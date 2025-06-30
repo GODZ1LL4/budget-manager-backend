@@ -47,6 +47,12 @@ app.use("/api/analytics", analyticsRoutes);
 const jobsRouter = require("./routes/jobs");
 app.use("/api/jobs", jobsRouter);
 
+const taxesRoutes = require("./routes/taxes");
+app.use("/api/taxes", taxesRoutes);
+
+const itemsWithPriceRoutes = require("./routes/itemsWithPrice");
+app.use("/api/items-with-price", itemsWithPriceRoutes);
+
 app.listen(PORT, () => {
   console.log(`Servidor corriendo en http://localhost:${PORT}`);
 });
