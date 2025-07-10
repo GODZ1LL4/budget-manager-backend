@@ -8,9 +8,11 @@ router.get("/", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
   const { data, error } = await supabase
-    .from("categories")
-    .select("*")
-    .eq("user_id", user_id);
+  .from("categories")
+  .select("*")
+  .eq("user_id", user_id)
+  .order("name", { ascending: true }); // 👈 orden A-Z
+
 
   if (error) return res.status(500).json({ error: error.message });
 
@@ -20,16 +22,19 @@ router.get("/", authenticateUser, async (req, res) => {
 // Crear nueva categoría
 router.post("/", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
-  const { name, type } = req.body;
+  const { name, type, stability_type = "variable" } = req.body;
 
-  if (!name || !["income", "expense"].includes(type)) {
-    console.error("❌ Datos inválidos:", { name, type });
+  if (
+    !name ||
+    !["income", "expense"].includes(type) ||
+    !["fixed", "variable", "occasional"].includes(stability_type)
+  ) {
     return res.status(400).json({ error: "Datos inválidos" });
   }
 
   const { data, error } = await supabase
     .from("categories")
-    .insert([{ user_id, name, type }])
+    .insert([{ user_id, name, type, stability_type }])
     .select();
 
   if (error) {
@@ -44,11 +49,19 @@ router.post("/", authenticateUser, async (req, res) => {
 router.put("/:id", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
   const { id } = req.params;
-  const { name, type } = req.body;
+  const { name, type, stability_type } = req.body;
+
+  if (
+    !name ||
+    !["income", "expense"].includes(type) ||
+    !["fixed", "variable", "occasional"].includes(stability_type)
+  ) {
+    return res.status(400).json({ error: "Datos inválidos" });
+  }
 
   const { data, error } = await supabase
     .from("categories")
-    .update({ name, type })
+    .update({ name, type, stability_type })
     .eq("id", id)
     .eq("user_id", user_id)
     .select();

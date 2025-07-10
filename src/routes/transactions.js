@@ -111,6 +111,7 @@ router.post("/", authenticateUser, async (req, res) => {
     recurrence,
     recurrence_end_date,
     items = [],
+    discount = 0,
   } = req.body;
 
   let amount = rawAmount;
@@ -134,6 +135,7 @@ router.post("/", authenticateUser, async (req, res) => {
       return res.status(500).json({ error: "Error al obtener precios." });
     }
   
+
     let total = 0;
   
     for (const item of items) {
@@ -157,6 +159,10 @@ router.post("/", authenticateUser, async (req, res) => {
       });
     }
   
+    if (discount > 0) {
+      total = total * (1 - discount / 100);
+    }
+    
     amount = total;
   }
   
