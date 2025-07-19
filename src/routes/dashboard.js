@@ -230,6 +230,8 @@ router.get("/summary", authenticateUser, async (req, res) => {
       }
     });
 
+
+
     const fixedIncomeAverage =
       Object.values(fixedIncomeByMonth).reduce((a, b) => a + b, 0) /
         Object.keys(fixedIncomeByMonth).length || 0;
@@ -293,6 +295,51 @@ router.get("/summary", authenticateUser, async (req, res) => {
 
     const budgetBalance = totalMonthlyBudget - budgetedExpenseTotal;
 
+    // Agrupar gasto por día
+const dailyExpensesMap = {};
+tx.forEach((t) => {
+  if (t.type === "expense") {
+    const d = t.date;
+    dailyExpensesMap[d] = (dailyExpensesMap[d] || 0) + parseFloat(t.amount);
+  }
+});
+
+let maxExpenseDay = null;
+for (const [date, amount] of Object.entries(dailyExpensesMap)) {
+  if (!maxExpenseDay || amount > maxExpenseDay.amount) {
+    maxExpenseDay = { date, amount };
+  }
+}
+
+let minExpenseDay = null;
+for (const [date, amount] of Object.entries(dailyExpensesMap)) {
+  if (!minExpenseDay || amount < minExpenseDay.amount) {
+    minExpenseDay = { date, amount };
+  }
+}
+
+// === Días con gasto menor al promedio diario ===
+const dailyExpenses = {};
+
+tx.forEach((t) => {
+  if (t.type === "expense") {
+    const date = t.date;
+    dailyExpenses[date] = (dailyExpenses[date] || 0) + parseFloat(t.amount);
+  }
+});
+
+let daysBelowAverage = 0;
+for (const amount of Object.values(dailyExpenses)) {
+  if (amount < averageDailyExpense) daysBelowAverage++;
+}
+
+let daysAboveAverage = 0;
+for (const amount of Object.values(dailyExpenses)) {
+  if (amount > averageDailyExpense) daysAboveAverage++;
+}
+
+
+
     res.json({
       success: true,
       data: {
@@ -328,6 +375,10 @@ router.get("/summary", authenticateUser, async (req, res) => {
         topItemSpent: maxItem,
         totalMonthlyBudget,
         budgetBalance,
+        maxExpenseDay,
+        daysBelowAverage,
+        daysAboveAverage,
+        minExpenseDay,
       },
     });
   } catch (err) {
