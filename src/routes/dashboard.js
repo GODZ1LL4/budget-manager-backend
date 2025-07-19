@@ -336,4 +336,27 @@ router.get("/summary", authenticateUser, async (req, res) => {
   }
 });
 
+router.get("/today-expense", authenticateUser, async (req, res) => {
+  const user_id = req.user?.id;
+  const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+
+  try {
+    const { data, error } = await supabase
+      .from("transactions")
+      .select("amount")
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .eq("date", today);
+
+    if (error) throw error;
+
+    const totalToday = data.reduce((sum, tx) => sum + parseFloat(tx.amount), 0);
+
+    res.json({ success: true, data: { totalExpenseToday: totalToday } });
+  } catch (err) {
+    console.error("🔥 Error en /dashboard/today-expense:", err);
+    res.status(500).json({ error: "Error al calcular gasto de hoy." });
+  }
+});
+
 module.exports = router;
