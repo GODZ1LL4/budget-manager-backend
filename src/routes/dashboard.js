@@ -230,8 +230,6 @@ router.get("/summary", authenticateUser, async (req, res) => {
       }
     });
 
-
-
     const fixedIncomeAverage =
       Object.values(fixedIncomeByMonth).reduce((a, b) => a + b, 0) /
         Object.keys(fixedIncomeByMonth).length || 0;
@@ -296,49 +294,47 @@ router.get("/summary", authenticateUser, async (req, res) => {
     const budgetBalance = totalMonthlyBudget - budgetedExpenseTotal;
 
     // Agrupar gasto por día
-const dailyExpensesMap = {};
-tx.forEach((t) => {
-  if (t.type === "expense") {
-    const d = t.date;
-    dailyExpensesMap[d] = (dailyExpensesMap[d] || 0) + parseFloat(t.amount);
-  }
-});
+    const dailyExpensesMap = {};
+    tx.forEach((t) => {
+      if (t.type === "expense") {
+        const d = t.date;
+        dailyExpensesMap[d] = (dailyExpensesMap[d] || 0) + parseFloat(t.amount);
+      }
+    });
 
-let maxExpenseDay = null;
-for (const [date, amount] of Object.entries(dailyExpensesMap)) {
-  if (!maxExpenseDay || amount > maxExpenseDay.amount) {
-    maxExpenseDay = { date, amount };
-  }
-}
+    let maxExpenseDay = null;
+    for (const [date, amount] of Object.entries(dailyExpensesMap)) {
+      if (!maxExpenseDay || amount > maxExpenseDay.amount) {
+        maxExpenseDay = { date, amount };
+      }
+    }
 
-let minExpenseDay = null;
-for (const [date, amount] of Object.entries(dailyExpensesMap)) {
-  if (!minExpenseDay || amount < minExpenseDay.amount) {
-    minExpenseDay = { date, amount };
-  }
-}
+    let minExpenseDay = null;
+    for (const [date, amount] of Object.entries(dailyExpensesMap)) {
+      if (!minExpenseDay || amount < minExpenseDay.amount) {
+        minExpenseDay = { date, amount };
+      }
+    }
 
-// === Días con gasto menor al promedio diario ===
-const dailyExpenses = {};
+    // === Días con gasto menor al promedio diario ===
+    const dailyExpenses = {};
 
-tx.forEach((t) => {
-  if (t.type === "expense") {
-    const date = t.date;
-    dailyExpenses[date] = (dailyExpenses[date] || 0) + parseFloat(t.amount);
-  }
-});
+    tx.forEach((t) => {
+      if (t.type === "expense") {
+        const date = t.date;
+        dailyExpenses[date] = (dailyExpenses[date] || 0) + parseFloat(t.amount);
+      }
+    });
 
-let daysBelowAverage = 0;
-for (const amount of Object.values(dailyExpenses)) {
-  if (amount < averageDailyExpense) daysBelowAverage++;
-}
+    let daysBelowAverage = 0;
+    for (const amount of Object.values(dailyExpenses)) {
+      if (amount < averageDailyExpense) daysBelowAverage++;
+    }
 
-let daysAboveAverage = 0;
-for (const amount of Object.values(dailyExpenses)) {
-  if (amount > averageDailyExpense) daysAboveAverage++;
-}
-
-
+    let daysAboveAverage = 0;
+    for (const amount of Object.values(dailyExpenses)) {
+      if (amount > averageDailyExpense) daysAboveAverage++;
+    }
 
     res.json({
       success: true,
@@ -390,11 +386,10 @@ for (const amount of Object.values(dailyExpenses)) {
 router.get("/today-expense", authenticateUser, async (req, res) => {
   const user_id = req.user?.id;
 
+  const userTZOffset = -4; // RD está en GMT-4
   const now = new Date();
-  const localDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const today = localDate.toISOString().split("T")[0]; // YYYY-MM-DD
-
-  console.log("🕐 Fecha buscada para hoy:", today);
+  const localTime = new Date(now.getTime() + userTZOffset * 60 * 60 * 1000);
+  const today = localTime.toISOString().split("T")[0]; // YYYY-MM-DD en zona local
 
   try {
     const { data, error } = await supabase
@@ -409,13 +404,7 @@ router.get("/today-expense", authenticateUser, async (req, res) => {
       throw error;
     }
 
-    console.log("📄 Transacciones encontradas hoy:", data?.length || 0);
-    data?.forEach((tx) =>
-      console.log(`➡️ ${tx.date} | RD$ ${tx.amount} | type: ${tx.type}`)
-    );
-
     const totalToday = data.reduce((sum, tx) => sum + parseFloat(tx.amount), 0);
-    console.log("💰 Total gastado hoy:", totalToday);
 
     res.json({ success: true, data: { totalExpenseToday: totalToday } });
   } catch (err) {
@@ -423,6 +412,5 @@ router.get("/today-expense", authenticateUser, async (req, res) => {
     res.status(500).json({ error: "Error al calcular gasto de hoy." });
   }
 });
-
 
 module.exports = router;
