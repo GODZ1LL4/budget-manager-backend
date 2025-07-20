@@ -389,22 +389,33 @@ for (const amount of Object.values(dailyExpenses)) {
 
 router.get("/today-expense", authenticateUser, async (req, res) => {
   const user_id = req.user?.id;
-  const today = new Date();
-  const start = new Date(today.setHours(0, 0, 0, 0)).toISOString();
-  const end = new Date(today.setHours(23, 59, 59, 999)).toISOString();
+
+  const now = new Date();
+  const localDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const today = localDate.toISOString().split("T")[0]; // YYYY-MM-DD
+
+  console.log("🕐 Fecha buscada para hoy:", today);
 
   try {
     const { data, error } = await supabase
       .from("transactions")
-      .select("amount")
+      .select("id, amount, date, type")
       .eq("user_id", user_id)
       .eq("type", "expense")
-      .gte("date", start)
-      .lte("date", end);
+      .eq("date", today);
 
-    if (error) throw error;
+    if (error) {
+      console.error("❌ Error Supabase:", error.message);
+      throw error;
+    }
+
+    console.log("📄 Transacciones encontradas hoy:", data?.length || 0);
+    data?.forEach((tx) =>
+      console.log(`➡️ ${tx.date} | RD$ ${tx.amount} | type: ${tx.type}`)
+    );
 
     const totalToday = data.reduce((sum, tx) => sum + parseFloat(tx.amount), 0);
+    console.log("💰 Total gastado hoy:", totalToday);
 
     res.json({ success: true, data: { totalExpenseToday: totalToday } });
   } catch (err) {
@@ -412,5 +423,6 @@ router.get("/today-expense", authenticateUser, async (req, res) => {
     res.status(500).json({ error: "Error al calcular gasto de hoy." });
   }
 });
+
 
 module.exports = router;
