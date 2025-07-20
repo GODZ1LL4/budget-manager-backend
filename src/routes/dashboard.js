@@ -389,7 +389,9 @@ for (const amount of Object.values(dailyExpenses)) {
 
 router.get("/today-expense", authenticateUser, async (req, res) => {
   const user_id = req.user?.id;
-  const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+  const today = new Date();
+  const start = new Date(today.setHours(0, 0, 0, 0)).toISOString();
+  const end = new Date(today.setHours(23, 59, 59, 999)).toISOString();
 
   try {
     const { data, error } = await supabase
@@ -397,7 +399,8 @@ router.get("/today-expense", authenticateUser, async (req, res) => {
       .select("amount")
       .eq("user_id", user_id)
       .eq("type", "expense")
-      .eq("date", today);
+      .gte("date", start)
+      .lte("date", end);
 
     if (error) throw error;
 
