@@ -413,4 +413,37 @@ router.get("/today-expense", authenticateUser, async (req, res) => {
   }
 });
 
+router.get("/transactions-by-category", authenticateUser, async (req, res) => {
+  const user_id = req.user?.id;
+  const category_id = req.query.category_id;
+
+  if (!category_id) return res.status(400).json({ error: "Falta category_id" });
+
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const start = `${year}-${month}-01`;
+  const lastDay = new Date(year, now.getMonth() + 1, 0).getDate();
+  const end = `${year}-${month}-${String(lastDay).padStart(2, "0")}`;
+
+  try {
+    const { data, error } = await supabase
+      .from("transactions")
+      .select("id, amount, description, date")
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .eq("category_id", category_id)
+      .gte("date", start)
+      .lte("date", end);
+
+    if (error) throw error;
+
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error("🔥 Error en /transactions-by-category:", err);
+    res.status(500).json({ error: "Error al obtener transacciones" });
+  }
+});
+
+
 module.exports = router;
