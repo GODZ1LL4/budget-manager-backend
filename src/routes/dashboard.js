@@ -435,7 +435,7 @@ router.get("/transactions-by-category", authenticateUser, async (req, res) => {
       .eq("category_id", category_id)
       .gte("date", start)
       .lte("date", end)
-      .order("date", { ascending: false });
+      .order("date", { ascending: true });
 
     if (error) throw error;
 
