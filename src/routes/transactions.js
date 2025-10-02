@@ -6,7 +6,6 @@ const dayjs = require("dayjs");
 const isSameOrBefore = require("dayjs/plugin/isSameOrBefore");
 dayjs.extend(isSameOrBefore);
 
-
 router.get("/for-calendar", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
@@ -73,7 +72,6 @@ router.get("/for-calendar", authenticateUser, async (req, res) => {
   res.json({ success: true, data: result });
 });
 
-
 // ✅ Obtener transacciones del usuario
 router.get("/", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -82,10 +80,12 @@ router.get("/", authenticateUser, async (req, res) => {
     .from("transactions")
     .select(
       `
-      *,
-      accounts (name),
-      categories (name, type)
-    `
+    *,
+    account:accounts!transactions_account_id_fkey (id, name),
+    account_from:accounts!transactions_account_from_fkey (id, name),
+    account_to:accounts!transactions_account_to_fkey (id, name),
+    categories (id, name, type)
+  `
     )
     .eq("user_id", user_id)
     .order("date", { ascending: false });
@@ -124,48 +124,46 @@ router.post("/", authenticateUser, async (req, res) => {
   // ✅ Si se proveen artículos, usar sus precios más recientes desde la vista
   if (items.length > 0) {
     const itemIds = items.map((i) => i.item_id);
-  
+
     const { data: itemData, error: itemError } = await supabase
       .from("items_with_price")
       .select("id, latest_price, is_exempt, tax_rate")
       .in("id", itemIds);
-  
+
     if (itemError) {
       console.error("🧨 Error al obtener datos de artículos:", itemError);
       return res.status(500).json({ error: "Error al obtener precios." });
     }
-  
 
     let total = 0;
-  
+
     for (const item of items) {
       const ref = itemData.find((i) => i.id === item.item_id);
       if (!ref) continue;
-  
+
       const qty = parseFloat(item.quantity) || 1;
       const price = parseFloat(ref.latest_price || 0);
       const taxRate = ref.is_exempt ? 0 : parseFloat(ref.tax_rate || 0);
-  
+
       const subtotal = price * qty;
       const taxAmount = subtotal * (taxRate / 100);
       const lineTotal = subtotal + taxAmount;
-  
+
       total += lineTotal;
-  
+
       transactionItems.push({
         item_id: item.item_id,
         quantity: qty,
         price, // precio sin ITBIS (para referencia)
       });
     }
-  
+
     if (discount > 0) {
       total = total * (1 - discount / 100);
     }
-    
+
     amount = total;
   }
-  
 
   // ✅ Insertar transacción
   const { data: tx, error: txError } = await supabase

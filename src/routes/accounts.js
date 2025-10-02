@@ -74,28 +74,52 @@ router.get("/balances", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
   const { data, error } = await supabase
-    .from("transactions")
-    .select("account_id, amount, type")
+    .from("accounts")
+    .select("id,current_balance")
     .eq("user_id", user_id);
 
   if (error) return res.status(500).json({ error: error.message });
 
-  // Agrupar y calcular saldo
-  const balances = {};
-
-  data.forEach((tx) => {
-    const acc = tx.account_id;
-    if (!acc) return;
-    if (!balances[acc]) balances[acc] = 0;
-
-    if (tx.type === "income") {
-      balances[acc] += parseFloat(tx.amount);
-    } else if (tx.type === "expense") {
-      balances[acc] -= parseFloat(tx.amount);
-    }
-  });
+  const balances = Object.fromEntries(
+    (data || []).map((a) => [a.id, Number(a.current_balance || 0)])
+  );
 
   res.json({ success: true, data: balances });
+});
+
+// POST /accounts/transfer
+// body: { from_account_id, to_account_id, amount, date, description }
+router.post("/transfer", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+  const { from_account_id, to_account_id, amount, date, description } =
+    req.body;
+
+  if (!from_account_id || !to_account_id || !amount || !date) {
+    return res.status(400).json({ error: "Datos incompletos" });
+  }
+  if (from_account_id === to_account_id) {
+    return res.status(400).json({ error: "Las cuentas deben ser distintas" });
+  }
+
+  const { data, error } = await supabase
+    .from("transactions")
+    .insert([
+      {
+        user_id,
+        type: "transfer",
+        account_from_id: from_account_id,
+        account_to_id: to_account_id,
+        amount,
+        date,
+        description: description || null,
+      },
+    ])
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  // Los triggers ya ajustaron balances de ambas cuentas
+  res.status(201).json({ success: true, data });
 });
 
 module.exports = router;
