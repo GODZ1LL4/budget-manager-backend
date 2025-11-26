@@ -515,6 +515,7 @@ router.get(
     res.json({ success: true, data: result });
   }
 );
+
 router.get(
   "/yearly-category-variations",
   authenticateUser,
@@ -557,6 +558,7 @@ router.get(
     res.json({ success: true, data: perCategory });
   }
 );
+
 router.get("/budget-vs-actual-history", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
@@ -618,6 +620,7 @@ router.get("/budget-vs-actual-history", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: result });
 });
+
 router.get("/budget-vs-actual-yearly", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
   const now = new Date();
@@ -673,6 +676,7 @@ router.get("/budget-vs-actual-yearly", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: result });
 });
+
 router.get(
   "/budget-vs-actual-summary-yearly",
   authenticateUser,
@@ -829,6 +833,7 @@ router.get("/expense-by-stability-type", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: result });
 });
+
 router.get("/top-variable-categories", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
@@ -859,6 +864,7 @@ router.get("/top-variable-categories", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: result });
 });
+
 router.get("/goals-progress", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
@@ -885,6 +891,7 @@ router.get("/goals-progress", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: result });
 });
+
 router.get("/saving-real-vs-projected", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
@@ -950,6 +957,7 @@ router.get("/saving-real-vs-projected", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: [...combined, ...projections] });
 });
+
 router.get("/scenario-projections", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
@@ -1380,6 +1388,7 @@ router.get("/top-items", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: result });
 });
+
 router.get("/top-items-by-value", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
   const year = parseInt(req.query.year);
@@ -1392,30 +1401,77 @@ router.get("/top-items-by-value", authenticateUser, async (req, res) => {
   const start = `${year}-${month}-01`;
   const end = new Date(year, parseInt(month), 0).toISOString().split("T")[0];
 
-  const { data, error } = await supabase
-    .from("transaction_items")
-    .select("item_id, price, quantity, items(name), transactions(date)")
-    .eq("transactions.user_id", user_id)
-    .gte("transactions.date", start)
-    .lte("transactions.date", end);
+  try {
+    const { data, error } = await supabase
+      .from("transaction_items")
+      .select(
+        `
+        item_id,
+        price,
+        quantity,
+        items (
+          name,
+          taxes (
+            rate,
+            is_exempt
+          )
+        ),
+        transactions (
+          date,
+          type,
+          user_id
+        )
+      `
+      )
+      .eq("transactions.user_id", user_id)
+      .eq("transactions.type", "expense") // solo gastos
+      .gte("transactions.date", start)
+      .lte("transactions.date", end);
 
-  if (error) return res.status(500).json({ error: error.message });
+    if (error) return res.status(500).json({ error: error.message });
 
-  const totals = {};
+    const totals = {};
 
-  data.forEach((item) => {
-    const key = item.items?.name || "Sin nombre";
-    const amount = parseFloat(item.price || 0) * (item.quantity || 1);
-    totals[key] = (totals[key] || 0) + amount;
-  });
+    (data || []).forEach((row) => {
+      const trx = row.transactions;
+      const itemRel = row.items;
 
-  const result = Object.entries(totals)
-    .map(([item, total_spent]) => ({ item, total_spent }))
-    .sort((a, b) => b.total_spent - a.total_spent)
-    .slice(0, 10);
+      if (!trx) return;
 
-  res.json({ success: true, data: result });
+      const itemName = itemRel?.name || "Sin nombre";
+      const qty = Number(row.quantity || 1);
+      const netPrice = Number(row.price || 0); // precio sin ITBIS
+
+      // Calcular precio con ITBIS
+      const taxRate =
+        itemRel?.taxes?.rate != null ? Number(itemRel.taxes.rate) : 0;
+      const isExempt = !!itemRel?.taxes?.is_exempt;
+
+      let priceWithTax = netPrice;
+      if (!isExempt && taxRate > 0) {
+        priceWithTax = netPrice * (1 + taxRate / 100);
+      }
+
+      const amount = priceWithTax * qty;
+
+      totals[itemName] = (totals[itemName] || 0) + amount;
+    });
+
+    const result = Object.entries(totals)
+      .map(([item, total_spent]) => ({
+        item,
+        total_spent: Number(total_spent.toFixed(2)),
+      }))
+      .sort((a, b) => b.total_spent - a.total_spent)
+      .slice(0, 10);
+
+    res.json({ success: true, data: result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error calculando top items por valor" });
+  }
 });
+
 router.get("/item-trend/:item_id", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
   const item_id = req.params.item_id;
@@ -1459,5 +1515,616 @@ router.get("/item-trend/:item_id", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: result });
 });
+
+router.get("/items-to-restock", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  // Parámetros opcionales
+  const months = parseInt(req.query.months, 10) || 6; // ventana de meses hacia atrás
+  try {
+    const today = new Date();
+
+    // Fecha de inicio: primer día del mes (months - 1) hacia atrás
+    const startMonthDate = new Date(
+      today.getFullYear(),
+      today.getMonth() - (months - 1),
+      1
+    );
+    const startDate = startMonthDate.toISOString().split("T")[0];
+
+    // Mes siguiente (target de pronóstico)
+    const nextMonthDate = new Date(
+      today.getFullYear(),
+      today.getMonth() + 1,
+      1
+    );
+    const nextMonthKey = `${nextMonthDate.getFullYear()}-${String(
+      nextMonthDate.getMonth() + 1
+    ).padStart(2, "0")}`;
+    const nextMonthIndex =
+      nextMonthDate.getFullYear() * 12 + (nextMonthDate.getMonth() + 1);
+
+    // Traer líneas de items de transacciones de gasto + categoría + impuesto
+    const { data, error } = await supabase
+      .from("transaction_items")
+      .select(
+        `
+        item_id,
+        quantity,
+        price,
+        items (
+          name,
+          taxes (
+            rate,
+            is_exempt
+          )
+        ),
+        transactions (
+          date,
+          type,
+          user_id,
+          categories (
+            stability_type
+          )
+        )
+      `
+      )
+      .eq("transactions.user_id", user_id)
+      .eq("transactions.type", "expense")
+      .gte("transactions.date", startDate);
+
+    if (error) {
+      console.error(error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    // Helper para gap típico (moda)
+    function getTypicalGap(gaps) {
+      if (!gaps.length) return null;
+      const freq = {};
+      gaps.forEach((g) => {
+        freq[g] = (freq[g] || 0) + 1;
+      });
+      let bestGap = null;
+      let bestCount = 0;
+      for (const [gStr, count] of Object.entries(freq)) {
+        const g = Number(gStr);
+        if (
+          count > bestCount ||
+          (count === bestCount && (bestGap == null || g < bestGap))
+        ) {
+          bestGap = g;
+          bestCount = count;
+        }
+      }
+      return bestGap;
+    }
+
+    const itemsMap = {};
+
+    (data || []).forEach((row) => {
+      const trx = row.transactions;
+      const itemRel = row.items;
+
+      // 1) Excluir categorías "occasional"
+      const stability = trx?.categories?.stability_type;
+      if (stability === "occasional") return;
+
+      const itemId = row.item_id;
+      const name = itemRel?.name || "Sin nombre";
+      const qty = Number(row.quantity || 0);
+      const netPrice = Number(row.price || 0); // precio sin ITBIS
+      const dateStr = trx?.date;
+
+      if (!itemId || !dateStr || qty <= 0) return;
+
+      const date = new Date(dateStr);
+      const monthKey = `${date.getFullYear()}-${String(
+        date.getMonth() + 1
+      ).padStart(2, "0")}`;
+
+      // Impuesto del artículo
+      const taxRate =
+        itemRel?.taxes?.rate != null ? Number(itemRel.taxes.rate) : 0;
+      const isExempt = !!itemRel?.taxes?.is_exempt;
+
+      if (!itemsMap[itemId]) {
+        itemsMap[itemId] = {
+          item_id: itemId,
+          item_name: name,
+          perMonthQty: {}, // YYYY-MM -> qty total del item en ese mes
+          lastPurchaseDate: dateStr,
+          lastMonthKey: monthKey,
+          lastNetPrice: netPrice,
+          lastTaxRate: taxRate,
+          lastIsExempt: isExempt,
+        };
+      }
+
+      const item = itemsMap[itemId];
+
+      item.perMonthQty[monthKey] = (item.perMonthQty[monthKey] || 0) + qty;
+
+      // última compra (para cantidad y precio)
+      if (new Date(item.lastPurchaseDate) < date) {
+        item.lastPurchaseDate = dateStr;
+        item.lastMonthKey = monthKey;
+        item.lastNetPrice = netPrice;
+        item.lastTaxRate = taxRate;
+        item.lastIsExempt = isExempt;
+      }
+    });
+
+    const result = [];
+
+    Object.values(itemsMap).forEach((rawItem) => {
+      const monthKeys = Object.keys(rawItem.perMonthQty).sort(); // YYYY-MM ascendente
+      if (monthKeys.length < 2) {
+        // con una sola compra no podemos deducir frecuencia de manera robusta
+        return;
+      }
+
+      // Convertir a índice numérico: year * 12 + month
+      const indices = monthKeys.map((mk) => {
+        const [y, m] = mk.split("-").map(Number);
+        return y * 12 + m;
+      });
+
+      // Gaps entre compras
+      const gaps = [];
+      for (let i = 1; i < indices.length; i++) {
+        const diff = indices[i] - indices[i - 1];
+        if (diff > 0) {
+          gaps.push(diff);
+        }
+      }
+
+      const typicalGap = getTypicalGap(gaps);
+      if (!typicalGap || typicalGap <= 0) return;
+
+      // Último mes de compra
+      const lastMonthKey = rawItem.lastMonthKey;
+      const [lastY, lastM] = lastMonthKey.split("-").map(Number);
+      const lastIndex = lastY * 12 + lastM;
+
+      const expectedNextIndex = lastIndex + typicalGap;
+
+      // Solo marcamos el item si el mes que viene coincide con el patrón
+      if (expectedNextIndex !== nextMonthIndex) {
+        return;
+      }
+
+      // Cantidad pronosticada = lo que compraste en el último mes de compra
+      const lastMonthQty = rawItem.perMonthQty[lastMonthKey] || 0;
+      if (lastMonthQty <= 0) return;
+
+      // Precio con ITBIS
+      const netPrice = rawItem.lastNetPrice || 0;
+      let priceWithTax = netPrice;
+      if (!rawItem.lastIsExempt && rawItem.lastTaxRate > 0) {
+        priceWithTax = netPrice * (1 + rawItem.lastTaxRate / 100);
+      }
+
+      const projectedQty = lastMonthQty;
+      const projectedCost = projectedQty * priceWithTax;
+
+      result.push({
+        item_id: rawItem.item_id,
+        item_name: rawItem.item_name,
+        last_purchase_date: rawItem.lastPurchaseDate,
+        last_month_key: lastMonthKey,
+        gap_months: typicalGap,
+        projected_month_key: nextMonthKey,
+        projected_next_month_qty: Number(projectedQty.toFixed(2)),
+        projected_next_month_cost: Number(projectedCost.toFixed(2)),
+      });
+    });
+
+    // Ordenar por costo proyectado descendente
+    result.sort(
+      (a, b) => b.projected_next_month_cost - a.projected_next_month_cost
+    );
+
+    return res.json({
+      success: true,
+      meta: {
+        months_considered: months,
+        start_date: startDate,
+        next_month: nextMonthKey,
+        excludes_occasional: true,
+        cost_includes_item_tax: true,
+      },
+      data: result,
+    });
+  } catch (err) {
+    console.error(err);
+    return res
+      .status(500)
+      .json({ error: "Error calculando items a recomprar" });
+  }
+});
+
+router.get(  "/category-monthly-comparison",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+
+    try {
+      const now = new Date();
+
+      // Parámetros: mes 1 y mes 2
+      const year1Param = parseInt(req.query.year1, 10);
+      const month1Param = parseInt(req.query.month1, 10); // 1-12
+      const year2Param = parseInt(req.query.year2, 10);
+      const month2Param = parseInt(req.query.month2, 10); // 1-12
+
+      let y1, m1Index, y2, m2Index;
+
+      const paramsAreValid =
+        !isNaN(year1Param) &&
+        !isNaN(month1Param) &&
+        !isNaN(year2Param) &&
+        !isNaN(month2Param) &&
+        month1Param >= 1 &&
+        month1Param <= 12 &&
+        month2Param >= 1 &&
+        month2Param <= 12;
+
+      if (paramsAreValid) {
+        y1 = year1Param;
+        m1Index = month1Param - 1;
+        y2 = year2Param;
+        m2Index = month2Param - 1;
+      } else {
+        // Default: mes 1 = mes anterior, mes 2 = mes actual
+        const baseYear = now.getFullYear();
+        const baseMonthIndex = now.getMonth(); // actual 0-11
+
+        y2 = baseYear;
+        m2Index = baseMonthIndex;
+
+        let prevYear = baseYear;
+        let prevMonthIndex = baseMonthIndex - 1;
+        if (prevMonthIndex < 0) {
+          prevMonthIndex = 11;
+          prevYear = baseYear - 1;
+        }
+        y1 = prevYear;
+        m1Index = prevMonthIndex;
+      }
+
+      const month1Key = `${y1}-${String(m1Index + 1).padStart(2, "0")}`;
+      const month2Key = `${y2}-${String(m2Index + 1).padStart(2, "0")}`;
+
+      const start1 = new Date(y1, m1Index, 1).toISOString().split("T")[0];
+      const end1 = new Date(y1, m1Index + 1, 0).toISOString().split("T")[0];
+
+      const start2 = new Date(y2, m2Index, 1).toISOString().split("T")[0];
+      const end2 = new Date(y2, m2Index + 1, 0).toISOString().split("T")[0];
+
+      // Rango global para una sola query
+      const globalStart = start1 < start2 ? start1 : start2;
+      const globalEnd = end1 > end2 ? end1 : end2;
+
+      const { data, error } = await supabase
+        .from("transactions")
+        .select(
+          `
+          amount,
+          date,
+          category_id,
+          categories ( name )
+        `
+        )
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", globalStart)
+        .lte("date", globalEnd);
+
+      if (error) {
+        console.error(error);
+        return res.status(500).json({ error: error.message });
+      }
+
+      const byCategory = {};
+      let totalMonth1 = 0;
+      let totalMonth2 = 0;
+
+      (data || []).forEach((tx) => {
+        const dateStr = tx.date;
+        if (!dateStr) return;
+
+        const [y, m] = dateStr.split("-");
+        const monthKey = `${y}-${m}`;
+        const catId = tx.category_id || "sin_categoria";
+        const catName = tx.categories?.name || "Sin categoría";
+        const amt = Number(tx.amount || 0);
+
+        if (!byCategory[catId]) {
+          byCategory[catId] = {
+            category_id: catId,
+            category_name: catName,
+            month1_total: 0,
+            month2_total: 0,
+          };
+        }
+
+        if (monthKey === month1Key) {
+          byCategory[catId].month1_total += amt;
+          totalMonth1 += amt;
+        } else if (monthKey === month2Key) {
+          byCategory[catId].month2_total += amt;
+          totalMonth2 += amt;
+        }
+      });
+
+      const rows = Object.values(byCategory).map((row) => {
+        const m1 = row.month1_total || 0;
+        const m2 = row.month2_total || 0;
+        const diff = m2 - m1; // de mes1 a mes2
+
+        let diffPercent = 0;
+        if (m1 === 0 && m2 > 0) {
+          diffPercent = 100;
+        } else if (m1 !== 0) {
+          diffPercent = (diff / m1) * 100;
+        }
+
+        return {
+          category_id: row.category_id,
+          category_name: row.category_name,
+          month1_total: Number(m1.toFixed(2)),
+          month2_total: Number(m2.toFixed(2)),
+          diff: Number(diff.toFixed(2)),
+          diff_percent: Number(diffPercent.toFixed(2)),
+        };
+      });
+
+  
+      // Ordenar por mayor diferencia (mes2 - mes1)
+      rows.sort((a, b) => b.diff - a.diff);
+
+      return res.json({
+        success: true,
+        meta: {
+          month1: month1Key,
+          month2: month2Key,
+          month1_total: Number(totalMonth1.toFixed(2)),
+          month2_total: Number(totalMonth2.toFixed(2)),
+        },
+        data: rows,
+      });
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({
+        error: "Error generando comparativo mensual por categoría",
+      });
+    }
+  }
+);
+
+router.get(
+  "/item-monthly-comparison",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+
+    try {
+      const now = new Date();
+
+      // Parámetros: mes 1 y mes 2
+      const year1Param = parseInt(req.query.year1, 10);
+      const month1Param = parseInt(req.query.month1, 10); // 1-12
+      const year2Param = parseInt(req.query.year2, 10);
+      const month2Param = parseInt(req.query.month2, 10); // 1-12
+
+      let y1, m1Index, y2, m2Index;
+
+      const paramsAreValid =
+        !isNaN(year1Param) &&
+        !isNaN(month1Param) &&
+        !isNaN(year2Param) &&
+        !isNaN(month2Param) &&
+        month1Param >= 1 &&
+        month1Param <= 12 &&
+        month2Param >= 1 &&
+        month2Param <= 12;
+
+      if (paramsAreValid) {
+        y1 = year1Param;
+        m1Index = month1Param - 1;
+        y2 = year2Param;
+        m2Index = month2Param - 1;
+      } else {
+        // Default: mes 1 = mes anterior, mes 2 = mes actual
+        const baseYear = now.getFullYear();
+        const baseMonthIndex = now.getMonth(); // actual 0-11
+
+        y2 = baseYear;
+        m2Index = baseMonthIndex;
+
+        let prevYear = baseYear;
+        let prevMonthIndex = baseMonthIndex - 1;
+        if (prevMonthIndex < 0) {
+          prevMonthIndex = 11;
+          prevYear = baseYear - 1;
+        }
+        y1 = prevYear;
+        m1Index = prevMonthIndex;
+      }
+
+      const month1Key = `${y1}-${String(m1Index + 1).padStart(2, "0")}`;
+      const month2Key = `${y2}-${String(m2Index + 1).padStart(2, "0")}`;
+
+      const start1 = new Date(y1, m1Index, 1).toISOString().split("T")[0];
+      const end1 = new Date(y1, m1Index + 1, 0)
+        .toISOString()
+        .split("T")[0];
+
+      const start2 = new Date(y2, m2Index, 1).toISOString().split("T")[0];
+      const end2 = new Date(y2, m2Index + 1, 0)
+        .toISOString()
+        .split("T")[0];
+
+      // Rango global para una sola query
+      const globalStart = start1 < start2 ? start1 : start2;
+      const globalEnd = end1 > end2 ? end1 : end2;
+
+      const { data, error } = await supabase
+        .from("transaction_items")
+        .select(`
+          item_id,
+          quantity,
+          price,
+          items (
+            name,
+            taxes (
+              rate,
+              is_exempt
+            )
+          ),
+          transactions (
+            date,
+            type,
+            user_id
+          )
+        `)
+        .eq("transactions.user_id", user_id)
+        .eq("transactions.type", "expense")
+        .gte("transactions.date", globalStart)
+        .lte("transactions.date", globalEnd);
+
+      if (error) {
+        console.error(error);
+        return res.status(500).json({ error: error.message });
+      }
+
+      const byItem = {};
+      let totalMonth1Amount = 0;
+      let totalMonth2Amount = 0;
+
+      (data || []).forEach((row) => {
+        const trx = row.transactions;
+        const itemRel = row.items;
+        if (!trx) return;
+
+        const dateStr = trx.date;
+        if (!dateStr) return;
+
+        const [y, m] = dateStr.split("-");
+        const monthKey = `${y}-${m}`;
+
+        const itemId = row.item_id || "sin_item";
+        const itemName = itemRel?.name || "Sin nombre";
+
+        const qty = Number(row.quantity || 0);
+        const netPrice = Number(row.price || 0); // sin ITBIS
+
+        // ITBIS del artículo
+        const taxRate =
+          itemRel?.taxes?.rate != null ? Number(itemRel.taxes.rate) : 0;
+        const isExempt = !!itemRel?.taxes?.is_exempt;
+
+        let priceWithTax = netPrice;
+        if (!isExempt && taxRate > 0) {
+          priceWithTax = netPrice * (1 + taxRate / 100);
+        }
+
+        const lineAmount = priceWithTax * qty;
+
+        if (!byItem[itemId]) {
+          byItem[itemId] = {
+            item_id: itemId,
+            item_name: itemName,
+            month1_qty: 0,
+            month2_qty: 0,
+            month1_amount: 0,
+            month2_amount: 0,
+          };
+        }
+
+        if (monthKey === month1Key) {
+          byItem[itemId].month1_qty += qty;
+          byItem[itemId].month1_amount += lineAmount;
+          totalMonth1Amount += lineAmount;
+        } else if (monthKey === month2Key) {
+          byItem[itemId].month2_qty += qty;
+          byItem[itemId].month2_amount += lineAmount;
+          totalMonth2Amount += lineAmount;
+        }
+      });
+
+      const rows = Object.values(byItem).map((row) => {
+        const m1Amt = row.month1_amount || 0;
+        const m2Amt = row.month2_amount || 0;
+        const diffAmt = m2Amt - m1Amt;
+      
+        const q1 = row.month1_qty || 0;
+        const q2 = row.month2_qty || 0;
+        const diffQty = q2 - q1; // Mes2 − Mes1 en cantidad
+      
+        return {
+          item_id: row.item_id,
+          item_name: row.item_name,
+          month1_qty: Number(q1.toFixed(2)),
+          month2_qty: Number(q2.toFixed(2)),
+          month1_amount: Number(m1Amt.toFixed(2)),
+          month2_amount: Number(m2Amt.toFixed(2)),
+          diff_amount: Number(diffAmt.toFixed(2)),
+          diff_qty: Number(diffQty.toFixed(2)),
+        };
+      });
+      
+      // 🔀 ORDENACIÓN CUSTOM
+      // 1) Primero los que AUMENTARON el gasto (diff_amount > 0), de mayor a menor
+      // 2) Luego los que quedaron IGUAL (diff_amount = 0), orden alfabético por nombre
+      // 3) Luego los que DISMINUYERON el gasto (diff_amount < 0), de mayor ahorro a menor
+      rows.sort((a, b) => {
+        const da = a.diff_amount || 0;
+        const db = b.diff_amount || 0;
+      
+        const groupA = da > 0 ? 2 : da === 0 ? 1 : 0;
+        const groupB = db > 0 ? 2 : db === 0 ? 1 : 0;
+      
+        // Primero por grupo (2: aumentó, 1: igual, 0: disminuyó)
+        if (groupA !== groupB) {
+          return groupB - groupA; // 2 > 1 > 0
+        }
+      
+        // Dentro del grupo de AUMENTOS: mayor diff_amount primero
+        if (groupA === 2) {
+          return db - da;
+        }
+      
+        // Dentro del grupo de DISMINUCIONES: más negativo (más ahorro) primero
+        if (groupA === 0) {
+          return da - db; // -500, -300, -100...
+        }
+      
+        // Dentro del grupo de IGUALES: ordenar por nombre
+        return a.item_name.localeCompare(b.item_name);
+      });
+      
+      return res.json({
+        success: true,
+        meta: {
+          month1: month1Key,
+          month2: month2Key,
+          month1_total_amount: Number(totalMonth1Amount.toFixed(2)),
+          month2_total_amount: Number(totalMonth2Amount.toFixed(2)),
+        },
+        data: rows,
+      });
+      
+      
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({
+        error: "Error generando comparativo mensual por artículo",
+      });
+    }
+  }
+);
+
 
 module.exports = router;
