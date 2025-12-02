@@ -111,7 +111,7 @@ router.post("/", authenticateUser, async (req, res) => {
     recurrence,
     recurrence_end_date,
     items = [],
-    discount = 0,
+    discount = 0, // descuento % a nivel de transacción
   } = req.body;
 
   let amount = rawAmount;
@@ -121,7 +121,7 @@ router.post("/", authenticateUser, async (req, res) => {
     return res.status(400).json({ error: "Campos obligatorios faltantes." });
   }
 
-  // ✅ Si se proveen artículos, usar sus precios más recientes desde la vista
+  // ✅ Si se proveen artículos, usamos "items_with_price" y calculamos totales
   if (items.length > 0) {
     const itemIds = items.map((i) => i.item_id);
 
@@ -135,37 +135,45 @@ router.post("/", authenticateUser, async (req, res) => {
       return res.status(500).json({ error: "Error al obtener precios." });
     }
 
-    let total = 0;
+    const discountRate = parseFloat(discount) || 0;
+    let totalFinal = 0;
 
     for (const item of items) {
       const ref = itemData.find((i) => i.id === item.item_id);
       if (!ref) continue;
 
       const qty = parseFloat(item.quantity) || 1;
-      const price = parseFloat(ref.latest_price || 0);
+      const unitPriceNet = parseFloat(ref.latest_price || 0); // sin ITBIS
       const taxRate = ref.is_exempt ? 0 : parseFloat(ref.tax_rate || 0);
 
-      const subtotal = price * qty;
-      const taxAmount = subtotal * (taxRate / 100);
-      const lineTotal = subtotal + taxAmount;
+      const lineSubtotalNet = unitPriceNet * qty;
+      const lineTaxAmount = lineSubtotalNet * (taxRate / 100);
+      const lineTotalGross = lineSubtotalNet + lineTaxAmount; // con ITBIS, sin desc.
 
-      total += lineTotal;
+      const lineDiscountAmount =
+        discountRate > 0 ? lineTotalGross * (discountRate / 100) : 0;
+
+      const lineTotalFinal = lineTotalGross - lineDiscountAmount; // con ITBIS y desc.
+      const unitPriceFinal = qty > 0 ? lineTotalFinal / qty : lineTotalFinal;
+
+      totalFinal += lineTotalFinal;
 
       transactionItems.push({
         item_id: item.item_id,
         quantity: qty,
-        price, // precio sin ITBIS (para referencia)
+        unit_price_net: unitPriceNet,
+        unit_price_final: unitPriceFinal,
+        line_total_final: lineTotalFinal,
+        tax_rate_used: taxRate,
+        is_exempt_used: ref.is_exempt ?? false,
       });
     }
 
-    if (discount > 0) {
-      total = total * (1 - discount / 100);
-    }
-
-    amount = total;
+    // amount de la transacción = suma de totales finales (ITBIS + descuento)
+    amount = totalFinal;
   }
 
-  // ✅ Insertar transacción
+  // ✅ Insertar transacción (encaja con tu schema: discount_percent existe)
   const { data: tx, error: txError } = await supabase
     .from("transactions")
     .insert([
@@ -179,6 +187,7 @@ router.post("/", authenticateUser, async (req, res) => {
         date,
         recurrence: recurrence || null,
         recurrence_end_date: recurrence_end_date || null,
+        discount_percent: parseFloat(discount) || 0,
       },
     ])
     .select()
@@ -186,7 +195,9 @@ router.post("/", authenticateUser, async (req, res) => {
 
   if (txError) {
     console.error("❌ Error al crear transacción:", txError);
-    return res.status(500).json({ error: "Error al crear transacción." });
+    return res
+      .status(500)
+      .json({ error: txError.message || "Error al crear transacción." });
   }
 
   // ✅ Insertar relación con artículos
@@ -195,7 +206,11 @@ router.post("/", authenticateUser, async (req, res) => {
       transaction_id: tx.id,
       item_id: i.item_id,
       quantity: i.quantity,
-      price: i.price,
+      unit_price_net: i.unit_price_net,
+      unit_price_final: i.unit_price_final,
+      line_total_final: i.line_total_final,
+      tax_rate_used: i.tax_rate_used,
+      is_exempt_used: i.is_exempt_used,
     }));
 
     const { error: insertError } = await supabase
@@ -204,12 +219,15 @@ router.post("/", authenticateUser, async (req, res) => {
 
     if (insertError) {
       console.error("🧨 Error al guardar artículos:", insertError);
-      return res.status(500).json({ error: "Error al guardar artículos." });
+      return res
+        .status(500)
+        .json({ error: insertError.message || "Error al guardar artículos." });
     }
   }
 
   res.json({ success: true, data: tx });
 });
+
 
 // ✅ Eliminar transacción (y sus artículos por cascade)
 router.delete("/:id", authenticateUser, async (req, res) => {

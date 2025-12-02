@@ -57,6 +57,7 @@ const scenariosRoutes = require("./routes/scenarios");
 app.use("/api/scenarios", scenariosRoutes);
 
 
+
 app.listen(PORT, () => {
   console.log(`Servidor corriendo en http://localhost:${PORT}`);
 });

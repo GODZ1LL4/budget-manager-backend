@@ -36,4 +36,7 @@ router.post("/", authenticateUser, async (req, res) => {
   res.status(201).json({ success: true, data: data[0] });
 });
 
+// Exportar precios de artículos seleccionados en CSV
+
+
 module.exports = router;
