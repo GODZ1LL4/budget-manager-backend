@@ -21,7 +21,9 @@ const getLastNMonthsKeys = (n, fromDate = new Date()) => {
   const months = [];
   for (let i = n - 1; i >= 0; i--) {
     const d = new Date(fromDate.getFullYear(), fromDate.getMonth() - i, 1);
-    months.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
+    months.push(
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`
+    );
   }
   return months;
 };
@@ -109,7 +111,6 @@ router.get("/category-spending-summary", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: result });
 });
-
 
 router.get("/top-items-by-category", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -216,7 +217,6 @@ router.get("/top-items-by-category", authenticateUser, async (req, res) => {
       .json({ error: "Error calculando top ítems por categoría" });
   }
 });
-
 
 /* ========= PRESUPUESTO VS REAL (MES ACTUAL) ========= */
 
@@ -332,7 +332,6 @@ router.get("/account-balances", authenticateUser, async (req, res) => {
   }
 });
 
-
 /* ========= PROYECCIÓN DE AHORRO SIMPLE ========= */
 
 router.get("/savings-projection", authenticateUser, async (req, res) => {
@@ -366,7 +365,7 @@ router.get("/savings-projection", authenticateUser, async (req, res) => {
 
   const avgSaving =
     sortedMonths.reduce((sum, m) => sum + m.saving, 0) /
-      (sortedMonths.length || 1);
+    (sortedMonths.length || 1);
 
   const lastMonth =
     sortedMonths.at(-1)?.month || new Date().toISOString().slice(0, 7);
@@ -445,44 +444,50 @@ router.get("/overbudget-categories", authenticateUser, async (req, res) => {
 
 /* ========= TENDENCIA DE AHORRO Y INGRESO/GASTO MENSUAL ========= */
 
+router.get(
+  "/monthly-income-expense-avg",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+    const year = new Date().getFullYear();
+    const { start, end } = getYearRange(year);
 
+    const { data, error } = await supabase
+      .from("transactions")
+      .select("amount, type, date")
+      .eq("user_id", user_id)
+      .gte("date", start)
+      .lte("date", end);
 
+    if (error) return res.status(500).json({ error: error.message });
 
-router.get("/monthly-income-expense-avg", authenticateUser, async (req, res) => {
-  const user_id = req.user.id;
-  const year = new Date().getFullYear();
-  const { start, end } = getYearRange(year);
+    const grouped = {};
+    (data || []).forEach((tx) => {
+      const [y, m] = tx.date.split("-");
+      const key = `${y}-${m}`;
+      if (!grouped[key]) grouped[key] = { income: 0, expense: 0 };
 
-  const { data, error } = await supabase
-    .from("transactions")
-    .select("amount, type, date")
-    .eq("user_id", user_id)
-    .gte("date", start)
-    .lte("date", end);
+      const amount = parseFloat(tx.amount);
+      if (tx.type === "income") grouped[key].income += amount;
+      else if (tx.type === "expense") grouped[key].expense += amount;
+    });
 
-  if (error) return res.status(500).json({ error: error.message });
+    const result = Object.entries(grouped)
+      .map(([month, { income, expense }]) => {
+        income = Number(income ?? 0);
+        expense = Number(expense ?? 0);
+        return {
+          month,
+          income,
+          expense,
+          balance: income - expense,
+        };
+      })
+      .sort((a, b) => a.month.localeCompare(b.month));
 
-  const grouped = {};
-  (data || []).forEach((tx) => {
-    const [y, m] = tx.date.split("-");
-    const key = `${y}-${m}`;
-    if (!grouped[key]) grouped[key] = { income: 0, expense: 0 };
-
-    const amount = parseFloat(tx.amount);
-    if (tx.type === "income") grouped[key].income += amount;
-    else if (tx.type === "expense") grouped[key].expense += amount;
-  });
-
-  const result = Object.entries(grouped)
-    .map(([month, { income, expense }]) => ({
-      month,
-      income,
-      expense,
-    }))
-    .sort((a, b) => a.month.localeCompare(b.month));
-
-  res.json({ success: true, data: result });
-});
+    res.json({ success: true, data: result });
+  }
+);
 
 /* ========= GASTO ANUAL POR CATEGORÍA Y VARIACIONES ========= */
 
@@ -606,62 +611,98 @@ router.get("/budget-vs-actual-history", authenticateUser, async (req, res) => {
   res.json({ success: true, data: result });
 });
 
-
 router.get(
   "/budget-vs-actual-summary-yearly",
   authenticateUser,
   async (req, res) => {
-    const user_id = req.user.id;
-    const year = new Date().getFullYear();
+    try {
+      const user_id = req.user.id;
+      const year = new Date().getFullYear();
 
-    const { data: budgets, error: budgetError } = await supabase
-      .from("budgets")
-      .select("month, limit_amount")
-      .eq("user_id", user_id)
-      .gte("month", `${year}-01`)
-      .lte("month", `${year}-12`);
+      const { start, end } = getYearRange(year);
+      // p.ej. start = `${year}-01-01`, end = `${year}-12-31`
 
-    if (budgetError)
-      return res.status(500).json({ error: budgetError.message });
+      // 1) Presupuestos del año actual (por mes)
+      const { data: budgets, error: budgetError } = await supabase
+        .from("budgets")
+        .select("month, limit_amount")
+        .eq("user_id", user_id)
+        .gte("month", `${year}-01`)
+        .lte("month", `${year}-12`);
 
-    const { data: expenses, error: expenseError } = await supabase
-      .from("transactions")
-      .select("date, amount")
-      .eq("user_id", user_id)
-      .eq("type", "expense")
-      .gte("date", `${year}-01-01`)
-      .lte("date", `${year}-12-31`);
+      if (budgetError) {
+        return res.status(500).json({ error: budgetError.message });
+      }
 
-    if (expenseError)
-      return res.status(500).json({ error: expenseError.message });
+      // 2) Gastos del año actual (MISMA lógica que monthly-income-expense-avg)
+      const { data: expenses, error: expenseError } = await supabase
+        .from("transactions")
+        .select("amount, type, date")
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", start)
+        .lte("date", end);
 
-    const totals = {};
+      if (expenseError) {
+        return res.status(500).json({ error: expenseError.message });
+      }
 
-    for (let i = 1; i <= 12; i++) {
-      const key = `${year}-${String(i).padStart(2, "0")}`;
-      totals[key] = { month: key, budgeted: 0, spent: 0 };
+      // 3) Inicializar todos los meses del año con 0
+      const totals = {};
+      for (let i = 1; i <= 12; i++) {
+        const key = `${year}-${String(i).padStart(2, "0")}`;
+        totals[key] = {
+          month: key,
+          budgeted: 0,
+          spent: 0,
+          diff: 0, // diferencia global del mes
+        };
+      }
+
+      // 4) Sumar presupuesto mensual
+      (budgets || []).forEach((b) => {
+        const monthKey = b.month; // viene como YYYY-MM
+        if (totals[monthKey]) {
+          totals[monthKey].budgeted += parseFloat(b.limit_amount) || 0;
+        }
+      });
+
+      // 5) Sumar gasto mensual (igual que monthly-income-expense-avg)
+      (expenses || []).forEach((tx) => {
+        const [y, m] = tx.date.split("-");
+        const key = `${y}-${m}`;
+        if (!totals[key]) return;
+
+        const amount = parseFloat(tx.amount) || 0;
+        totals[key].spent += amount;
+      });
+
+      // 6) Calcular diferencia por mes (spent - budgeted)
+      const result = Object.values(totals)
+        .map((row) => {
+          const budgeted = row.budgeted || 0;
+          const spent = row.spent || 0;
+          const diff = spent - budgeted; // puede ser + o -
+
+          return {
+            ...row,
+            budgeted,
+            spent,
+            diff,
+          };
+        })
+        .sort((a, b) => a.month.localeCompare(b.month));
+
+      return res.json({ success: true, data: result });
+    } catch (err) {
+      console.error(
+        "Error en /analytics/budget-vs-actual-summary-yearly:",
+        err
+      );
+      return res.status(500).json({ error: "Error interno del servidor" });
     }
-
-    (budgets || []).forEach((b) => {
-      if (totals[b.month]) {
-        totals[b.month].budgeted += parseFloat(b.limit_amount);
-      }
-    });
-
-    (expenses || []).forEach((tx) => {
-      const key = getMonthKey(tx.date);
-      if (totals[key]) {
-        totals[key].spent += parseFloat(tx.amount);
-      }
-    });
-
-    const result = Object.values(totals).sort((a, b) =>
-      a.month.localeCompare(b.month)
-    );
-    res.json({ success: true, data: result });
   }
 );
-
 
 /* ========= GASTO POR TIPO DE ESTABILIDAD ========= */
 
@@ -694,11 +735,41 @@ router.get("/expense-by-stability-type", authenticateUser, async (req, res) => {
 router.get("/top-variable-categories", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
-  const { data, error } = await supabase
+  // 🔹 Query params
+  const {
+    stability_types,  // "fixed,variable", "variable", etc. Opcional
+    date_from,        // "YYYY-MM-DD". Opcional
+    date_to,          // "YYYY-MM-DD". Opcional
+    limit,            // número. Opcional, por defecto 10
+  } = req.query;
+
+  const topN = Number(limit) > 0 ? Number(limit) : 10;
+
+  // Parsear stability_types si viene como string "fixed,variable"
+  let stabilityList = [];
+  if (typeof stability_types === "string" && stability_types.trim() !== "") {
+    stabilityList = stability_types
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  // Construir query base
+  let query = supabase
     .from("transactions")
-    .select("amount, category_id, categories ( name, stability_type )")
+    .select("amount, date, category_id, categories ( name, stability_type )")
     .eq("user_id", user_id)
     .eq("type", "expense");
+
+  // 🔹 Filtro por rango de fechas (si viene)
+  if (date_from) {
+    query = query.gte("date", date_from);
+  }
+  if (date_to) {
+    query = query.lte("date", date_to);
+  }
+
+  const { data, error } = await query;
 
   if (error) return res.status(500).json({ error: error.message });
 
@@ -706,18 +777,24 @@ router.get("/top-variable-categories", authenticateUser, async (req, res) => {
 
   (data || []).forEach((tx) => {
     const category = tx.categories?.name;
-    const type = tx.categories?.stability_type || "variable";
+    const stability = tx.categories?.stability_type;
 
-    if (type !== "variable" || !category) return;
+    if (!category) return;
+
+    // 🔹 Si se especificaron stability_types, filtramos por ellos
+    if (stabilityList.length > 0) {
+      if (!stability || !stabilityList.includes(stability)) return;
+    }
+    // Si NO se especificó stability_types → aceptamos cualquier estabilidad
 
     if (!totals[category]) totals[category] = 0;
-    totals[category] += parseFloat(tx.amount);
+    totals[category] += parseFloat(tx.amount) || 0;
   });
 
   const result = Object.entries(totals)
     .map(([category, total]) => ({ category, total }))
     .sort((a, b) => b.total - a.total)
-    .slice(0, 5);
+    .slice(0, topN);
 
   res.json({ success: true, data: result });
 });
@@ -749,8 +826,6 @@ router.get("/goals-progress", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: result });
 });
-
-
 
 /* ========= PROYECCIONES POR CATEGORÍA (INGRESO / GASTO) ========= */
 
@@ -892,7 +967,6 @@ router.get(
   }
 );
 
-
 /* ========= ESCENARIO SIMULADO (POST) ========= */
 
 router.post("/simulated-scenario", authenticateUser, async (req, res) => {
@@ -1003,7 +1077,8 @@ router.get("/top-items", authenticateUser, async (req, res) => {
 
   const { data, error } = await supabase
     .from("transaction_items")
-    .select(`
+    .select(
+      `
       item_id,
       quantity,
       items!inner (
@@ -1014,7 +1089,8 @@ router.get("/top-items", authenticateUser, async (req, res) => {
         date,
         user_id
       )
-    `)
+    `
+    )
     .eq("transactions.user_id", user_id)
     .eq("items.user_id", user_id)
     .gte("transactions.date", start)
@@ -1037,9 +1113,6 @@ router.get("/top-items", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: result });
 });
-
-
-
 
 router.get("/items-annual-summary", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -1148,8 +1221,6 @@ router.get("/items-annual-summary", authenticateUser, async (req, res) => {
   }
 });
 
-
-
 router.get("/item-trend/:item_id", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
   const item_id = req.params.item_id;
@@ -1196,7 +1267,6 @@ router.get("/item-trend/:item_id", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: result });
 });
-
 
 /* ========= COMPARATIVO MENSUAL POR CATEGORÍA ========= */
 
@@ -1341,8 +1411,7 @@ router.get(
         const c1 = byCat1[catId];
         const c2 = byCat2[catId];
 
-        const name =
-          c1?.category_name || c2?.category_name || "Sin categoría";
+        const name = c1?.category_name || c2?.category_name || "Sin categoría";
 
         const m1 = c1?.month1_total || 0;
         const m2 = c2?.month2_total || 0;
@@ -1388,282 +1457,282 @@ router.get(
 
 /* ========= COMPARATIVO MENSUAL POR ITEM ========= */
 
-router.get(
-  "/item-monthly-comparison",
-  authenticateUser,
-  async (req, res) => {
-    const user_id = req.user.id;
+router.get("/item-monthly-comparison", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
 
-    try {
-      const now = new Date();
+  try {
+    const now = new Date();
 
-      const year1Param = parseInt(req.query.year1, 10);
-      const month1Param = parseInt(req.query.month1, 10);
-      const year2Param = parseInt(req.query.year2, 10);
-      const month2Param = parseInt(req.query.month2, 10);
+    const year1Param = parseInt(req.query.year1, 10);
+    const month1Param = parseInt(req.query.month1, 10);
+    const year2Param = parseInt(req.query.year2, 10);
+    const month2Param = parseInt(req.query.month2, 10);
 
-      let y1, m1Index, y2, m2Index;
+    let y1, m1Index, y2, m2Index;
 
-      const paramsAreValid =
-        !isNaN(year1Param) &&
-        !isNaN(month1Param) &&
-        !isNaN(year2Param) &&
-        !isNaN(month2Param) &&
-        month1Param >= 1 &&
-        month1Param <= 12 &&
-        month2Param >= 1 &&
-        month2Param <= 12;
+    const paramsAreValid =
+      !isNaN(year1Param) &&
+      !isNaN(month1Param) &&
+      !isNaN(year2Param) &&
+      !isNaN(month2Param) &&
+      month1Param >= 1 &&
+      month1Param <= 12 &&
+      month2Param >= 1 &&
+      month2Param <= 12;
 
-      if (paramsAreValid) {
-        y1 = year1Param;
-        m1Index = month1Param - 1;
-        y2 = year2Param;
-        m2Index = month2Param - 1;
-      } else {
-        const baseYear = now.getFullYear();
-        const baseMonthIndex = now.getMonth();
+    if (paramsAreValid) {
+      y1 = year1Param;
+      m1Index = month1Param - 1;
+      y2 = year2Param;
+      m2Index = month2Param - 1;
+    } else {
+      const baseYear = now.getFullYear();
+      const baseMonthIndex = now.getMonth();
 
-        y2 = baseYear;
-        m2Index = baseMonthIndex;
+      y2 = baseYear;
+      m2Index = baseMonthIndex;
 
-        let prevYear = baseYear;
-        let prevMonthIndex = baseMonthIndex - 1;
-        if (prevMonthIndex < 0) {
-          prevMonthIndex = 11;
-          prevYear = baseYear - 1;
-        }
-        y1 = prevYear;
-        m1Index = prevMonthIndex;
+      let prevYear = baseYear;
+      let prevMonthIndex = baseMonthIndex - 1;
+      if (prevMonthIndex < 0) {
+        prevMonthIndex = 11;
+        prevYear = baseYear - 1;
       }
-
-      const month1Key = `${y1}-${String(m1Index + 1).padStart(2, "0")}`;
-      const month2Key = `${y2}-${String(m2Index + 1).padStart(2, "0")}`;
-
-      const { start: start1, end: end1 } = getMonthDateRange(y1, m1Index);
-      const { start: start2, end: end2 } = getMonthDateRange(y2, m2Index);
-
-      const { data: items1, error: err1 } = await supabase
-        .from("transaction_items")
-        .select(`
-          item_id,
-          quantity,
-          unit_price_net,
-          line_total_final,
-          items (
-            name,
-            taxes (
-              rate,
-              is_exempt
-            )
-          ),
-          transactions (
-            date,
-            type,
-            user_id
-          )
-        `)
-        .eq("transactions.user_id", user_id)
-        .eq("transactions.type", "expense")
-        .gte("transactions.date", start1)
-        .lte("transactions.date", end1);
-
-      if (err1) {
-        console.error(err1);
-        return res.status(500).json({ error: err1.message });
-      }
-
-      const byItem1 = {};
-      let totalMonth1Amount = 0;
-
-      (items1 || []).forEach((row) => {
-        const trx = row.transactions;
-        const itemRel = row.items;
-        if (!trx) return;
-
-        const itemId = row.item_id || "sin_item";
-        const itemName = itemRel?.name || "Sin nombre";
-
-        const qty = Number(row.quantity || 0);
-        let lineAmount = 0;
-
-        if (row.line_total_final != null) {
-          lineAmount = Number(row.line_total_final) || 0;
-        } else {
-          const netPrice = Number(row.unit_price_net || 0);
-          const taxRate =
-            itemRel?.taxes?.rate != null ? Number(itemRel.taxes.rate) : 0;
-          const isExempt = !!itemRel?.taxes?.is_exempt;
-
-          let priceWithTax = netPrice;
-          if (!isExempt && taxRate > 0) {
-            priceWithTax = netPrice * (1 + taxRate / 100);
-          }
-
-          lineAmount = priceWithTax * qty;
-        }
-
-        if (!byItem1[itemId]) {
-          byItem1[itemId] = {
-            item_id: itemId,
-            item_name: itemName,
-            month1_qty: 0,
-            month2_qty: 0,
-            month1_amount: 0,
-            month2_amount: 0,
-          };
-        }
-
-        byItem1[itemId].month1_qty += qty;
-        byItem1[itemId].month1_amount += lineAmount;
-        totalMonth1Amount += lineAmount;
-      });
-
-      const { data: items2, error: err2 } = await supabase
-        .from("transaction_items")
-        .select(`
-          item_id,
-          quantity,
-          unit_price_net,
-          line_total_final,
-          items (
-            name,
-            taxes (
-              rate,
-              is_exempt
-            )
-          ),
-          transactions (
-            date,
-            type,
-            user_id
-          )
-        `)
-        .eq("transactions.user_id", user_id)
-        .eq("transactions.type", "expense")
-        .gte("transactions.date", start2)
-        .lte("transactions.date", end2);
-
-      if (err2) {
-        console.error(err2);
-        return res.status(500).json({ error: err2.message });
-      }
-
-      const byItem2 = {};
-      let totalMonth2Amount = 0;
-
-      (items2 || []).forEach((row) => {
-        const trx = row.transactions;
-        const itemRel = row.items;
-        if (!trx) return;
-
-        const itemId = row.item_id || "sin_item";
-        const itemName = itemRel?.name || "Sin nombre";
-
-        const qty = Number(row.quantity || 0);
-        let lineAmount = 0;
-
-        if (row.line_total_final != null) {
-          lineAmount = Number(row.line_total_final) || 0;
-        } else {
-          const netPrice = Number(row.unit_price_net || 0);
-          const taxRate =
-            itemRel?.taxes?.rate != null ? Number(itemRel.taxes.rate) : 0;
-          const isExempt = !!itemRel?.taxes?.is_exempt;
-
-          let priceWithTax = netPrice;
-          if (!isExempt && taxRate > 0) {
-            priceWithTax = netPrice * (1 + taxRate / 100);
-          }
-
-          lineAmount = priceWithTax * qty;
-        }
-
-        if (!byItem2[itemId]) {
-          byItem2[itemId] = {
-            item_id: itemId,
-            item_name: itemName,
-            month1_qty: 0,
-            month2_qty: 0,
-            month1_amount: 0,
-            month2_amount: 0,
-          };
-        }
-
-        byItem2[itemId].month2_qty += qty;
-        byItem2[itemId].month2_amount += lineAmount;
-        totalMonth2Amount += lineAmount;
-      });
-
-      const allItemIds = new Set([
-        ...Object.keys(byItem1),
-        ...Object.keys(byItem2),
-      ]);
-
-      const rows = Array.from(allItemIds).map((itemId) => {
-        const i1 = byItem1[itemId];
-        const i2 = byItem2[itemId];
-
-        const name = i1?.item_name || i2?.item_name || "Sin nombre";
-
-        const q1 = i1?.month1_qty || 0;
-        const q2 = i2?.month2_qty || 0;
-        const m1Amt = i1?.month1_amount || 0;
-        const m2Amt = i2?.month2_amount || 0;
-
-        const diffAmt = m2Amt - m1Amt;
-        const diffQty = q2 - q1;
-
-        return {
-          item_id: itemId,
-          item_name: name,
-          month1_qty: Number(q1.toFixed(2)),
-          month2_qty: Number(q2.toFixed(2)),
-          month1_amount: Number(m1Amt.toFixed(2)),
-          month2_amount: Number(m2Amt.toFixed(2)),
-          diff_amount: Number(diffAmt.toFixed(2)),
-          diff_qty: Number(diffQty.toFixed(2)),
-        };
-      });
-
-      rows.sort((a, b) => {
-        const da = a.diff_amount || 0;
-        const db = b.diff_amount || 0;
-
-        const groupA = da > 0 ? 2 : da === 0 ? 1 : 0;
-        const groupB = db > 0 ? 2 : db === 0 ? 1 : 0;
-
-        if (groupA !== groupB) {
-          return groupB - groupA;
-        }
-
-        if (groupA === 2) {
-          return db - da;
-        }
-
-        if (groupA === 0) {
-          return da - db;
-        }
-
-        return a.item_name.localeCompare(b.item_name);
-      });
-
-      return res.json({
-        success: true,
-        meta: {
-          month1: month1Key,
-          month2: month2Key,
-          month1_total_amount: Number(totalMonth1Amount.toFixed(2)),
-          month2_total_amount: Number(totalMonth2Amount.toFixed(2)),
-        },
-        data: rows,
-      });
-    } catch (err) {
-      console.error(err);
-      return res.status(500).json({
-        error: "Error generando comparativo mensual por artículo",
-      });
+      y1 = prevYear;
+      m1Index = prevMonthIndex;
     }
+
+    const month1Key = `${y1}-${String(m1Index + 1).padStart(2, "0")}`;
+    const month2Key = `${y2}-${String(m2Index + 1).padStart(2, "0")}`;
+
+    const { start: start1, end: end1 } = getMonthDateRange(y1, m1Index);
+    const { start: start2, end: end2 } = getMonthDateRange(y2, m2Index);
+
+    const { data: items1, error: err1 } = await supabase
+      .from("transaction_items")
+      .select(
+        `
+          item_id,
+          quantity,
+          unit_price_net,
+          line_total_final,
+          items (
+            name,
+            taxes (
+              rate,
+              is_exempt
+            )
+          ),
+          transactions (
+            date,
+            type,
+            user_id
+          )
+        `
+      )
+      .eq("transactions.user_id", user_id)
+      .eq("transactions.type", "expense")
+      .gte("transactions.date", start1)
+      .lte("transactions.date", end1);
+
+    if (err1) {
+      console.error(err1);
+      return res.status(500).json({ error: err1.message });
+    }
+
+    const byItem1 = {};
+    let totalMonth1Amount = 0;
+
+    (items1 || []).forEach((row) => {
+      const trx = row.transactions;
+      const itemRel = row.items;
+      if (!trx) return;
+
+      const itemId = row.item_id || "sin_item";
+      const itemName = itemRel?.name || "Sin nombre";
+
+      const qty = Number(row.quantity || 0);
+      let lineAmount = 0;
+
+      if (row.line_total_final != null) {
+        lineAmount = Number(row.line_total_final) || 0;
+      } else {
+        const netPrice = Number(row.unit_price_net || 0);
+        const taxRate =
+          itemRel?.taxes?.rate != null ? Number(itemRel.taxes.rate) : 0;
+        const isExempt = !!itemRel?.taxes?.is_exempt;
+
+        let priceWithTax = netPrice;
+        if (!isExempt && taxRate > 0) {
+          priceWithTax = netPrice * (1 + taxRate / 100);
+        }
+
+        lineAmount = priceWithTax * qty;
+      }
+
+      if (!byItem1[itemId]) {
+        byItem1[itemId] = {
+          item_id: itemId,
+          item_name: itemName,
+          month1_qty: 0,
+          month2_qty: 0,
+          month1_amount: 0,
+          month2_amount: 0,
+        };
+      }
+
+      byItem1[itemId].month1_qty += qty;
+      byItem1[itemId].month1_amount += lineAmount;
+      totalMonth1Amount += lineAmount;
+    });
+
+    const { data: items2, error: err2 } = await supabase
+      .from("transaction_items")
+      .select(
+        `
+          item_id,
+          quantity,
+          unit_price_net,
+          line_total_final,
+          items (
+            name,
+            taxes (
+              rate,
+              is_exempt
+            )
+          ),
+          transactions (
+            date,
+            type,
+            user_id
+          )
+        `
+      )
+      .eq("transactions.user_id", user_id)
+      .eq("transactions.type", "expense")
+      .gte("transactions.date", start2)
+      .lte("transactions.date", end2);
+
+    if (err2) {
+      console.error(err2);
+      return res.status(500).json({ error: err2.message });
+    }
+
+    const byItem2 = {};
+    let totalMonth2Amount = 0;
+
+    (items2 || []).forEach((row) => {
+      const trx = row.transactions;
+      const itemRel = row.items;
+      if (!trx) return;
+
+      const itemId = row.item_id || "sin_item";
+      const itemName = itemRel?.name || "Sin nombre";
+
+      const qty = Number(row.quantity || 0);
+      let lineAmount = 0;
+
+      if (row.line_total_final != null) {
+        lineAmount = Number(row.line_total_final) || 0;
+      } else {
+        const netPrice = Number(row.unit_price_net || 0);
+        const taxRate =
+          itemRel?.taxes?.rate != null ? Number(itemRel.taxes.rate) : 0;
+        const isExempt = !!itemRel?.taxes?.is_exempt;
+
+        let priceWithTax = netPrice;
+        if (!isExempt && taxRate > 0) {
+          priceWithTax = netPrice * (1 + taxRate / 100);
+        }
+
+        lineAmount = priceWithTax * qty;
+      }
+
+      if (!byItem2[itemId]) {
+        byItem2[itemId] = {
+          item_id: itemId,
+          item_name: itemName,
+          month1_qty: 0,
+          month2_qty: 0,
+          month1_amount: 0,
+          month2_amount: 0,
+        };
+      }
+
+      byItem2[itemId].month2_qty += qty;
+      byItem2[itemId].month2_amount += lineAmount;
+      totalMonth2Amount += lineAmount;
+    });
+
+    const allItemIds = new Set([
+      ...Object.keys(byItem1),
+      ...Object.keys(byItem2),
+    ]);
+
+    const rows = Array.from(allItemIds).map((itemId) => {
+      const i1 = byItem1[itemId];
+      const i2 = byItem2[itemId];
+
+      const name = i1?.item_name || i2?.item_name || "Sin nombre";
+
+      const q1 = i1?.month1_qty || 0;
+      const q2 = i2?.month2_qty || 0;
+      const m1Amt = i1?.month1_amount || 0;
+      const m2Amt = i2?.month2_amount || 0;
+
+      const diffAmt = m2Amt - m1Amt;
+      const diffQty = q2 - q1;
+
+      return {
+        item_id: itemId,
+        item_name: name,
+        month1_qty: Number(q1.toFixed(2)),
+        month2_qty: Number(q2.toFixed(2)),
+        month1_amount: Number(m1Amt.toFixed(2)),
+        month2_amount: Number(m2Amt.toFixed(2)),
+        diff_amount: Number(diffAmt.toFixed(2)),
+        diff_qty: Number(diffQty.toFixed(2)),
+      };
+    });
+
+    rows.sort((a, b) => {
+      const da = a.diff_amount || 0;
+      const db = b.diff_amount || 0;
+
+      const groupA = da > 0 ? 2 : da === 0 ? 1 : 0;
+      const groupB = db > 0 ? 2 : db === 0 ? 1 : 0;
+
+      if (groupA !== groupB) {
+        return groupB - groupA;
+      }
+
+      if (groupA === 2) {
+        return db - da;
+      }
+
+      if (groupA === 0) {
+        return da - db;
+      }
+
+      return a.item_name.localeCompare(b.item_name);
+    });
+
+    return res.json({
+      success: true,
+      meta: {
+        month1: month1Key,
+        month2: month2Key,
+        month1_total_amount: Number(totalMonth1Amount.toFixed(2)),
+        month2_total_amount: Number(totalMonth2Amount.toFixed(2)),
+      },
+      data: rows,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({
+      error: "Error generando comparativo mensual por artículo",
+    });
   }
-);
+});
 
 module.exports = router;
