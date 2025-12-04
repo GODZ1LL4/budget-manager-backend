@@ -74,43 +74,6 @@ router.get("/item-prices-trend", authenticateUser, async (req, res) => {
 
 /* ========= CATEGORÍAS: RESUMEN Y TENDENCIAS ========= */
 
-router.get("/category-spending-summary", authenticateUser, async (req, res) => {
-  const user_id = req.user.id;
-  const now = new Date();
-  const sixMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 5, 1);
-  const startDate = sixMonthsAgo.toISOString().split("T")[0];
-
-  const { data, error } = await supabase
-    .from("transactions")
-    .select(
-      `
-      amount,
-      category_id,
-      categories ( name, type )
-    `
-    )
-    .eq("user_id", user_id)
-    .eq("type", "expense")
-    .gte("date", startDate);
-
-  if (error) return res.status(500).json({ error: error.message });
-
-  const totals = {};
-
-  (data || []).forEach((tx) => {
-    const catName = tx.categories?.name || "Sin categoría";
-    const amount = parseFloat(tx.amount);
-
-    if (!totals[catName]) totals[catName] = 0;
-    totals[catName] += amount;
-  });
-
-  const result = Object.entries(totals)
-    .map(([category, total]) => ({ category, total }))
-    .sort((a, b) => b.total - a.total);
-
-  res.json({ success: true, data: result });
-});
 
 router.get("/top-items-by-category", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -1734,5 +1697,251 @@ router.get("/item-monthly-comparison", authenticateUser, async (req, res) => {
     });
   }
 });
+
+/* ========= INGRESOS / GASTOS ANUALES POR TIPO DE ESTABILIDAD ========= */
+
+router.get(
+  "/yearly-income-expense-by-stability",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+
+    // Permitir override de año por query param ?year=2024, si quieres
+    const now = new Date();
+    const yearParam = parseInt(req.query.year, 10);
+    const year = !isNaN(yearParam) ? yearParam : now.getFullYear();
+
+    const { start, end } = getYearRange(year); // ya definido arriba
+
+    try {
+      const { data, error } = await supabase
+        .from("transactions")
+        .select(`
+          amount,
+          type,
+          date,
+          categories ( stability_type )
+        `)
+        .eq("user_id", user_id)
+        .gte("date", start)
+        .lte("date", end);
+
+      if (error) {
+        console.error(error);
+        return res.status(500).json({ error: error.message });
+      }
+
+      // Totales globales del año
+      const total = {
+        income: 0,
+        expense: 0,
+      };
+
+      // Totales por tipo de estabilidad
+      const byStability = {
+        fixed: { income: 0, expense: 0 },
+        variable: { income: 0, expense: 0 },
+        occasional: { income: 0, expense: 0 },
+      };
+
+      (data || []).forEach((tx) => {
+        const txType = tx.type; // "income" | "expense" | "transfer"
+        if (txType !== "income" && txType !== "expense") return;
+
+        const amount = parseFloat(tx.amount) || 0;
+
+        // Sumar al total global
+        total[txType] += amount;
+
+        // Determinar estabilidad (default "variable" si no viene)
+        const stability =
+          tx.categories?.stability_type || "variable";
+
+        if (!byStability[stability]) {
+          // Por si aparece algún valor raro en BD
+          byStability[stability] = { income: 0, expense: 0 };
+        }
+
+        byStability[stability][txType] += amount;
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          year,
+          total: {
+            income: Number(total.income.toFixed(2)),
+            expense: Number(total.expense.toFixed(2)),
+          },
+          byStability: Object.fromEntries(
+            Object.entries(byStability).map(([key, value]) => [
+              key,
+              {
+                income: Number((value.income || 0).toFixed(2)),
+                expense: Number((value.expense || 0).toFixed(2)),
+              },
+            ])
+          ),
+        },
+      });
+    } catch (err) {
+      console.error(
+        "Error en /analytics/yearly-income-expense-by-stability:",
+        err
+      );
+      return res
+        .status(500)
+        .json({ error: "Error interno del servidor" });
+    }
+  }
+);
+
+/* ========= BURN RATE (RITMO DE GASTO DEL MES ACTUAL) ========= */
+
+router.get(
+  "/spending-burn-rate-current-month",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+
+    try {
+      const now = new Date();
+      const year = now.getFullYear();
+      const monthIndex = now.getMonth(); // 0-11
+      const monthKey = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
+
+      const start = `${monthKey}-01`;
+      const today = now.toISOString().split("T")[0];
+      const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+      const dayOfMonth = now.getDate();
+
+      // 1) Presupuesto total del mes (suma de todos los budgets de ese mes)
+      const { data: budgets, error: budgetError } = await supabase
+        .from("budgets")
+        .select("limit_amount")
+        .eq("user_id", user_id)
+        .eq("month", monthKey);
+
+      if (budgetError) {
+        console.error(budgetError);
+        return res.status(500).json({ error: budgetError.message });
+      }
+
+      const budgetTotal = (budgets || []).reduce(
+        (sum, b) => sum + (parseFloat(b.limit_amount) || 0),
+        0
+      );
+
+      // Si no hay presupuesto, devolvemos algo útil pero sin ideal
+      if (!budgetTotal || budgetTotal <= 0) {
+        return res.json({
+          success: true,
+          data: {
+            month: monthKey,
+            today,
+            days_in_month: daysInMonth,
+            day_of_month: dayOfMonth,
+            budget_total: 0,
+            ideal_to_date: 0,
+            actual_to_date: 0,
+            projected_end_of_month: 0,
+            variance_to_ideal: 0,
+            variance_to_budget_end: 0,
+            series: [],
+          },
+        });
+      }
+
+      // 2) Gastos diarios reales del mes hasta hoy
+      const { data: expenses, error: expenseError } = await supabase
+        .from("transactions")
+        .select("amount, date")
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", start)
+        .lte("date", today);
+
+      if (expenseError) {
+        console.error(expenseError);
+        return res.status(500).json({ error: expenseError.message });
+      }
+
+      const dailyMap = {};
+
+      (expenses || []).forEach((tx) => {
+        const d = tx.date; // "YYYY-MM-DD"
+        const amt = parseFloat(tx.amount) || 0;
+        if (!dailyMap[d]) dailyMap[d] = 0;
+        dailyMap[d] += amt;
+      });
+
+      const idealDaily = budgetTotal / daysInMonth;
+
+      let cumulativeIdeal = 0;
+      let cumulativeActual = 0;
+
+      const series = [];
+
+      for (let day = 1; day <= daysInMonth; day++) {
+        const dateStr = `${monthKey}-${String(day).padStart(2, "0")}`;
+        const dailyExpense = dailyMap[dateStr] || 0;
+
+        cumulativeActual += dailyExpense;
+        cumulativeIdeal += idealDaily;
+
+        // Para días futuros (después de hoy), no sumamos más gasto real
+        if (day > dayOfMonth) {
+          // Mantener el acumulado real igual que al día actual
+          cumulativeActual = cumulativeActual; // no cambia, solo claridad
+        }
+
+        series.push({
+          day,
+          date: dateStr,
+          daily_expense: Number(dailyExpense.toFixed(2)),
+          ideal_cumulative: Number(cumulativeIdeal.toFixed(2)),
+          actual_cumulative: Number(
+            (day <= dayOfMonth ? cumulativeActual : cumulativeActual).toFixed(2)
+          ),
+        });
+      }
+
+      const actualToDate = series[dayOfMonth - 1]?.actual_cumulative || 0;
+      const idealToDate = series[dayOfMonth - 1]?.ideal_cumulative || 0;
+
+      const projectedEndOfMonth =
+        dayOfMonth > 0
+          ? (actualToDate / dayOfMonth) * daysInMonth
+          : actualToDate;
+
+      const varianceToIdeal = actualToDate - idealToDate;
+      const varianceToBudgetEnd = projectedEndOfMonth - budgetTotal;
+
+      return res.json({
+        success: true,
+        data: {
+          month: monthKey,
+          today,
+          days_in_month: daysInMonth,
+          day_of_month: dayOfMonth,
+          budget_total: Number(budgetTotal.toFixed(2)),
+          ideal_to_date: Number(idealToDate.toFixed(2)),
+          actual_to_date: Number(actualToDate.toFixed(2)),
+          projected_end_of_month: Number(projectedEndOfMonth.toFixed(2)),
+          variance_to_ideal: Number(varianceToIdeal.toFixed(2)),
+          variance_to_budget_end: Number(varianceToBudgetEnd.toFixed(2)),
+          series,
+        },
+      });
+    } catch (err) {
+      console.error("Error en /analytics/spending-burn-rate-current-month:", err);
+      return res
+        .status(500)
+        .json({ error: "Error interno del servidor (burn rate)" });
+    }
+  }
+);
+
+
 
 module.exports = router;
