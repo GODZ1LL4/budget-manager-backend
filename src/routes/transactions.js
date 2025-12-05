@@ -73,26 +73,109 @@ router.get("/for-calendar", authenticateUser, async (req, res) => {
 });
 
 // ✅ Obtener transacciones del usuario
+// ✅ Obtener transacciones del usuario (con filtros)
 router.get("/", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
-  const { data, error } = await supabase
+  const { description, type, account_id, category_id, date_from, date_to } =
+    req.query;
+
+  try {
+    let query = supabase
+      .from("transactions")
+      .select(
+        `
+      *,
+      account:accounts!transactions_account_id_fkey (id, name),
+      account_from:accounts!transactions_account_from_fkey (id, name),
+      account_to:accounts!transactions_account_to_fkey (id, name),
+      categories (id, name, type)
+    `
+      )
+      .eq("user_id", user_id);
+
+    // 🔍 Filtro por descripción (búsqueda parcial)
+    if (description && description.trim() !== "") {
+      query = query.ilike("description", `%${description.trim()}%`);
+    }
+
+    // 🔍 Filtro por tipo (expense, income, transfer...)
+    if (type && type !== "all") {
+      query = query.eq("type", type);
+    }
+
+    // 🔍 Filtro por categoría
+    if (category_id) {
+      query = query.eq("category_id", category_id);
+    }
+
+    // 🔍 Filtro por cuenta (en cualquiera de los campos de cuenta)
+    if (account_id) {
+      query = query.or(
+        `account_id.eq.${account_id},account_from_id.eq.${account_id},account_to_id.eq.${account_id}`
+      );
+    }
+
+    // 🔍 Filtro por fecha desde / hasta
+    if (date_from) {
+      query = query.gte("date", date_from);
+    }
+    if (date_to) {
+      query = query.lte("date", date_to);
+    }
+
+    // Orden por fecha descendente
+    query = query.order("date", { ascending: false });
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error("🔥 Error al obtener transacciones:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error("🔥 Error inesperado al obtener transacciones:", err);
+    return res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
+
+router.get("/:id/items", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+  const { id } = req.params;
+
+  // Validar que la transacción sea del usuario
+  const { data: tx, error: txError } = await supabase
     .from("transactions")
+    .select("id, user_id")
+    .eq("id", id)
+    .eq("user_id", user_id)
+    .single();
+
+  if (txError || !tx) {
+    return res.status(404).json({ error: "Transacción no encontrada" });
+  }
+
+  const { data, error } = await supabase
+    .from("transaction_items")
     .select(
       `
-    *,
-    account:accounts!transactions_account_id_fkey (id, name),
-    account_from:accounts!transactions_account_from_fkey (id, name),
-    account_to:accounts!transactions_account_to_fkey (id, name),
-    categories (id, name, type)
-  `
+      id,
+      quantity,
+      unit_price_net,
+      unit_price_final,
+      line_total_final,
+      tax_rate_used,
+      is_exempt_used,
+      items ( id, name )
+    `
     )
-    .eq("user_id", user_id)
-    .order("date", { ascending: false });
+    .eq("transaction_id", id);
 
   if (error) {
-    console.error("🔥 Error al obtener transacciones:", error);
-    return res.status(500).json({ error: error.message });
+    console.error("Error obteniendo items de transacción:", error);
+    return res.status(500).json({ error: "Error obteniendo artículos." });
   }
 
   res.json({ success: true, data });
@@ -173,7 +256,10 @@ router.post("/", authenticateUser, async (req, res) => {
     amount = totalFinal;
   }
 
-  // ✅ Insertar transacción (encaja con tu schema: discount_percent existe)
+  // ✅ AHORA SÍ, después de construir transactionItems
+  const isShoppingList = transactionItems.length > 0;
+
+  // ✅ Insertar transacción
   const { data: tx, error: txError } = await supabase
     .from("transactions")
     .insert([
@@ -188,6 +274,7 @@ router.post("/", authenticateUser, async (req, res) => {
         recurrence: recurrence || null,
         recurrence_end_date: recurrence_end_date || null,
         discount_percent: parseFloat(discount) || 0,
+        is_shopping_list: isShoppingList, // 👈 ahora sí correcto
       },
     ])
     .select()
