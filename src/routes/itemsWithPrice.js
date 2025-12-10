@@ -18,7 +18,7 @@ router.get("/", authenticateUser, async (req, res) => {
   res.json({ success: true, data });
 });
 
-// POST /api/items-with-price/export-prices
+
 // Exportar precios de artículos seleccionados en CSV
 router.post("/export-prices", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -46,24 +46,21 @@ router.post("/export-prices", authenticateUser, async (req, res) => {
 
     // Construir CSV: "id","nombre","ultimo precio","Fecha"
 // Construir CSV: "id";"nombre";"ultimo precio";"Fecha"
-const header = ['"id"', '"nombre"', '"ultimo precio"', '"Fecha"'];
+// Construir CSV: "id";"nombre";"precio";"cantidad"
+const header = ['"id"', '"nombre"', '"precio"', '"cantidad"'];
 
 const rows = (data || []).map((item) => {
   const id = item.id ?? "";
   const nombre = (item.name || "").replace(/"/g, '""');
-  const ultimoPrecio =
+  const precio =
     item.latest_price !== null && item.latest_price !== undefined
       ? String(item.latest_price)
       : "";
-  const fecha = ""; // de momento sin fecha
 
-  // OJO: ahora usamos ; como separador
-  return [
-    `"${id}"`,
-    `"${nombre}"`,
-    `"${ultimoPrecio}"`,
-    `"${fecha}"`,
-  ].join(";");
+  // cantidad vacía (el usuario la llenará en Excel)
+  const cantidad = "";
+
+  return [`"${id}"`, `"${nombre}"`, `"${precio}"`, `"${cantidad}"`].join(";");
 });
 
 // También aquí usamos ; en el header
@@ -79,6 +76,7 @@ res.setHeader(
 
 return res.status(200).send(csvContent);
 
+
   } catch (err) {
     console.error("Error inesperado en export-prices:", err);
     return res
@@ -87,8 +85,7 @@ return res.status(200).send(csvContent);
   }
 });
 
-router.post(
-  "/import-prices",
+router.post("/import-prices",
   authenticateUser,
   upload.single("file"), // campo "file" en el form-data
   async (req, res) => {

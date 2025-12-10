@@ -449,8 +449,7 @@ router.put("/scenario_transactions/:id", authenticateUser, async (req, res) => {
   res.json({ success: true });
 });
 
-router.delete(
-  "/scenario_transactions/:id",
+router.delete("/scenario_transactions/:id",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -693,13 +692,18 @@ router.get("/:id/budget-import-preview", authenticateUser, async (req, res) => {
 
 /**
  * ⬇️ Importar a budgets desde un escenario
- * Body: { scope: "current"|"all", strategy: "skip"|"replace" }
+ * Body: { scope: "current"|"all", selected_keys: string[] }
+ *  - selected_keys: array de claves "YYYY-MM::category_id"
+ *    Todo lo que esté en selected_keys se inserta/actualiza.
+ *    Todo lo demás se cuenta como "skipped".
  */
 router.post("/:id/import-to-budgets", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
   const scenario_id = req.params.id;
   const scope = (req.body.scope || "current").toLowerCase();
-  const strategy = (req.body.strategy || "skip").toLowerCase(); // "skip" | "replace"
+  const selectedKeys = Array.isArray(req.body.selected_keys)
+    ? req.body.selected_keys
+    : [];
 
   // validar escenario
   const { data: scenario, error: scenarioError } = await supabase
@@ -733,17 +737,22 @@ router.post("/:id/import-to-budgets", authenticateUser, async (req, res) => {
     instances.push(...expandRuleToRange(rule, from, to));
   }
   const rollup = rollupByMonthAndCategory(instances);
+  const totalCandidates = rollup.length;
 
-  if (rollup.length === 0) {
+  if (totalCandidates === 0) {
     return res.json({
       success: true,
-      data: { inserted: 0, updated: 0, skipped: 0 },
+      data: { inserted: 0, updated: 0, skipped: 0, total: 0, selected: 0 },
     });
   }
 
-  // buscar existentes
+  // set de claves seleccionadas (YYYY-MM::category_id)
+  const selectedSet = new Set(selectedKeys);
+
+  // buscar budgets existentes solo para las combinaciones detectadas
   const months = Array.from(new Set(rollup.map((r) => r.month)));
   const categoryIds = Array.from(new Set(rollup.map((r) => r.category_id)));
+
   const { data: existing, error: existingErr } = await supabase
     .from("budgets")
     .select("id, month, category_id, limit_amount")
@@ -765,10 +774,23 @@ router.post("/:id/import-to-budgets", authenticateUser, async (req, res) => {
   const toInsert = [];
   const toUpdate = [];
 
+  let selectedCount = 0;
+  let skipped = 0;
+
   for (const r of rollup) {
     const key = `${r.month}::${r.category_id}`;
+
+    // si no está marcado → se omite
+    if (!selectedSet.has(key)) {
+      skipped++;
+      continue;
+    }
+
+    selectedCount++;
+
     const exists = existingMap.get(key);
     if (!exists) {
+      // nuevo presupuesto
       toInsert.push({
         user_id,
         month: r.month,
@@ -776,7 +798,8 @@ router.post("/:id/import-to-budgets", authenticateUser, async (req, res) => {
         limit_amount: r.amount,
         source_scenario_id: scenario_id,
       });
-    } else if (strategy === "replace") {
+    } else {
+      // reemplazar presupuesto existente
       toUpdate.push({
         id: exists.id,
         limit_amount: r.amount,
@@ -784,9 +807,8 @@ router.post("/:id/import-to-budgets", authenticateUser, async (req, res) => {
     }
   }
 
-  let inserted = 0,
-    updated = 0,
-    skipped = 0;
+  let inserted = 0;
+  let updated = 0;
 
   if (toInsert.length > 0) {
     const { error: insErr } = await supabase.from("budgets").insert(toInsert);
@@ -798,7 +820,6 @@ router.post("/:id/import-to-budgets", authenticateUser, async (req, res) => {
   }
 
   if (toUpdate.length > 0) {
-    // sanity check: ningún update sin id
     const invalid = toUpdate.filter(
       (u) => !u.id || typeof u.limit_amount === "undefined"
     );
@@ -833,15 +854,16 @@ router.post("/:id/import-to-budgets", authenticateUser, async (req, res) => {
     }
   }
 
-  // los conflictos que no se reemplazaron cuentan como skipped
-  for (const r of rollup) {
-    const key = `${r.month}::${r.category_id}`;
-    if (existingMap.has(key) && strategy !== "replace") skipped++;
-  }
-
+  // skipped ya cuenta lo no seleccionado
   res.json({
     success: true,
-    data: { inserted, updated, skipped, total: rollup.length },
+    data: {
+      inserted,
+      updated,
+      skipped,
+      total: totalCandidates,
+      selected: selectedCount,
+    },
   });
 });
 

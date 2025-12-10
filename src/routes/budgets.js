@@ -16,8 +16,7 @@ const getLastDayOfMonth = (yyyyMm) => {
  * - Suma gastos por categoría en ese mes.
  * - Indica si la categoría ya tiene presupuesto en el mes destino.
  */
-router.get(
-  "/history-import-preview",
+router.get("/history-import-preview",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -333,14 +332,21 @@ router.get("/", authenticateUser, async (req, res) => {
       gastoPorMesCat[key][cat] += parseFloat(tx.amount);
     });
 
-    const result = budgets.map((b) => ({
-      id: b.id,
-      category_id: b.category_id,
-      category_name: b.categories?.name || "Sin nombre",
-      month: b.month,
-      limit: parseFloat(b.limit_amount),
-      spent: gastoPorMesCat[b.month]?.[b.category_id] || 0,
-    }));
+    const result = budgets
+      .map((b) => ({
+        id: b.id,
+        category_id: b.category_id,
+        category_name: b.categories?.name || "Sin nombre",
+        month: b.month,
+        limit: parseFloat(b.limit_amount),
+        spent: gastoPorMesCat[b.month]?.[b.category_id] || 0,
+      }))
+      // 👇 ordenar por nombre de categoría (orden alfabético ES)
+      .sort((a, b) =>
+        a.category_name.localeCompare(b.category_name, "es", {
+          sensitivity: "base",
+        })
+      );
 
     res.json({ success: true, data: result });
   } catch (err) {
@@ -348,6 +354,7 @@ router.get("/", authenticateUser, async (req, res) => {
     res.status(500).json({ error: "Error inesperado en /budgets" });
   }
 });
+
 
 // POST /budgets — Crear presupuesto (soporte para repeat anual)
 router.post("/", authenticateUser, async (req, res) => {

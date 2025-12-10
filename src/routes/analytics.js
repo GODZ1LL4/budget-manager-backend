@@ -407,8 +407,7 @@ router.get("/overbudget-categories", authenticateUser, async (req, res) => {
 
 /* ========= TENDENCIA DE AHORRO Y INGRESO/GASTO MENSUAL ========= */
 
-router.get(
-  "/monthly-income-expense-avg",
+router.get("/monthly-income-expense-avg",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -454,8 +453,7 @@ router.get(
 
 /* ========= GASTO ANUAL POR CATEGORÍA Y VARIACIONES ========= */
 
-router.get(
-  "/annual-expense-by-category",
+router.get("/annual-expense-by-category",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -488,8 +486,7 @@ router.get(
   }
 );
 
-router.get(
-  "/yearly-category-variations",
+router.get("/yearly-category-variations",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -574,8 +571,7 @@ router.get("/budget-vs-actual-history", authenticateUser, async (req, res) => {
   res.json({ success: true, data: result });
 });
 
-router.get(
-  "/budget-vs-actual-summary-yearly",
+router.get("/budget-vs-actual-summary-yearly",
   authenticateUser,
   async (req, res) => {
     try {
@@ -792,16 +788,29 @@ router.get("/goals-progress", authenticateUser, async (req, res) => {
 
 /* ========= PROYECCIONES POR CATEGORÍA (INGRESO / GASTO) ========= */
 
-router.get(
-  "/projected-expense-by-category",
+router.get("/projected-expense-by-category",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
 
     const now = new Date();
-    const startDate = new Date(now.getFullYear(), now.getMonth() - 2, 1)
+
+    // 1) Primer día del mes actual
+    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    // 2) Primer día de hace 3 meses (esto incluye justo 3 meses completos ANTES del mes actual)
+    //    Ej: hoy diciembre -> startDate = 1 septiembre
+    const startDate = new Date(
+      now.getFullYear(),
+      now.getMonth() - 3,
+      1
+    )
       .toISOString()
       .split("T")[0];
+
+    // 3) endDate = primer día del mes actual (para excluir total el mes actual)
+    //    Ej: hoy diciembre -> endDate = 1 diciembre
+    const endDate = currentMonthStart.toISOString().split("T")[0];
 
     const { data, error } = await supabase
       .from("transactions")
@@ -810,20 +819,26 @@ router.get(
       )
       .eq("user_id", user_id)
       .eq("type", "expense")
-      .gte("date", startDate);
+      .gte("date", startDate)  // >= 1er día de hace 3 meses
+      .lt("date", endDate);    // < 1er día del mes actual (excluye el mes actual)
 
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
 
+    // 4) Acumulamos gasto MENSUAL por categoría + stability_type + mes
     const monthlyPerCategory = {};
 
     (data || []).forEach((tx) => {
       const catName = tx.categories?.name || "Sin categoría";
       const stability = tx.categories?.stability_type || "variable";
-      const month = tx.date.slice(0, 7);
+      const month = tx.date.slice(0, 7); // "YYYY-MM"
 
+      // Ignoramos categorías ocasionales
       if (stability === "occasional") return;
 
       const key = `${catName}__${stability}__${month}`;
+
       if (!monthlyPerCategory[key]) {
         monthlyPerCategory[key] = {
           category: catName,
@@ -836,34 +851,57 @@ router.get(
       monthlyPerCategory[key].total += parseFloat(tx.amount);
     });
 
+    // 5) Agrupamos por categoría + stability_type y guardamos los totales mensuales
     const byCategory = {};
 
     Object.values(monthlyPerCategory).forEach((entry) => {
       const key = `${entry.category}__${entry.stability_type}`;
+
       if (!byCategory[key]) {
         byCategory[key] = {
           category: entry.category,
           stability_type: entry.stability_type,
-          total: 0,
-          months: 0,
+          monthlyTotals: [],
         };
       }
-      byCategory[key].total += entry.total;
-      byCategory[key].months += 1;
+
+      byCategory[key].monthlyTotals.push(entry.total);
     });
 
-    const result = Object.values(byCategory).map((entry) => ({
-      category: entry.category,
-      stability_type: entry.stability_type,
-      projected_monthly: parseFloat((entry.total / entry.months).toFixed(2)),
-    }));
+    // 6) Helper para calcular MEDIANA
+    const median = (arr) => {
+      if (!arr || arr.length === 0) return 0;
+
+      const sorted = [...arr].sort((a, b) => a - b);
+      const n = sorted.length;
+      const mid = Math.floor(n / 2);
+
+      if (n % 2 === 1) {
+        // longitud impar → valor central
+        return sorted[mid];
+      } else {
+        // longitud par → promedio de los dos centrales
+        return (sorted[mid - 1] + sorted[mid]) / 2;
+      }
+    };
+
+    // 7) Calculamos la proyección mensual (mediana) por categoría + stability_type
+    const result = Object.values(byCategory).map((entry) => {
+      const projectedMonthly = median(entry.monthlyTotals || []);
+
+      return {
+        category: entry.category,
+        stability_type: entry.stability_type,
+        projected_monthly: parseFloat(projectedMonthly.toFixed(2)),
+      };
+    });
 
     res.json({ success: true, data: result });
   }
 );
 
-router.get(
-  "/projected-income-by-category",
+
+router.get("/projected-income-by-category",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -1233,8 +1271,7 @@ router.get("/item-trend/:item_id", authenticateUser, async (req, res) => {
 
 /* ========= COMPARATIVO MENSUAL POR CATEGORÍA ========= */
 
-router.get(
-  "/category-monthly-comparison",
+router.get("/category-monthly-comparison",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -1700,8 +1737,7 @@ router.get("/item-monthly-comparison", authenticateUser, async (req, res) => {
 
 /* ========= INGRESOS / GASTOS ANUALES POR TIPO DE ESTABILIDAD ========= */
 
-router.get(
-  "/yearly-income-expense-by-stability",
+router.get("/yearly-income-expense-by-stability",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -1798,8 +1834,7 @@ router.get(
 
 /* ========= BURN RATE (RITMO DE GASTO DEL MES ACTUAL) ========= */
 
-router.get(
-  "/spending-burn-rate-current-month",
+router.get("/spending-burn-rate-current-month",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;

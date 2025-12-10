@@ -72,7 +72,6 @@ router.get("/for-calendar", authenticateUser, async (req, res) => {
   res.json({ success: true, data: result });
 });
 
-// ✅ Obtener transacciones del usuario
 // ✅ Obtener transacciones del usuario (con filtros)
 router.get("/", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -315,7 +314,6 @@ router.post("/", authenticateUser, async (req, res) => {
   res.json({ success: true, data: tx });
 });
 
-
 // ✅ Eliminar transacción (y sus artículos por cascade)
 router.delete("/:id", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -334,5 +332,303 @@ router.delete("/:id", authenticateUser, async (req, res) => {
 
   res.json({ success: true, message: "Transacción eliminada" });
 });
+
+router.post("/import-shopping-list",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+    const {
+      account_id,
+      category_id,
+      date,
+      description = "",
+      discount = 0,   // porcentaje 0–100
+      lines = [],
+    } = req.body;
+
+    if (!account_id || !category_id || !date) {
+      return res
+        .status(400)
+        .json({ error: "Faltan account_id, category_id o date" });
+    }
+
+    if (!Array.isArray(lines) || lines.length === 0) {
+      return res
+        .status(400)
+        .json({ error: "Debes enviar al menos una línea en 'lines'" });
+    }
+
+    try {
+      const itemIds = Array.from(
+        new Set(
+          lines
+            .map((l) => l.item_id)
+            .filter((id) => typeof id === "string" && id.length > 0)
+        )
+      );
+
+      if (itemIds.length === 0) {
+        return res
+          .status(400)
+          .json({ error: "Las líneas no contienen item_id válidos" });
+      }
+
+      // 1) Items + impuestos
+      const { data: itemsData, error: itemsError } = await supabase
+        .from("items")
+        .select("id, user_id, tax_id, taxes:tax_id(rate, is_exempt)")
+        .in("id", itemIds);
+
+      if (itemsError) {
+        console.error("❌ Error leyendo items:", itemsError);
+        return res
+          .status(500)
+          .json({ error: "No se pudieron leer los artículos" });
+      }
+
+      // asegurar que todo es del usuario
+      const filteredItems = (itemsData || []).filter(
+        (it) => it.user_id === user_id
+      );
+      const itemMap = new Map(filteredItems.map((it) => [it.id, it]));
+
+      // 2) Precios existentes para esa fecha
+      const { data: existingPrices, error: priceFetchErr } = await supabase
+        .from("item_prices")
+        .select("id, item_id, price, date")
+        .eq("date", date)
+        .in("item_id", itemIds);
+
+      if (priceFetchErr) {
+        console.error("❌ Error leyendo item_prices:", priceFetchErr);
+        return res
+          .status(500)
+          .json({ error: "No se pudieron leer precios existentes" });
+      }
+
+      const existingMap = new Map(
+        (existingPrices || []).map((p) => [p.item_id, p])
+      );
+
+      const discountPct = Number(discount || 0);
+      const discountFactor =
+        discountPct > 0 ? 1 - discountPct / 100 : 1;
+
+      let totalBeforeDiscount = 0;
+
+      const pricesToInsert = [];
+      const pricesToUpdate = [];
+      const transactionItemRows = [];
+
+      for (const line of lines) {
+        const itemId = line.item_id;
+        const rawQty = Number(line.quantity || 0) || 1;
+        const priceSource = line.price_source === "existing" ? "existing" : "new";
+
+        const item = itemMap.get(itemId);
+        if (!item) {
+          console.warn(
+            "⚠️ Línea con item_id no encontrado o de otro usuario, se omite:",
+            itemId
+          );
+          continue;
+        }
+
+        const existingRow = existingMap.get(itemId);
+        const existingPrice = existingRow
+          ? Number(existingRow.price || 0)
+          : 0;
+
+        let usedPrice;
+
+        if (priceSource === "existing") {
+          // 👇 importante: el "precio existente" viene de BD, no del cliente
+          usedPrice = existingPrice;
+        } else {
+          // usamos el precio nuevo del archivo
+          usedPrice = Number(line.unit_price || 0);
+        }
+
+        // ✅ Validación: precio > 0 obligatorio
+        if (!usedPrice || usedPrice <= 0) {
+          return res.status(400).json({
+            error: `El artículo seleccionado tiene precio 0 para la fecha ${date}. Revisa el archivo o registra un precio válido.`,
+            item_id: itemId,
+          });
+        }
+
+        const qty = rawQty;
+        const taxRate = Number(item.taxes?.rate || 0);
+        const isExempt =
+          item.taxes?.is_exempt === true ? true : false;
+
+        const subtotal = usedPrice * qty;
+        const taxAmount = isExempt ? 0 : subtotal * (taxRate / 100);
+        const lineTotalWithTax = subtotal + taxAmount;
+
+        totalBeforeDiscount += lineTotalWithTax;
+
+        // Manejo de item_prices (sin duplicar fechas)
+        if (!existingRow) {
+          // no hay precio ese día → insert
+          pricesToInsert.push({
+            item_id: itemId,
+            price: usedPrice,
+            date,
+          });
+        } else if (priceSource === "new" && usedPrice !== existingPrice) {
+          // hay precio y el usuario eligió "nuevo" → actualizar
+          pricesToUpdate.push({
+            id: existingRow.id,
+            price: usedPrice,
+          });
+        }
+        // si elige "existing" y ya había precio → no tocamos item_prices
+
+        // info para transaction_items
+        transactionItemRows.push({
+          item_id: itemId,
+          quantity: qty,
+          unit_price_net: usedPrice,
+          tax_rate_used: taxRate,
+          is_exempt_used: isExempt,
+          lineTotalWithTax,
+        });
+      }
+
+      if (transactionItemRows.length === 0) {
+        return res.status(400).json({
+          error:
+            "Ninguna línea del archivo coincide con artículos válidos para este usuario.",
+        });
+      }
+
+      const totalAfterDiscount =
+        totalBeforeDiscount * discountFactor;
+
+      // 3) Insertar / actualizar precios
+      if (pricesToInsert.length > 0) {
+        const { error: insertPriceErr } = await supabase
+          .from("item_prices")
+          .insert(pricesToInsert);
+        if (insertPriceErr) {
+          console.error(
+            "❌ Error insertando item_prices:",
+            insertPriceErr
+          );
+          return res.status(500).json({
+            error: "No se pudieron guardar los precios de los artículos",
+          });
+        }
+      }
+
+      if (pricesToUpdate.length > 0) {
+        const updateResults = await Promise.all(
+          pricesToUpdate.map((p) =>
+            supabase
+              .from("item_prices")
+              .update({ price: p.price })
+              .eq("id", p.id)
+          )
+        );
+        const someError = updateResults.find((r) => r.error);
+        if (someError) {
+          console.error(
+            "❌ Error actualizando item_prices:",
+            someError.error
+          );
+          return res.status(500).json({
+            error: "No se pudieron actualizar algunos precios",
+          });
+        }
+      }
+
+      // 4) Crear la transacción
+      const { data: tx, error: txErr } = await supabase
+        .from("transactions")
+        .insert([
+          {
+            user_id,
+            account_id,
+            category_id,
+            amount: totalAfterDiscount,
+            type: "expense",
+            description:
+              description ||
+              "Lista de compra importada desde archivo",
+            date,
+            discount_percent: discountPct,
+            is_shopping_list: true,
+          },
+        ])
+        .select()
+        .single();
+
+      if (txErr || !tx) {
+        console.error("❌ Error creando transacción:", txErr);
+        return res.status(500).json({
+          error: "No se pudo crear la transacción de lista de compras",
+        });
+      }
+
+      // 5) Insertar transaction_items
+      const txItemsToInsert = transactionItemRows.map((row) => {
+        const lineTotalFinal =
+          row.lineTotalWithTax * discountFactor;
+        const unitPriceFinal =
+          row.quantity > 0
+            ? lineTotalFinal / row.quantity
+            : row.lineTotalWithTax;
+
+        return {
+          transaction_id: tx.id,
+          item_id: row.item_id,
+          unit_price_net: row.unit_price_net,
+          quantity: row.quantity,
+          unit_price_final: unitPriceFinal,
+          line_total_final: lineTotalFinal,
+          tax_rate_used: row.tax_rate_used,
+          is_exempt_used: row.is_exempt_used,
+        };
+      });
+
+      const { error: txItemsErr } = await supabase
+        .from("transaction_items")
+        .insert(txItemsToInsert);
+
+      if (txItemsErr) {
+        console.error(
+          "❌ Error insertando transaction_items:",
+          txItemsErr
+        );
+        return res.status(500).json({
+          error:
+            "La transacción se creó, pero falló el detalle de artículos",
+        });
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          transaction: tx,
+          totalBeforeDiscount,
+          totalAfterDiscount,
+          discount: discountPct,
+          lines: txItemsToInsert.length,
+        },
+      });
+    } catch (e) {
+      console.error(
+        "❌ Error inesperado en import-shopping-list:",
+        e
+      );
+      return res.status(500).json({
+        error: "Error inesperado al importar la lista de compras",
+      });
+    }
+  }
+);
+
+
 
 module.exports = router;
