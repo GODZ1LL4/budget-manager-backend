@@ -629,6 +629,134 @@ router.post("/import-shopping-list",
   }
 );
 
+// ✅ Actualizar transacción (sin tocar artículos)
+// - Si es lista de compras (is_shopping_list = true), el monto NO se puede editar
+//   ni tampoco el tipo (siempre será "expense") ni el descuento ya aplicado.
+// - Para transacciones normales, se puede editar monto, tipo y demás campos.
+router.put("/:id", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+  const { id } = req.params;
+
+  const {
+    amount,
+    account_id,
+    category_id,
+    type,
+    description,
+    date,
+    recurrence,
+    recurrence_end_date,
+  } = req.body;
+
+  try {
+    // 1) Buscar la transacción y validar que es del usuario
+    const { data: existing, error: existingError } = await supabase
+      .from("transactions")
+      .select(
+        `
+        id,
+        user_id,
+        is_shopping_list,
+        type
+      `
+      )
+      .eq("id", id)
+      .single();
+
+    if (existingError || !existing) {
+      console.error("❌ Error buscando transacción:", existingError);
+      return res
+        .status(404)
+        .json({ error: "TRANS_NOT_FOUND", message: "Transacción no encontrada" });
+    }
+
+    if (existing.user_id !== user_id) {
+      return res
+        .status(403)
+        .json({ error: "FORBIDDEN", message: "No puedes modificar esta transacción" });
+    }
+
+    const isShoppingList = existing.is_shopping_list === true;
+
+    // 2) Construir payload de actualización
+    const updatePayload = {};
+
+    if (account_id) updatePayload.account_id = account_id;
+    if (category_id) updatePayload.category_id = category_id;
+    if (description !== undefined) updatePayload.description = description;
+    if (date) updatePayload.date = date;
+
+    // Recurrencia (opcional)
+    updatePayload.recurrence = recurrence || null;
+    updatePayload.recurrence_end_date = recurrence_end_date || null;
+
+    // 3) Si NO es lista de compras → se puede editar monto y tipo
+    if (!isShoppingList) {
+      if (amount != null) {
+        const numericAmount = Number(amount);
+        if (Number.isNaN(numericAmount) || numericAmount < 0) {
+          return res.status(400).json({
+            error: "INVALID_AMOUNT",
+            message: "El monto debe ser un número válido y no negativo",
+          });
+        }
+        updatePayload.amount = numericAmount;
+      }
+
+      if (type) {
+        // Opcional: validar que type sea uno de ["income", "expense", "transfer"]
+        if (!["income", "expense", "transfer"].includes(type)) {
+          return res.status(400).json({
+            error: "INVALID_TYPE",
+            message: "Tipo de transacción inválido",
+          });
+        }
+        updatePayload.type = type;
+      }
+    } else {
+      // 4) Si ES lista de compras → NO permitir cambiar amount ni type
+      //    Para mayor seguridad, ignoramos cualquier amount/type que venga en el body
+      //    y dejamos los existentes.
+      // Podrías permitir cambiar type a futuro, pero por ahora lo fijamos.
+    }
+
+    if (Object.keys(updatePayload).length === 0) {
+      return res.status(400).json({
+        error: "NO_FIELDS_TO_UPDATE",
+        message: "No se enviaron campos válidos para actualizar",
+      });
+    }
+
+    // 5) Ejecutar update
+    const { data: updated, error: updateError } = await supabase
+      .from("transactions")
+      .update(updatePayload)
+      .eq("id", id)
+      .eq("user_id", user_id)
+      .select(
+        `
+        *,
+        account:accounts!transactions_account_id_fkey (id, name),
+        account_from:accounts!transactions_account_from_fkey (id, name),
+        account_to:accounts!transactions_account_to_fkey (id, name),
+        categories (id, name, type)
+      `
+      )
+      .single();
+
+    if (updateError) {
+      console.error("❌ Error actualizando transacción:", updateError);
+      return res
+        .status(500)
+        .json({ error: updateError.message || "Error al actualizar transacción" });
+    }
+
+    return res.json({ success: true, data: updated });
+  } catch (err) {
+    console.error("🔥 Error inesperado en PUT /transactions/:id:", err);
+    return res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
 
 
 module.exports = router;

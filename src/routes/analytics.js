@@ -1979,4 +1979,1110 @@ router.get("/spending-burn-rate-current-month",
 
 
 
+
+router.get("/expense-by-weekday", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  const { data, error } = await supabase
+    .from("transactions")
+    .select("amount, date")
+    .eq("user_id", user_id)
+    .eq("type", "expense");
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  const totals = [
+    { weekday: 0, label: "Dom", total: 0, count: 0 },
+    { weekday: 1, label: "Lun", total: 0, count: 0 },
+    { weekday: 2, label: "Mar", total: 0, count: 0 },
+    { weekday: 3, label: "Mié", total: 0, count: 0 },
+    { weekday: 4, label: "Jue", total: 0, count: 0 },
+    { weekday: 5, label: "Vie", total: 0, count: 0 },
+    { weekday: 6, label: "Sáb", total: 0, count: 0 },
+  ];
+
+  (data || []).forEach((tx) => {
+    const d = new Date(tx.date);
+    const wd = d.getDay(); // 0 = domingo
+    const amt = parseFloat(tx.amount) || 0;
+
+    totals[wd].total += amt;
+    totals[wd].count += 1;
+  });
+
+  const result = totals.map((t) => ({
+    ...t,
+    total: Number(t.total.toFixed(2)),
+    avg: t.count > 0 ? Number((t.total / t.count).toFixed(2)) : 0,
+  }));
+
+  res.json({ success: true, data: result });
+});
+
+
+
+router.get("/budget-coverage", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+  const year = parseInt(req.query.year, 10) || new Date().getFullYear();
+  const { start, end } = getYearRange(year); // ya definido arriba
+
+  try {
+    // 1) Presupuestos del año por categoría
+    const { data: budgets, error: budgetErr } = await supabase
+      .from("budgets")
+      .select("category_id, limit_amount, categories(name)")
+      .eq("user_id", user_id)
+      .gte("month", `${year}-01`)
+      .lte("month", `${year}-12`);
+
+    if (budgetErr) {
+      console.error(budgetErr);
+      return res.status(500).json({ error: budgetErr.message });
+    }
+
+    const budgetByCat = {};
+    (budgets || []).forEach((b) => {
+      const catId = b.category_id;
+      if (!catId) return;
+
+      if (!budgetByCat[catId]) {
+        budgetByCat[catId] = {
+          category_id: catId,
+          category_name: b.categories?.name || `Categoría ${catId}`,
+          total_budget: 0,
+        };
+      }
+      budgetByCat[catId].total_budget += parseFloat(b.limit_amount) || 0;
+    });
+
+    // 2) Gastos del año por categoría
+    const { data: expenses, error: expenseErr } = await supabase
+      .from("transactions")
+      .select("category_id, amount, categories(name)")
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .gte("date", start)
+      .lte("date", end);
+
+    if (expenseErr) {
+      console.error(expenseErr);
+      return res.status(500).json({ error: expenseErr.message });
+    }
+
+    const expenseByCat = {};
+    (expenses || []).forEach((tx) => {
+      const catId = tx.category_id;
+      if (!catId) return;
+
+      if (!expenseByCat[catId]) {
+        expenseByCat[catId] = {
+          category_id: catId,
+          category_name: tx.categories?.name || `Categoría ${catId}`,
+          total_expense: 0,
+        };
+      }
+      expenseByCat[catId].total_expense += parseFloat(tx.amount) || 0;
+    });
+
+    const totalExpense = Object.values(expenseByCat).reduce(
+      (sum, row) => sum + row.total_expense,
+      0
+    );
+
+    // 3) Cálculos de cobertura
+    let expenseWithBudget = 0;
+
+    const categoriesWithBoth = [];
+    const categoriesWithExpenseOnly = [];
+    const categoriesWithBudgetOnly = [];
+
+    const allCatIds = new Set([
+      ...Object.keys(expenseByCat),
+      ...Object.keys(budgetByCat),
+    ]);
+
+    allCatIds.forEach((catId) => {
+      const exp = expenseByCat[catId];
+      const bud = budgetByCat[catId];
+
+      if (exp && bud) {
+        expenseWithBudget += exp.total_expense;
+
+        categoriesWithBoth.push({
+          category_id: Number(catId),
+          category_name: exp.category_name || bud.category_name,
+          total_expense: Number(exp.total_expense.toFixed(2)),
+          total_budget: Number(bud.total_budget.toFixed(2)),
+          diff: Number((exp.total_expense - bud.total_budget).toFixed(2)),
+        });
+      } else if (exp && !bud) {
+        categoriesWithExpenseOnly.push({
+          category_id: Number(catId),
+          category_name: exp.category_name,
+          total_expense: Number(exp.total_expense.toFixed(2)),
+        });
+      } else if (!exp && bud) {
+        categoriesWithBudgetOnly.push({
+          category_id: Number(catId),
+          category_name: bud.category_name,
+          total_budget: Number(bud.total_budget.toFixed(2)),
+        });
+      }
+    });
+
+    categoriesWithBoth.sort((a, b) => b.total_expense - a.total_expense);
+    categoriesWithExpenseOnly.sort(
+      (a, b) => b.total_expense - a.total_expense
+    );
+    categoriesWithBudgetOnly.sort(
+      (a, b) => b.total_budget - a.total_budget
+    );
+
+    const coveragePct =
+      totalExpense > 0 ? (expenseWithBudget / totalExpense) * 100 : 0;
+
+    return res.json({
+      success: true,
+      data: {
+        year,
+        total_expense: Number(totalExpense.toFixed(2)),
+        expense_with_budget: Number(expenseWithBudget.toFixed(2)),
+        expense_without_budget: Number(
+          (totalExpense - expenseWithBudget).toFixed(2)
+        ),
+        coverage_pct: Number(coveragePct.toFixed(2)),
+        categories_with_both: categoriesWithBoth,
+        categories_with_expense_only: categoriesWithExpenseOnly,
+        categories_with_budget_only: categoriesWithBudgetOnly,
+      },
+    });
+  } catch (err) {
+    console.error("Error en /analytics/budget-coverage:", err);
+    return res
+      .status(500)
+      .json({ error: "Error interno calculando cobertura de presupuestos" });
+  }
+});
+
+router.get("/projected-vs-actual-expense-by-category",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+
+    try {
+      const now = new Date();
+
+      // 1) Rango de proyección (3 meses completos antes del mes actual)
+      const currentMonthStart = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        1
+      );
+      const startDate = new Date(
+        now.getFullYear(),
+        now.getMonth() - 3,
+        1
+      )
+        .toISOString()
+        .split("T")[0];
+      const endDate = currentMonthStart.toISOString().split("T")[0];
+
+      const { data: history, error: histErr } = await supabase
+        .from("transactions")
+        .select(
+          "amount, type, date, category_id, categories(name, stability_type)"
+        )
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", startDate)
+        .lt("date", endDate);
+
+      if (histErr) {
+        console.error(histErr);
+        return res.status(500).json({ error: histErr.message });
+      }
+
+      // 2) Agrupar por categoría + stability + mes
+      const monthlyPerCategory = {};
+
+      (history || []).forEach((tx) => {
+        const catName = tx.categories?.name || "Sin categoría";
+        const stability = tx.categories?.stability_type || "variable";
+        const month = tx.date.slice(0, 7);
+
+        // ignorar ocasionales
+        if (stability === "occasional") return;
+
+        const key = `${catName}__${stability}__${month}`;
+        if (!monthlyPerCategory[key]) {
+          monthlyPerCategory[key] = {
+            category: catName,
+            stability_type: stability,
+            month,
+            total: 0,
+          };
+        }
+        monthlyPerCategory[key].total += parseFloat(tx.amount) || 0;
+      });
+
+      // 3) Agrupar por categoría+stability y guardar lista de totales mensuales
+      const byCategory = {};
+      Object.values(monthlyPerCategory).forEach((entry) => {
+        const key = `${entry.category}__${entry.stability_type}`;
+        if (!byCategory[key]) {
+          byCategory[key] = {
+            category: entry.category,
+            stability_type: entry.stability_type,
+            monthlyTotals: [],
+          };
+        }
+        byCategory[key].monthlyTotals.push(entry.total);
+      });
+
+      const median = (arr) => {
+        if (!arr || arr.length === 0) return 0;
+        const sorted = [...arr].sort((a, b) => a - b);
+        const n = sorted.length;
+        const mid = Math.floor(n / 2);
+        if (n % 2 === 1) return sorted[mid];
+        return (sorted[mid - 1] + sorted[mid]) / 2;
+      };
+
+      const projectedMap = {};
+      Object.values(byCategory).forEach((entry) => {
+        const projected = median(entry.monthlyTotals);
+        const key = `${entry.category}__${entry.stability_type}`;
+        projectedMap[key] = {
+          category: entry.category,
+          stability_type: entry.stability_type,
+          projected_monthly: projected,
+        };
+      });
+
+      // 4) Gasto real del mes actual
+      const year = now.getFullYear();
+      const monthIndex = now.getMonth();
+      const monthKey = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
+      const monthStart = `${monthKey}-01`;
+      const today = now.toISOString().split("T")[0];
+
+      const { data: current, error: currErr } = await supabase
+        .from("transactions")
+        .select(
+          "amount, type, date, category_id, categories(name, stability_type)"
+        )
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", monthStart)
+        .lte("date", today);
+
+      if (currErr) {
+        console.error(currErr);
+        return res.status(500).json({ error: currErr.message });
+      }
+
+      const actualMap = {};
+      (current || []).forEach((tx) => {
+        const catName = tx.categories?.name || "Sin categoría";
+        const stability = tx.categories?.stability_type || "variable";
+        const key = `${catName}__${stability}`;
+
+        if (!actualMap[key]) {
+          actualMap[key] = {
+            category: catName,
+            stability_type: stability,
+            actual_month_to_date: 0,
+          };
+        }
+
+        actualMap[key].actual_month_to_date +=
+          parseFloat(tx.amount) || 2;
+      });
+
+      // 5) Combinar proyección + real
+      const allKeys = new Set([
+        ...Object.keys(projectedMap),
+        ...Object.keys(actualMap),
+      ]);
+
+      const rows = [];
+      allKeys.forEach((key) => {
+        const proj = projectedMap[key];
+        const act = actualMap[key];
+
+        const category = proj?.category || act?.category || "Sin categoría";
+        const stability_type =
+          proj?.stability_type || act?.stability_type || "variable";
+
+        const projected_monthly = proj?.projected_monthly || 0;
+        const actual_month_to_date = act?.actual_month_to_date || 0;
+
+        const variance = actual_month_to_date - projected_monthly;
+        const variance_pct =
+          projected_monthly > 0 ? (variance / projected_monthly) * 100 : null;
+
+        rows.push({
+          category,
+          stability_type,
+          projected_monthly: Number(projected_monthly.toFixed(2)),
+          actual_month_to_date: Number(actual_month_to_date.toFixed(2)),
+          variance: Number(variance.toFixed(2)),
+          variance_pct:
+            variance_pct != null ? Number(variance_pct.toFixed(2)) : null,
+        });
+      });
+
+      rows.sort(
+        (a, b) => Math.abs(b.variance || 0) - Math.abs(a.variance || 0)
+      );
+
+      const result = rows.slice(0, 15); // top 15 desviaciones
+
+      return res.json({
+        success: true,
+        meta: { month: monthKey },
+        data: result,
+      });
+    } catch (err) {
+      console.error(
+        "Error en /analytics/projected-vs-actual-expense-by-category:",
+        err
+      );
+      return res
+        .status(500)
+        .json({ error: "Error interno en proyección vs realidad" });
+    }
+  }
+);
+
+router.get("/unusual-expenses", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+  const now = new Date();
+
+  const year = now.getFullYear();
+  const monthIndex = now.getMonth();
+  const monthKey = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
+  const currentStart = `${monthKey}-01`;
+
+  try {
+    // 1) Histórico antes del mes actual
+    const { data: history, error: histErr } = await supabase
+      .from("transactions")
+      .select("id, amount, category_id, categories(name)")
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .lt("date", currentStart);
+
+    if (histErr) {
+      console.error(histErr);
+      return res.status(500).json({ error: histErr.message });
+    }
+
+    const statsByCat = {};
+    (history || []).forEach((tx) => {
+      const catId = tx.category_id;
+      if (!catId) return;
+      const amt = parseFloat(tx.amount) || 0;
+
+      if (!statsByCat[catId]) {
+        statsByCat[catId] = {
+          category_id: catId,
+          category_name: tx.categories?.name || `Categoría ${catId}`,
+          count: 0,
+          sum: 0,
+          sumSq: 0,
+        };
+      }
+
+      const s = statsByCat[catId];
+      s.count += 1;
+      s.sum += amt;
+      s.sumSq += amt * amt;
+    });
+
+    Object.values(statsByCat).forEach((s) => {
+      if (s.count > 0) {
+        s.mean = s.sum / s.count;
+        const variance = s.sumSq / s.count - s.mean * s.mean;
+        s.std_dev = Math.sqrt(Math.max(variance, 0));
+      } else {
+        s.mean = 0;
+        s.std_dev = 0;
+      }
+    });
+
+    // 2) Transacciones del mes actual
+    const today = now.toISOString().split("T")[0];
+    const { data: current, error: currErr } = await supabase
+      .from("transactions")
+      .select("id, amount, date, description, category_id, categories(name)")
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .gte("date", currentStart)
+      .lte("date", today);
+
+    if (currErr) {
+      console.error(currErr);
+      return res.status(500).json({ error: currErr.message });
+    }
+
+    const unusual = [];
+    const zThreshold = 2; // >= 2 desviaciones estándar
+
+    (current || []).forEach((tx) => {
+      const catId = tx.category_id;
+      const stats = statsByCat[catId];
+      if (!stats) return;
+      if (!stats.std_dev || stats.std_dev <= 0 || stats.count < 5) return;
+
+      const amt = parseFloat(tx.amount) || 0;
+      const z = (amt - stats.mean) / stats.std_dev;
+      if (z >= zThreshold) {
+        unusual.push({
+          id: tx.id,
+          date: tx.date,
+          amount: amt,
+          category: tx.categories?.name || stats.category_name,
+          description: tx.description || "",
+          z_score: Number(z.toFixed(2)),
+          mean: Number(stats.mean.toFixed(2)),
+          std_dev: Number(stats.std_dev.toFixed(2)),
+        });
+      }
+    });
+
+    unusual.sort((a, b) => b.z_score - a.z_score);
+
+    return res.json({ success: true, data: unusual });
+  } catch (err) {
+    console.error("Error en /analytics/unusual-expenses:", err);
+    return res
+      .status(500)
+      .json({ error: "Error interno detectando gastos atípicos" });
+  }
+});
+
+router.get("/category-month-heatmap", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+  const year = parseInt(req.query.year, 10) || new Date().getFullYear();
+  const { start, end } = getYearRange(year);
+
+  try {
+    const { data, error } = await supabase
+      .from("transactions")
+      .select("amount, date, category_id, categories(name)")
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .gte("date", start)
+      .lte("date", end);
+
+    if (error) {
+      console.error(error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    const byCatMonth = {};
+
+    (data || []).forEach((tx) => {
+      const catId = tx.category_id;
+      if (!catId) return;
+
+      const catName = tx.categories?.name || `Categoría ${catId}`;
+      const month = tx.date.slice(0, 7); // YYYY-MM
+      const key = `${catId}__${month}`;
+
+      if (!byCatMonth[key]) {
+        byCatMonth[key] = {
+          category_id: catId,
+          category_name: catName,
+          month,
+          amount: 0,
+        };
+      }
+      byCatMonth[key].amount += parseFloat(tx.amount) || 0;
+    });
+
+    const rows = Object.values(byCatMonth).map((r) => ({
+      category_id: r.category_id,
+      category_name: r.category_name,
+      month: r.month,
+      amount: Number(r.amount.toFixed(2)),
+    }));
+
+    return res.json({ success: true, data: rows, meta: { year } });
+  } catch (err) {
+    console.error("Error en /analytics/category-month-heatmap:", err);
+    return res
+      .status(500)
+      .json({ error: "Error interno generando heatmap de categorías" });
+  }
+});
+
+
+// ========== DETECTOR DE GASTOS REPETITIVOS (NO MARCADOS) ==========
+router.get("/recurring-expense-patterns",  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+
+    try {
+      const monthsBack = parseInt(req.query.months, 10) || 6;
+      const now = new Date();
+      const fromDateObj = new Date(
+        now.getFullYear(),
+        now.getMonth() - (monthsBack - 1),
+        1
+      );
+      const fromDate = fromDateObj.toISOString().split("T")[0];
+
+      const { data, error } = await supabase
+        .from("transactions")
+        .select(
+          `
+          id,
+          amount,
+          date,
+          category_id,
+          description,
+          categories ( name )
+        `
+        )
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", fromDate);
+
+      if (error) {
+        console.error("🔥 Error en recurring-expense-patterns:", error);
+        return res.status(500).json({ error: error.message });
+      }
+
+      const txs = data || [];
+
+      // Helpers
+      const normDesc = (s) =>
+        (s || "")
+          .trim()
+          .toLowerCase()
+          .replace(/\s+/g, " ")
+          .slice(0, 80); // limitar un poco
+
+      const daysBetween = (d1, d2) => {
+        const t1 = new Date(d1).getTime();
+        const t2 = new Date(d2).getTime();
+        return Math.abs((t2 - t1) / (1000 * 60 * 60 * 24));
+      };
+
+      const median = (arr) => {
+        if (!arr.length) return 0;
+        const sorted = [...arr].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length - 1) / 2;
+        if (sorted.length % 2 === 1) {
+          return sorted[Math.floor(mid)];
+        } else {
+          const m1 = sorted[Math.floor(mid)];
+          const m2 = sorted[Math.floor(mid) + 1];
+          return (m1 + m2) / 2;
+        }
+      };
+
+      const stdDev = (arr, mean) => {
+        if (!arr.length) return 0;
+        const m = mean ?? arr.reduce((s, v) => s + v, 0) / arr.length;
+        const variance =
+          arr.reduce((s, v) => s + Math.pow(v - m, 2), 0) / arr.length;
+        return Math.sqrt(variance);
+      };
+
+      // 1) Agrupamos por categoría + descripción normalizada
+      const groups = {};
+      txs.forEach((tx) => {
+        const catId = tx.category_id || "sin_categoria";
+        const catName = tx.categories?.name || "Sin categoría";
+        const descKey = normDesc(tx.description) || "sin_descripcion";
+
+        const key = `${catId}__${descKey}`;
+
+        if (!groups[key]) {
+          groups[key] = {
+            category_id: catId,
+            category_name: catName,
+            description_key: descKey,
+            transactions: [],
+          };
+        }
+        groups[key].transactions.push({
+          date: tx.date,
+          amount: Number(tx.amount) || 0,
+        });
+      });
+
+      const patterns = [];
+
+      Object.values(groups).forEach((g) => {
+        const txList = g.transactions;
+        if (txList.length < 3) return; // mínimo 3 ocurrencias
+
+        // Orden por fecha ascendente
+        txList.sort((a, b) => a.date.localeCompare(b.date));
+
+        const intervals = [];
+        for (let i = 1; i < txList.length; i++) {
+          const d = daysBetween(txList[i - 1].date, txList[i].date);
+          intervals.push(d);
+        }
+
+        if (intervals.length < 2) return;
+
+        const medianInterval = median(intervals);
+        const meanInterval =
+          intervals.reduce((s, v) => s + v, 0) / intervals.length;
+        const sd = stdDev(intervals, meanInterval);
+        const coefVar = meanInterval > 0 ? sd / meanInterval : 1;
+
+        // Regla simple para "recurrente"
+        // - intervalo mediano entre 3 y 60 días
+        // - coeficiente de variación relativamente bajo
+        if (medianInterval < 3 || medianInterval > 60) return;
+        if (coefVar > 0.5) return;
+
+        // Etiqueta de frecuencia aproximada
+        let frequency = "irregular";
+        if (medianInterval >= 3 && medianInterval <= 10) {
+          frequency = "semanal";
+        } else if (medianInterval > 10 && medianInterval <= 20) {
+          frequency = "quincenal";
+        } else if (medianInterval > 20 && medianInterval <= 40) {
+          frequency = "mensual";
+        } else if (medianInterval > 40 && medianInterval <= 60) {
+          frequency = "bimestral";
+        }
+
+        const totalAmount = txList.reduce((s, t) => s + t.amount, 0);
+        const avgAmount = totalAmount / txList.length;
+
+        patterns.push({
+          category_id: g.category_id,
+          category_name: g.category_name,
+          description_key: g.description_key,
+          occurrences: txList.length,
+          median_interval_days: Number(medianInterval.toFixed(2)),
+          mean_interval_days: Number(meanInterval.toFixed(2)),
+          std_dev_interval_days: Number(sd.toFixed(2)),
+          coef_variation: Number(coefVar.toFixed(2)),
+          frequency_label: frequency,
+          avg_amount: Number(avgAmount.toFixed(2)),
+          first_date: txList[0].date,
+          last_date: txList[txList.length - 1].date,
+        });
+      });
+
+      // Ordenar: más frecuentes y más recientes primero
+      patterns.sort((a, b) => {
+        if (b.occurrences !== a.occurrences) {
+          return b.occurrences - a.occurrences;
+        }
+        return b.last_date.localeCompare(a.last_date);
+      });
+
+      return res.json({ success: true, data: patterns });
+    } catch (err) {
+      console.error("🔥 Error inesperado en recurring-expense-patterns:", err);
+      return res
+        .status(500)
+        .json({ error: "Error interno en recurring-expense-patterns" });
+    }
+  }
+);
+
+
+// ========== INTERVALO ENTRE GASTOS POR CATEGORÍA ==========
+router.get("/expense-intervals-by-category",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+
+    try {
+      const monthsBack = parseInt(req.query.months, 10) || 12;
+      const now = new Date();
+      const fromDateObj = new Date(
+        now.getFullYear(),
+        now.getMonth() - (monthsBack - 1),
+        1
+      );
+      const fromDate = fromDateObj.toISOString().split("T")[0];
+
+      const { data, error } = await supabase
+        .from("transactions")
+        .select(
+          `
+          amount,
+          date,
+          category_id,
+          categories ( name )
+        `
+        )
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", fromDate);
+
+      if (error) {
+        console.error("🔥 Error en expense-intervals-by-category:", error);
+        return res.status(500).json({ error: error.message });
+      }
+
+      const txs = data || [];
+
+      const daysBetween = (d1, d2) => {
+        const t1 = new Date(d1).getTime();
+        const t2 = new Date(d2).getTime();
+        return Math.abs((t2 - t1) / (1000 * 60 * 60 * 24));
+      };
+
+      const median = (arr) => {
+        if (!arr.length) return 0;
+        const sorted = [...arr].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length - 1) / 2;
+        if (sorted.length % 2 === 1) {
+          return sorted[Math.floor(mid)];
+        } else {
+          const m1 = sorted[Math.floor(mid)];
+          const m2 = sorted[Math.floor(mid) + 1];
+          return (m1 + m2) / 2;
+        }
+      };
+
+      // Agrupar por categoría
+      const byCategory = {};
+
+      txs.forEach((tx) => {
+        const catId = tx.category_id || "sin_categoria";
+        const catName = tx.categories?.name || "Sin categoría";
+
+        if (!byCategory[catId]) {
+          byCategory[catId] = {
+            category_id: catId,
+            category_name: catName,
+            transactions: [],
+          };
+        }
+
+        byCategory[catId].transactions.push({
+          date: tx.date,
+          amount: Number(tx.amount) || 0,
+        });
+      });
+
+      const result = [];
+
+      Object.values(byCategory).forEach((cat) => {
+        const list = cat.transactions;
+        if (list.length < 2) return; // se necesita al menos 2 para tener intervalo
+
+        // Ordenar por fecha
+        list.sort((a, b) => a.date.localeCompare(b.date));
+
+        const intervals = [];
+        let totalAmount = 0;
+        list.forEach((tx) => {
+          totalAmount += tx.amount;
+        });
+
+        for (let i = 1; i < list.length; i++) {
+          const d = daysBetween(list[i - 1].date, list[i].date);
+          intervals.push(d);
+        }
+
+        const count = list.length;
+        const avgInterval =
+          intervals.reduce((s, v) => s + v, 0) / intervals.length;
+        const medInterval = median(intervals);
+        const minInterval = Math.min(...intervals);
+        const maxInterval = Math.max(...intervals);
+
+        result.push({
+          category_id: cat.category_id,
+          category_name: cat.category_name,
+          transactions_count: count,
+          avg_interval_days: Number(avgInterval.toFixed(2)),
+          median_interval_days: Number(medInterval.toFixed(2)),
+          min_interval_days: Number(minInterval.toFixed(2)),
+          max_interval_days: Number(maxInterval.toFixed(2)),
+          first_date: list[0].date,
+          last_date: list[list.length - 1].date,
+          total_spent: Number(totalAmount.toFixed(2)),
+        });
+      });
+
+      // Ordenar: de menor intervalo promedio a mayor (para ver "más frecuentes" primero)
+      result.sort((a, b) => a.avg_interval_days - b.avg_interval_days);
+
+      return res.json({ success: true, data: result });
+    } catch (err) {
+      console.error(
+        "🔥 Error inesperado en /analytics/expense-intervals-by-category:",
+        err
+      );
+      return res
+        .status(500)
+        .json({ error: "Error interno en expense-intervals-by-category" });
+    }
+  }
+);
+
+// Helpers locales para este reporte (déjalos donde ya los pusiste)
+function diffInDays(dateA, dateB) {
+  const a = new Date(dateA);
+  const b = new Date(dateB);
+  const ms = b - a;
+  return Math.round(ms / (1000 * 60 * 60 * 24));
+}
+
+function mean(arr) {
+  if (!arr || arr.length === 0) return 0;
+  const s = arr.reduce((acc, v) => acc + v, 0);
+  return s / arr.length;
+}
+
+function median(arr) {
+  if (!arr || arr.length === 0) return 0;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const n = sorted.length;
+  const mid = Math.floor(n / 2);
+  if (n % 2 === 1) return sorted[mid];
+  return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function stdDev(arr) {
+  if (!arr || arr.length === 0) return 0;
+  const m = mean(arr);
+  const variance =
+    arr.reduce((acc, v) => acc + Math.pow(v - m, 2), 0) / arr.length;
+  return Math.sqrt(variance);
+}
+
+function normalizeDescriptionKey(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim().toLowerCase();
+  return s.length > 0 ? s : null;
+}
+
+function mapIntervalToFrequencyLabel(medianDays) {
+  if (!Number.isFinite(medianDays) || medianDays <= 0) return "irregular";
+
+  if (medianDays <= 9) return "semanal";      // ~ 7 días
+  if (medianDays <= 20) return "quincenal";   // ~ 15 días
+  if (medianDays <= 40) return "mensual";     // ~ 30 días
+  if (medianDays <= 70) return "bimestral";   // ~ 60 días
+
+  return "irregular";
+}
+
+/**
+ * GET /analytics/recurring-item-patterns
+ */
+router.get("/recurring-item-patterns",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+
+    const monthsParam = parseInt(req.query.months, 10);
+    const months =
+      Number.isNaN(monthsParam) || monthsParam <= 0 ? 6 : monthsParam;
+
+    const minOccParam = parseInt(req.query.min_occurrences, 10);
+    const minOccurrences =
+      Number.isNaN(minOccParam) || minOccParam <= 0 ? 3 : minOccParam;
+
+    try {
+      // 1) Fecha desde: primer día de hace "months" meses
+      const now = new Date();
+      const fromDate = new Date(
+        now.getFullYear(),
+        now.getMonth() - (months - 1),
+        1
+      );
+      const dateFrom = fromDate.toISOString().split("T")[0];
+
+      // 2) Traer transaction_items + transactions + items (+ categoría vía transactions)
+      const { data, error } = await supabase
+        .from("transaction_items")
+        .select(
+          `
+          item_id,
+          quantity,
+          line_total_final,
+          unit_price_net,
+          transactions!inner (
+            id,
+            user_id,
+            date,
+            type,
+            description,
+            category_id,
+            categories (
+              name
+            )
+          ),
+          items!inner (
+            name
+          )
+        `
+        )
+        .eq("transactions.user_id", user_id)
+        .eq("transactions.type", "expense")
+        .gte("transactions.date", dateFrom);
+
+      if (error) {
+        console.error(
+          "Error en /analytics/recurring-item-patterns (Supabase):",
+          error
+        );
+        return res.status(500).json({ error: error.message });
+      }
+
+      const rows = data || [];
+
+      // 3) Agrupar por (item_id, description_key)
+      const groups = {};
+
+      for (const row of rows) {
+        const trx = row.transactions;
+        const itemRel = row.items;
+        if (!trx || !itemRel) continue;
+
+        const itemId = row.item_id;
+        if (!itemId) continue;
+
+        const itemName = itemRel.name || "Sin nombre";
+        const categoryName = trx.categories?.name || null; // 👈 ahora viene de transactions
+        const descKey = normalizeDescriptionKey(trx.description);
+
+        const date = trx.date;
+        if (!date) continue;
+
+        const qty = Number(row.quantity || 0);
+
+        // Calcular monto de la línea
+        let lineAmount = 0;
+        if (row.line_total_final != null) {
+          lineAmount = Number(row.line_total_final) || 0;
+        } else {
+          const netPrice = Number(row.unit_price_net || 0);
+          lineAmount = netPrice * qty;
+        }
+
+        const groupKey = `${itemId}::${descKey || ""}`;
+
+        if (!groups[groupKey]) {
+          groups[groupKey] = {
+            item_id: itemId,
+            item_name: itemName,
+            category_name: categoryName,
+            description_key: descKey,
+            entries: [], // { date, quantity, amount }
+          };
+        }
+
+        groups[groupKey].entries.push({
+          date,
+          quantity: qty,
+          amount: lineAmount,
+        });
+      }
+
+      // 4) Calcular métricas por grupo
+      const results = [];
+
+      Object.values(groups).forEach((group) => {
+        const entries = group.entries;
+        if (!entries || entries.length < minOccurrences) {
+          return; // no cumple mínimo de ocurrencias
+        }
+
+        // Ordenar por fecha ascendente
+        entries.sort((a, b) => a.date.localeCompare(b.date));
+
+        const dates = entries.map((e) => e.date);
+
+        // Intervalos en días entre compras consecutivas
+        const intervals = [];
+        for (let i = 1; i < dates.length; i++) {
+          const dPrev = dates[i - 1];
+          const dCurr = dates[i];
+          const diff = diffInDays(dPrev, dCurr);
+          if (diff > 0) intervals.push(diff);
+        }
+
+        if (intervals.length === 0) {
+          return; // no hay al menos 2 fechas válidas
+        }
+
+        const medianInterval = median(intervals);
+        const meanInterval = mean(intervals);
+        const stdInterval = stdDev(intervals);
+
+        const totalQty = entries.reduce(
+          (sum, e) => sum + (Number(e.quantity) || 0),
+          0
+        );
+        const totalAmount = entries.reduce(
+          (sum, e) => sum + (Number(e.amount) || 0),
+          0
+        );
+
+        const avgQty =
+          entries.length > 0 ? totalQty / entries.length : 0;
+        const avgAmount =
+          entries.length > 0 ? totalAmount / entries.length : 0;
+
+        const lastEntry = entries[entries.length - 1];
+        const lastDate = lastEntry?.date || null;
+        const lastAmount = lastEntry?.amount || 0;
+
+        const frequencyLabel = mapIntervalToFrequencyLabel(
+          medianInterval
+        );
+
+        results.push({
+          item_id: group.item_id,
+          item_name: group.item_name,
+          category_name: group.category_name,
+          description_key: group.description_key,
+          occurrences: entries.length,
+          median_interval_days: Number(medianInterval.toFixed(1)),
+          mean_interval_days: Number(meanInterval.toFixed(1)),
+          std_dev_interval_days: Number(stdInterval.toFixed(1)),
+          avg_quantity: Number(avgQty.toFixed(2)),
+          avg_amount: Number(avgAmount.toFixed(2)),
+          last_date: lastDate,
+          last_amount: Number(lastAmount.toFixed(2)),
+          frequency_label: frequencyLabel,
+        });
+      });
+
+      // 5) Ordenar resultados (más interesantes arriba)
+      results.sort((a, b) => {
+        if (b.occurrences !== a.occurrences) {
+          return b.occurrences - a.occurrences;
+        }
+        if (a.median_interval_days !== b.median_interval_days) {
+          return a.median_interval_days - b.median_interval_days;
+        }
+        return b.avg_amount - a.avg_amount;
+      });
+
+      return res.json({ success: true, data: results });
+    } catch (err) {
+      console.error(
+        "Error inesperado en /analytics/recurring-item-patterns:",
+        err
+      );
+      return res
+        .status(500)
+        .json({ error: "Error interno del servidor" });
+    }
+  }
+);
+
+
 module.exports = router;
+
