@@ -69,23 +69,26 @@ router.delete("/:id", authenticateUser, async (req, res) => {
   res.json({ success: true, message: "Cuenta eliminada" });
 });
 
+
 // Obtener saldos por cuenta
 router.get("/balances", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
   const { data, error } = await supabase
-    .from("accounts")
-    .select("id,current_balance")
-    .eq("user_id", user_id);
+    .from("account_balances_extended")
+    .select("id, name, current_balance, reserved_total, available_balance")
+    .eq("user_id", user_id)
+    .order("name", { ascending: true });
 
-  if (error) return res.status(500).json({ error: error.message });
+  if (error) {
+    // IMPORTANTE: log para ver el motivo real en consola
+    console.error("accounts/balances error:", error);
+    return res.status(500).json({ error: error.message, details: error });
+  }
 
-  const balances = Object.fromEntries(
-    (data || []).map((a) => [a.id, Number(a.current_balance || 0)])
-  );
-
-  res.json({ success: true, data: balances });
+  res.json({ success: true, data });
 });
+
 
 // POST /accounts/transfer
 // body: { from_account_id, to_account_id, amount, date, description }
