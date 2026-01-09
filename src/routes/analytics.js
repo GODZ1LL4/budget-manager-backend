@@ -1835,10 +1835,7 @@ router.get(
 
 /* ========= BURN RATE (RITMO DE GASTO DEL MES ACTUAL) ========= */
 
-router.get(
-  "/spending-burn-rate-current-month",
-  authenticateUser,
-  async (req, res) => {
+router.get("/spending-burn-rate-current-month", authenticateUser, async (req, res) => {
     const user_id = req.user.id;
 
     try {
@@ -3444,36 +3441,53 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
   }
 });
 
-// ===== Helpers (si ya los tienes, no dupliques) =====
+module.exports = {
+  clampInt,
+  toISODate,
+  addDays,
+  diffInDays,
+  mean,
+  median,
+  stdDev,
+  normalizeText,
+  trigrams,
+  jaccard,
+};
+
+function clampInt(v, def, min, max) {
+  const n = parseInt(v ?? "", 10);
+  const x = Number.isFinite(n) ? n : def;
+  return Math.max(min, Math.min(max, x));
+}
+
 function toISODate(d) {
   return new Date(d).toISOString().split("T")[0];
 }
-function firstDayOfMonth(dateObj = new Date()) {
-  return new Date(dateObj.getFullYear(), dateObj.getMonth(), 1);
-}
-function lastDayOfMonth(dateObj = new Date()) {
-  return new Date(dateObj.getFullYear(), dateObj.getMonth() + 1, 0);
-}
+
 function addDays(dateStr, days) {
   const d = new Date(dateStr);
   d.setDate(d.getDate() + days);
   return toISODate(d);
 }
+
 function diffInDays(a, b) {
   const da = new Date(a);
   const db = new Date(b);
   return Math.round((db - da) / (1000 * 60 * 60 * 24));
 }
+
 function mean(arr) {
   if (!arr?.length) return 0;
   return arr.reduce((s, v) => s + v, 0) / arr.length;
 }
+
 function median(arr) {
   if (!arr?.length) return 0;
   const s = [...arr].sort((a, b) => a - b);
   const mid = Math.floor(s.length / 2);
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
+
 function stdDev(arr) {
   if (!arr?.length) return 0;
   const m = mean(arr);
@@ -3481,10 +3495,12 @@ function stdDev(arr) {
   return Math.sqrt(v);
 }
 
-// Normalización general (no user-specific)
 function stripAccents(s) {
-  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return String(s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
 }
+
 function normalizeText(raw) {
   const s = stripAccents(String(raw || "").toLowerCase())
     .replace(/[_|/\\]+/g, " ")
@@ -3496,48 +3512,21 @@ function normalizeText(raw) {
   if (!s) return "";
 
   const stop = new Set([
-    "de",
-    "del",
-    "la",
-    "el",
-    "los",
-    "las",
-    "y",
-    "o",
-    "para",
-    "por",
-    "con",
-    "un",
-    "una",
-    "unos",
-    "unas",
-    "mi",
-    "mis",
-    "tu",
-    "tus",
-    "su",
-    "sus",
-    "en",
-    "a",
-    "al",
-    "se",
-    "me",
-    "te",
-    "que",
-    "como",
+    "de","del","la","el","los","las","y","o","para","por","con","un","una","unos","unas",
+    "mi","mis","tu","tus","su","sus","en","a","al","se","me","te","que","como",
   ]);
 
   const tokens = s.split(" ").filter((t) => t.length >= 2 && !stop.has(t));
   return tokens.slice(0, 6).join(" ");
 }
 
-// Trigramas + similitud Jaccard
 function trigrams(s) {
   const t = `  ${s}  `;
   const grams = new Set();
   for (let i = 0; i < t.length - 2; i++) grams.add(t.slice(i, i + 3));
   return grams;
 }
+
 function jaccard(a, b) {
   if (!a.size || !b.size) return 0;
   let inter = 0;
@@ -3545,5 +3534,436 @@ function jaccard(a, b) {
   const union = a.size + b.size - inter;
   return union > 0 ? inter / union : 0;
 }
+
+
+// GET /analytics/advanced-burn-rate-current-month
+// - Fechas internas: primer y último día del mes actual
+// - Acepta parámetros (months, min_occurrences, include_noise, include_occasional, etc.)
+// - Expected = continúa la secuencia histórica (NO se reinicia en el día 1)
+//   => primer evento esperado dentro del mes = primer múltiplo de intervalo desde last_date que caiga >= date_from
+
+router.get(
+  "/advanced-burn-rate-current-month",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+
+    try {
+      // =========================
+      // 1) Mes actual (interno)
+      // =========================
+      const now = new Date();
+      const year = now.getFullYear();
+      const monthIndex = now.getMonth(); // 0-11
+      const monthKey = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
+
+      const dateFromObj = new Date(year, monthIndex, 1);
+      const dateToObj = new Date(year, monthIndex + 1, 0);
+
+      const date_from = toISODate(dateFromObj); // YYYY-MM-DD
+      const date_to = toISODate(dateToObj); // YYYY-MM-DD
+
+      const today = toISODate(now);
+      const day_of_month = now.getDate();
+      const days_in_month = dateToObj.getDate();
+
+      // =========================
+      // 2) Params (editables) - excepto fechas
+      // =========================
+      const months = clampInt(req.query.months, 12, 1, 36);
+      const minOccurrences = clampInt(req.query.min_occurrences, 3, 2, 50);
+
+      const includeOccasional =
+        String(req.query.include_occasional ?? "false") === "true";
+      const includeNoise = String(req.query.include_noise ?? "true") === "true";
+
+      const minIntervalDays = clampInt(req.query.min_interval_days, 3, 1, 365);
+      const maxIntervalDays = clampInt(
+        req.query.max_interval_days,
+        70,
+        minIntervalDays,
+        3650
+      );
+
+      const maxCoefVariation = Number.isFinite(
+        Number(req.query.max_coef_variation)
+      )
+        ? Number(req.query.max_coef_variation)
+        : 0.6;
+
+      // =========================
+      // 3) Ventana histórica (N meses atrás) TERMINA antes del mes actual
+      //    Para evitar leakage, cortamos en el día anterior a date_from.
+      // =========================
+      const historyToObj = new Date(dateFromObj);
+      historyToObj.setDate(historyToObj.getDate() - 1); // último día mes anterior
+
+      const historyFromObj = new Date(dateFromObj);
+      historyFromObj.setMonth(historyFromObj.getMonth() - months);
+
+      const history_from = toISODate(historyFromObj);
+      const history_to = toISODate(historyToObj);
+
+      // =========================
+      // 4) Traer transacciones históricas (expenses)
+      // =========================
+      const { data, error } = await supabase
+        .from("transactions")
+        .select(
+          `
+          id,
+          amount,
+          date,
+          category_id,
+          description,
+          categories:categories!transactions_category_id_fkey (
+            name,
+            stability_type
+          )
+        `
+        )
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", history_from)
+        .lte("date", history_to);
+
+      if (error) {
+        console.error("Error supabase /advanced-burn-rate:", error);
+        return res.status(500).json({ error: error.message });
+      }
+
+      const rawTxs = (data || [])
+        .map((tx) => ({
+          id: tx.id,
+          date: tx.date,
+          amount: Number(tx.amount) || 0,
+          category_id: tx.category_id,
+          category_name: tx.categories?.name || "Sin categoría",
+          category_stability: tx.categories?.stability_type || "variable",
+          description: tx.description || "",
+        }))
+        .filter((tx) => tx.amount > 0 && !!tx.date);
+
+      // filtrar ocasionales si no se incluyen
+      const txs = rawTxs.filter((tx) =>
+        includeOccasional ? true : tx.category_stability !== "occasional"
+      );
+
+      // normalizar descripción
+      const txsNorm = txs.map((tx) => ({
+        ...tx,
+        norm: normalizeText(tx.description),
+      }));
+
+      // =========================
+      // 5) Clustering por categoría + similitud de descripción
+      // =========================
+      const byCategory = {};
+      for (const tx of txsNorm) {
+        const catKey = String(tx.category_id || "sin_cat");
+        if (!byCategory[catKey]) byCategory[catKey] = [];
+        byCategory[catKey].push(tx);
+      }
+
+      const SIM_THRESHOLD = 0.45;
+      const clusters = []; // { category_id, category_name, rep_norm, rep_grams, entries: [] }
+
+      for (const catKey of Object.keys(byCategory)) {
+        const list = byCategory[catKey];
+        const catClusters = [];
+
+        for (const tx of list) {
+          const grams = trigrams(tx.norm || "");
+          let bestIdx = -1;
+          let bestScore = 0;
+
+          for (let i = 0; i < catClusters.length; i++) {
+            const score = jaccard(grams, catClusters[i].rep_grams);
+            if (score > bestScore) {
+              bestScore = score;
+              bestIdx = i;
+            }
+          }
+
+          if (bestIdx >= 0 && bestScore >= SIM_THRESHOLD) {
+            catClusters[bestIdx].entries.push(tx);
+            // Mantener representante más "informativo"
+            if (
+              (tx.norm || "").length >
+              (catClusters[bestIdx].rep_norm || "").length
+            ) {
+              catClusters[bestIdx].rep_norm = tx.norm;
+              catClusters[bestIdx].rep_grams = grams;
+            }
+          } else {
+            catClusters.push({
+              category_id: tx.category_id,
+              category_name: tx.category_name,
+              rep_norm: tx.norm,
+              rep_grams: grams,
+              entries: [tx],
+            });
+          }
+        }
+
+        clusters.push(...catClusters);
+      }
+
+      // =========================
+      // 6) Detectar patrones recurrentes
+      // =========================
+      const recurringPatterns = [];
+      const recurringTxIds = new Set();
+
+      for (const c of clusters) {
+        const entries = c.entries;
+        if (!entries || entries.length < minOccurrences) continue;
+
+        entries.sort((a, b) => a.date.localeCompare(b.date));
+
+        const intervals = [];
+        for (let i = 1; i < entries.length; i++) {
+          const d = diffInDays(entries[i - 1].date, entries[i].date);
+          if (d > 0) intervals.push(d);
+        }
+        if (intervals.length < 2) continue;
+
+        const medInterval = median(intervals);
+        const mu = mean(intervals);
+        const sd = stdDev(intervals);
+        const coefVar = mu > 0 ? sd / mu : 999;
+
+        if (medInterval < minIntervalDays || medInterval > maxIntervalDays)
+          continue;
+        if (coefVar > maxCoefVariation) continue;
+
+        const amounts = entries
+          .map((e) => e.amount)
+          .filter((a) => Number.isFinite(a) && a > 0);
+
+        const medAmount = median(amounts);
+        if (!Number.isFinite(medAmount) || medAmount <= 0) continue;
+
+        const last = entries[entries.length - 1];
+        const lastDate = last.date;
+
+        for (const e of entries) recurringTxIds.add(e.id);
+
+        recurringPatterns.push({
+          type: "recurring",
+          category: c.category_name,
+          pattern: `${c.category_name} · ${c.rep_norm || "sin descripcion"}`.trim(),
+          median_interval_days: Number(medInterval.toFixed(1)),
+          median_amount: Number(medAmount.toFixed(2)),
+          last_date: lastDate,
+        });
+      }
+
+      // =========================
+      // 7) “Eventos / ruido” (no recurrentes) -> total mensual estimado
+      // =========================
+      let noisePatterns = [];
+      if (includeNoise) {
+        const historyDays = Math.max(1, diffInDays(history_from, history_to) + 1);
+        const targetDays = Math.max(1, diffInDays(date_from, date_to) + 1);
+
+        const noiseByCat = {};
+        for (const tx of txsNorm) {
+          if (recurringTxIds.has(tx.id)) continue;
+
+          const catKey = String(tx.category_id || "sin_cat");
+          if (!noiseByCat[catKey]) {
+            noiseByCat[catKey] = {
+              category_id: tx.category_id,
+              category_name: tx.category_name,
+              amounts: [],
+              total: 0,
+              count: 0,
+            };
+          }
+          noiseByCat[catKey].amounts.push(tx.amount);
+          noiseByCat[catKey].total += tx.amount;
+          noiseByCat[catKey].count += 1;
+        }
+
+        noisePatterns = Object.values(noiseByCat)
+          .map((c) => {
+            if (c.count < 3) return null;
+
+            const medAmount = median(c.amounts);
+            const meanPerDay = c.total / historyDays;
+            const projectedA = meanPerDay * targetDays;
+
+            const expectedCountRaw = (c.count / historyDays) * targetDays;
+            const expectedCount =
+              expectedCountRaw >= 0.75 ? Math.round(expectedCountRaw) : 0;
+
+            const projectedB =
+              expectedCount > 0 ? expectedCount * (Number(medAmount) || 0) : 0;
+
+            const projection = Math.min(projectedB, projectedA);
+            if (!Number.isFinite(projection) || projection <= 0) return null;
+
+            return {
+              type: "event",
+              category: c.category_name,
+              pattern: `${c.category_name} · gastos eventuales`,
+              projection: Number(projection.toFixed(2)),
+            };
+          })
+          .filter(Boolean);
+      }
+
+      // =========================
+      // 8) Construir expectedDaily para el mes (YYYY-MM-DD)
+      //    - Recurrentes: seguir secuencia histórica (NO reinicio día 1)
+      //    - Eventos: distribución uniforme (suave)
+      // =========================
+      const expectedDaily = {};
+      for (let day = 1; day <= days_in_month; day++) {
+        const d = `${monthKey}-${String(day).padStart(2, "0")}`;
+        expectedDaily[d] = 0;
+      }
+
+      // 8.1 Recurrentes -> continuar secuencia
+      //     Primer evento dentro del mes = last_date + n*interval donde sea >= date_from
+      for (const p of recurringPatterns) {
+        const interval = Math.max(1, Math.round(p.median_interval_days || 0));
+        const amount = Number(p.median_amount) || 0;
+        if (!interval || amount <= 0 || !p.last_date) continue;
+
+        const gap = diffInDays(p.last_date, date_from);
+
+        // Si last_date está antes del mes: alineamos a la secuencia para que el primer "next" caiga dentro del mes.
+        // Si last_date es >= date_from (raro aquí porque histórico se corta antes), empezamos en el siguiente.
+        const n = gap > 0 ? Math.ceil(gap / interval) : 1;
+
+        let next = addDays(p.last_date, n * interval);
+
+        while (new Date(next) <= new Date(date_to)) {
+          if (expectedDaily[next] != null) expectedDaily[next] += amount;
+          next = addDays(next, interval);
+        }
+      }
+
+      // 8.2 Eventos -> distribución uniforme diaria
+      const totalNoise = (noisePatterns || []).reduce(
+        (s, r) => s + (Number(r.projection) || 0),
+        0
+      );
+      const noiseDaily = days_in_month > 0 ? totalNoise / days_in_month : 0;
+
+      if (noiseDaily > 0) {
+        for (let day = 1; day <= days_in_month; day++) {
+          const d = `${monthKey}-${String(day).padStart(2, "0")}`;
+          expectedDaily[d] += noiseDaily;
+        }
+      }
+
+      // =========================
+      // 9) Gastos reales del mes hasta HOY
+      // =========================
+      const { data: expenses, error: expenseError } = await supabase
+        .from("transactions")
+        .select("amount, date")
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", date_from)
+        .lte("date", today);
+
+      if (expenseError) {
+        console.error(expenseError);
+        return res.status(500).json({ error: expenseError.message });
+      }
+
+      const actualDailyMap = {};
+      (expenses || []).forEach((tx) => {
+        const d = tx.date;
+        const amt = Number(tx.amount) || 0;
+        if (!actualDailyMap[d]) actualDailyMap[d] = 0;
+        actualDailyMap[d] += amt;
+      });
+
+      // =========================
+      // 10) Series acumuladas (expected vs actual)
+      // =========================
+      let cumulativeExpected = 0;
+      let cumulativeActual = 0;
+
+      const series = [];
+
+      for (let day = 1; day <= days_in_month; day++) {
+        const dateStr = `${monthKey}-${String(day).padStart(2, "0")}`;
+
+        const exp = expectedDaily[dateStr] || 0;
+        cumulativeExpected += exp;
+
+        const act = actualDailyMap[dateStr] || 0;
+        if (day <= day_of_month) cumulativeActual += act;
+
+        series.push({
+          day,
+          date: dateStr,
+          expected_daily: Number(exp.toFixed(2)),
+          expected_cumulative: Number(cumulativeExpected.toFixed(2)),
+          actual_cumulative: Number(cumulativeActual.toFixed(2)),
+        });
+      }
+
+      const expected_total = series[days_in_month - 1]?.expected_cumulative || 0;
+      const expected_to_date = series[day_of_month - 1]?.expected_cumulative || 0;
+      const actual_to_date = series[day_of_month - 1]?.actual_cumulative || 0;
+
+      const projected_end_of_month =
+        day_of_month > 0 ? (actual_to_date / day_of_month) * days_in_month : 0;
+
+      const variance_to_expected = actual_to_date - expected_to_date;
+      const variance_to_expected_end = projected_end_of_month - expected_total;
+
+      return res.json({
+        success: true,
+        data: {
+          month: monthKey,
+          today,
+          days_in_month,
+          day_of_month,
+
+          expected_total: Number(expected_total.toFixed(2)),
+          expected_to_date: Number(expected_to_date.toFixed(2)),
+          actual_to_date: Number(actual_to_date.toFixed(2)),
+
+          projected_end_of_month: Number(projected_end_of_month.toFixed(2)),
+          variance_to_expected: Number(variance_to_expected.toFixed(2)),
+          variance_to_expected_end: Number(variance_to_expected_end.toFixed(2)),
+
+          params_used: {
+            months,
+            min_occurrences: minOccurrences,
+            include_occasional: includeOccasional,
+            include_noise: includeNoise,
+            min_interval_days: minIntervalDays,
+            max_interval_days: maxIntervalDays,
+            max_coef_variation: maxCoefVariation,
+          },
+
+          meta: {
+            date_from,
+            date_to,
+            history_from,
+            history_to,
+            recurring_patterns_count: recurringPatterns.length,
+            noise_month_total: Number(totalNoise.toFixed(2)),
+          },
+
+          series,
+        },
+      });
+    } catch (err) {
+      console.error("Error en /analytics/advanced-burn-rate-current-month:", err);
+      return res.status(500).json({ error: "Error interno del servidor" });
+    }
+  }
+);
+
 
 module.exports = router;
