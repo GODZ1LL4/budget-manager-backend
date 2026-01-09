@@ -74,7 +74,6 @@ router.get("/item-prices-trend", authenticateUser, async (req, res) => {
 
 /* ========= CATEGORÍAS: RESUMEN Y TENDENCIAS ========= */
 
-
 router.get("/top-items-by-category", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
   const category_id = req.query.category_id;
@@ -407,7 +406,8 @@ router.get("/overbudget-categories", authenticateUser, async (req, res) => {
 
 /* ========= TENDENCIA DE AHORRO Y INGRESO/GASTO MENSUAL ========= */
 
-router.get("/monthly-income-expense-avg",
+router.get(
+  "/monthly-income-expense-avg",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -453,7 +453,8 @@ router.get("/monthly-income-expense-avg",
 
 /* ========= GASTO ANUAL POR CATEGORÍA Y VARIACIONES ========= */
 
-router.get("/annual-expense-by-category",
+router.get(
+  "/annual-expense-by-category",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -486,7 +487,8 @@ router.get("/annual-expense-by-category",
   }
 );
 
-router.get("/yearly-category-variations",
+router.get(
+  "/yearly-category-variations",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -571,7 +573,8 @@ router.get("/budget-vs-actual-history", authenticateUser, async (req, res) => {
   res.json({ success: true, data: result });
 });
 
-router.get("/budget-vs-actual-summary-yearly",
+router.get(
+  "/budget-vs-actual-summary-yearly",
   authenticateUser,
   async (req, res) => {
     try {
@@ -696,10 +699,10 @@ router.get("/top-variable-categories", authenticateUser, async (req, res) => {
 
   // 🔹 Query params
   const {
-    stability_types,  // "fixed,variable", "variable", etc. Opcional
-    date_from,        // "YYYY-MM-DD". Opcional
-    date_to,          // "YYYY-MM-DD". Opcional
-    limit,            // número. Opcional, por defecto 10
+    stability_types, // "fixed,variable", "variable", etc. Opcional
+    date_from, // "YYYY-MM-DD". Opcional
+    date_to, // "YYYY-MM-DD". Opcional
+    limit, // número. Opcional, por defecto 10
   } = req.query;
 
   const topN = Number(limit) > 0 ? Number(limit) : 10;
@@ -788,7 +791,8 @@ router.get("/goals-progress", authenticateUser, async (req, res) => {
 
 /* ========= PROYECCIONES POR CATEGORÍA (INGRESO / GASTO) ========= */
 
-router.get("/projected-expense-by-category",
+router.get(
+  "/projected-expense-by-category",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -800,11 +804,7 @@ router.get("/projected-expense-by-category",
 
     // 2) Primer día de hace 3 meses (esto incluye justo 3 meses completos ANTES del mes actual)
     //    Ej: hoy diciembre -> startDate = 1 septiembre
-    const startDate = new Date(
-      now.getFullYear(),
-      now.getMonth() - 3,
-      1
-    )
+    const startDate = new Date(now.getFullYear(), now.getMonth() - 3, 1)
       .toISOString()
       .split("T")[0];
 
@@ -819,8 +819,8 @@ router.get("/projected-expense-by-category",
       )
       .eq("user_id", user_id)
       .eq("type", "expense")
-      .gte("date", startDate)  // >= 1er día de hace 3 meses
-      .lt("date", endDate);    // < 1er día del mes actual (excluye el mes actual)
+      .gte("date", startDate) // >= 1er día de hace 3 meses
+      .lt("date", endDate); // < 1er día del mes actual (excluye el mes actual)
 
     if (error) {
       return res.status(500).json({ error: error.message });
@@ -900,8 +900,8 @@ router.get("/projected-expense-by-category",
   }
 );
 
-
-router.get("/projected-income-by-category",
+router.get(
+  "/projected-income-by-category",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -1271,7 +1271,8 @@ router.get("/item-trend/:item_id", authenticateUser, async (req, res) => {
 
 /* ========= COMPARATIVO MENSUAL POR CATEGORÍA ========= */
 
-router.get("/category-monthly-comparison",
+router.get(
+  "/category-monthly-comparison",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -1737,7 +1738,8 @@ router.get("/item-monthly-comparison", authenticateUser, async (req, res) => {
 
 /* ========= INGRESOS / GASTOS ANUALES POR TIPO DE ESTABILIDAD ========= */
 
-router.get("/yearly-income-expense-by-stability",
+router.get(
+  "/yearly-income-expense-by-stability",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -1752,12 +1754,14 @@ router.get("/yearly-income-expense-by-stability",
     try {
       const { data, error } = await supabase
         .from("transactions")
-        .select(`
+        .select(
+          `
           amount,
           type,
           date,
           categories ( stability_type )
-        `)
+        `
+        )
         .eq("user_id", user_id)
         .gte("date", start)
         .lte("date", end);
@@ -1790,8 +1794,7 @@ router.get("/yearly-income-expense-by-stability",
         total[txType] += amount;
 
         // Determinar estabilidad (default "variable" si no viene)
-        const stability =
-          tx.categories?.stability_type || "variable";
+        const stability = tx.categories?.stability_type || "variable";
 
         if (!byStability[stability]) {
           // Por si aparece algún valor raro en BD
@@ -1825,16 +1828,15 @@ router.get("/yearly-income-expense-by-stability",
         "Error en /analytics/yearly-income-expense-by-stability:",
         err
       );
-      return res
-        .status(500)
-        .json({ error: "Error interno del servidor" });
+      return res.status(500).json({ error: "Error interno del servidor" });
     }
   }
 );
 
 /* ========= BURN RATE (RITMO DE GASTO DEL MES ACTUAL) ========= */
 
-router.get("/spending-burn-rate-current-month",
+router.get(
+  "/spending-burn-rate-current-month",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -1969,16 +1971,16 @@ router.get("/spending-burn-rate-current-month",
         },
       });
     } catch (err) {
-      console.error("Error en /analytics/spending-burn-rate-current-month:", err);
+      console.error(
+        "Error en /analytics/spending-burn-rate-current-month:",
+        err
+      );
       return res
         .status(500)
         .json({ error: "Error interno del servidor (burn rate)" });
     }
   }
 );
-
-
-
 
 router.get("/expense-by-weekday", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -2018,8 +2020,6 @@ router.get("/expense-by-weekday", authenticateUser, async (req, res) => {
 
   res.json({ success: true, data: result });
 });
-
-
 
 router.get("/budget-coverage", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -2131,12 +2131,8 @@ router.get("/budget-coverage", authenticateUser, async (req, res) => {
     });
 
     categoriesWithBoth.sort((a, b) => b.total_expense - a.total_expense);
-    categoriesWithExpenseOnly.sort(
-      (a, b) => b.total_expense - a.total_expense
-    );
-    categoriesWithBudgetOnly.sort(
-      (a, b) => b.total_budget - a.total_budget
-    );
+    categoriesWithExpenseOnly.sort((a, b) => b.total_expense - a.total_expense);
+    categoriesWithBudgetOnly.sort((a, b) => b.total_budget - a.total_budget);
 
     const coveragePct =
       totalExpense > 0 ? (expenseWithBudget / totalExpense) * 100 : 0;
@@ -2164,7 +2160,8 @@ router.get("/budget-coverage", authenticateUser, async (req, res) => {
   }
 });
 
-router.get("/projected-vs-actual-expense-by-category",
+router.get(
+  "/projected-vs-actual-expense-by-category",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -2173,16 +2170,8 @@ router.get("/projected-vs-actual-expense-by-category",
       const now = new Date();
 
       // 1) Rango de proyección (3 meses completos antes del mes actual)
-      const currentMonthStart = new Date(
-        now.getFullYear(),
-        now.getMonth(),
-        1
-      );
-      const startDate = new Date(
-        now.getFullYear(),
-        now.getMonth() - 3,
-        1
-      )
+      const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+      const startDate = new Date(now.getFullYear(), now.getMonth() - 3, 1)
         .toISOString()
         .split("T")[0];
       const endDate = currentMonthStart.toISOString().split("T")[0];
@@ -2295,8 +2284,7 @@ router.get("/projected-vs-actual-expense-by-category",
           };
         }
 
-        actualMap[key].actual_month_to_date +=
-          parseFloat(tx.amount) || 2;
+        actualMap[key].actual_month_to_date += parseFloat(tx.amount) || 2;
       });
 
       // 5) Combinar proyección + real
@@ -2518,9 +2506,10 @@ router.get("/category-month-heatmap", authenticateUser, async (req, res) => {
   }
 });
 
-
 // ========== DETECTOR DE GASTOS REPETITIVOS (NO MARCADOS) ==========
-router.get("/recurring-expense-patterns",  authenticateUser,
+router.get(
+  "/recurring-expense-patterns",
+  authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
 
@@ -2559,11 +2548,7 @@ router.get("/recurring-expense-patterns",  authenticateUser,
 
       // Helpers
       const normDesc = (s) =>
-        (s || "")
-          .trim()
-          .toLowerCase()
-          .replace(/\s+/g, " ")
-          .slice(0, 80); // limitar un poco
+        (s || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 80); // limitar un poco
 
       const daysBetween = (d1, d2) => {
         const t1 = new Date(d1).getTime();
@@ -2693,9 +2678,9 @@ router.get("/recurring-expense-patterns",  authenticateUser,
   }
 );
 
-
 // ========== INTERVALO ENTRE GASTOS POR CATEGORÍA ==========
-router.get("/expense-intervals-by-category",
+router.get(
+  "/expense-intervals-by-category",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -2868,10 +2853,10 @@ function normalizeDescriptionKey(raw) {
 function mapIntervalToFrequencyLabel(medianDays) {
   if (!Number.isFinite(medianDays) || medianDays <= 0) return "irregular";
 
-  if (medianDays <= 9) return "semanal";      // ~ 7 días
-  if (medianDays <= 20) return "quincenal";   // ~ 15 días
-  if (medianDays <= 40) return "mensual";     // ~ 30 días
-  if (medianDays <= 70) return "bimestral";   // ~ 60 días
+  if (medianDays <= 9) return "semanal"; // ~ 7 días
+  if (medianDays <= 20) return "quincenal"; // ~ 15 días
+  if (medianDays <= 40) return "mensual"; // ~ 30 días
+  if (medianDays <= 70) return "bimestral"; // ~ 60 días
 
   return "irregular";
 }
@@ -2879,34 +2864,32 @@ function mapIntervalToFrequencyLabel(medianDays) {
 /**
  * GET /analytics/recurring-item-patterns
  */
-router.get("/recurring-item-patterns",
-  authenticateUser,
-  async (req, res) => {
-    const user_id = req.user.id;
+router.get("/recurring-item-patterns", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
 
-    const monthsParam = parseInt(req.query.months, 10);
-    const months =
-      Number.isNaN(monthsParam) || monthsParam <= 0 ? 6 : monthsParam;
+  const monthsParam = parseInt(req.query.months, 10);
+  const months =
+    Number.isNaN(monthsParam) || monthsParam <= 0 ? 6 : monthsParam;
 
-    const minOccParam = parseInt(req.query.min_occurrences, 10);
-    const minOccurrences =
-      Number.isNaN(minOccParam) || minOccParam <= 0 ? 3 : minOccParam;
+  const minOccParam = parseInt(req.query.min_occurrences, 10);
+  const minOccurrences =
+    Number.isNaN(minOccParam) || minOccParam <= 0 ? 3 : minOccParam;
 
-    try {
-      // 1) Fecha desde: primer día de hace "months" meses
-      const now = new Date();
-      const fromDate = new Date(
-        now.getFullYear(),
-        now.getMonth() - (months - 1),
-        1
-      );
-      const dateFrom = fromDate.toISOString().split("T")[0];
+  try {
+    // 1) Fecha desde: primer día de hace "months" meses
+    const now = new Date();
+    const fromDate = new Date(
+      now.getFullYear(),
+      now.getMonth() - (months - 1),
+      1
+    );
+    const dateFrom = fromDate.toISOString().split("T")[0];
 
-      // 2) Traer transaction_items + transactions + items (+ categoría vía transactions)
-      const { data, error } = await supabase
-        .from("transaction_items")
-        .select(
-          `
+    // 2) Traer transaction_items + transactions + items (+ categoría vía transactions)
+    const { data, error } = await supabase
+      .from("transaction_items")
+      .select(
+        `
           item_id,
           quantity,
           line_total_final,
@@ -2926,163 +2909,641 @@ router.get("/recurring-item-patterns",
             name
           )
         `
-        )
-        .eq("transactions.user_id", user_id)
-        .eq("transactions.type", "expense")
-        .gte("transactions.date", dateFrom);
+      )
+      .eq("transactions.user_id", user_id)
+      .eq("transactions.type", "expense")
+      .gte("transactions.date", dateFrom);
 
-      if (error) {
-        console.error(
-          "Error en /analytics/recurring-item-patterns (Supabase):",
-          error
-        );
-        return res.status(500).json({ error: error.message });
+    if (error) {
+      console.error(
+        "Error en /analytics/recurring-item-patterns (Supabase):",
+        error
+      );
+      return res.status(500).json({ error: error.message });
+    }
+
+    const rows = data || [];
+
+    // 3) Agrupar por (item_id, description_key)
+    const groups = {};
+
+    for (const row of rows) {
+      const trx = row.transactions;
+      const itemRel = row.items;
+      if (!trx || !itemRel) continue;
+
+      const itemId = row.item_id;
+      if (!itemId) continue;
+
+      const itemName = itemRel.name || "Sin nombre";
+      const categoryName = trx.categories?.name || null; // 👈 ahora viene de transactions
+      const descKey = normalizeDescriptionKey(trx.description);
+
+      const date = trx.date;
+      if (!date) continue;
+
+      const qty = Number(row.quantity || 0);
+
+      // Calcular monto de la línea
+      let lineAmount = 0;
+      if (row.line_total_final != null) {
+        lineAmount = Number(row.line_total_final) || 0;
+      } else {
+        const netPrice = Number(row.unit_price_net || 0);
+        lineAmount = netPrice * qty;
       }
 
-      const rows = data || [];
+      const groupKey = `${itemId}::${descKey || ""}`;
 
-      // 3) Agrupar por (item_id, description_key)
-      const groups = {};
+      if (!groups[groupKey]) {
+        groups[groupKey] = {
+          item_id: itemId,
+          item_name: itemName,
+          category_name: categoryName,
+          description_key: descKey,
+          entries: [], // { date, quantity, amount }
+        };
+      }
 
-      for (const row of rows) {
-        const trx = row.transactions;
-        const itemRel = row.items;
-        if (!trx || !itemRel) continue;
+      groups[groupKey].entries.push({
+        date,
+        quantity: qty,
+        amount: lineAmount,
+      });
+    }
 
-        const itemId = row.item_id;
-        if (!itemId) continue;
+    // 4) Calcular métricas por grupo
+    const results = [];
 
-        const itemName = itemRel.name || "Sin nombre";
-        const categoryName = trx.categories?.name || null; // 👈 ahora viene de transactions
-        const descKey = normalizeDescriptionKey(trx.description);
+    Object.values(groups).forEach((group) => {
+      const entries = group.entries;
+      if (!entries || entries.length < minOccurrences) {
+        return; // no cumple mínimo de ocurrencias
+      }
 
-        const date = trx.date;
-        if (!date) continue;
+      // Ordenar por fecha ascendente
+      entries.sort((a, b) => a.date.localeCompare(b.date));
 
-        const qty = Number(row.quantity || 0);
+      const dates = entries.map((e) => e.date);
 
-        // Calcular monto de la línea
-        let lineAmount = 0;
-        if (row.line_total_final != null) {
-          lineAmount = Number(row.line_total_final) || 0;
-        } else {
-          const netPrice = Number(row.unit_price_net || 0);
-          lineAmount = netPrice * qty;
+      // Intervalos en días entre compras consecutivas
+      const intervals = [];
+      for (let i = 1; i < dates.length; i++) {
+        const dPrev = dates[i - 1];
+        const dCurr = dates[i];
+        const diff = diffInDays(dPrev, dCurr);
+        if (diff > 0) intervals.push(diff);
+      }
+
+      if (intervals.length === 0) {
+        return; // no hay al menos 2 fechas válidas
+      }
+
+      const medianInterval = median(intervals);
+      const meanInterval = mean(intervals);
+      const stdInterval = stdDev(intervals);
+
+      const totalQty = entries.reduce(
+        (sum, e) => sum + (Number(e.quantity) || 0),
+        0
+      );
+      const totalAmount = entries.reduce(
+        (sum, e) => sum + (Number(e.amount) || 0),
+        0
+      );
+
+      const avgQty = entries.length > 0 ? totalQty / entries.length : 0;
+      const avgAmount = entries.length > 0 ? totalAmount / entries.length : 0;
+
+      const lastEntry = entries[entries.length - 1];
+      const lastDate = lastEntry?.date || null;
+      const lastAmount = lastEntry?.amount || 0;
+
+      const frequencyLabel = mapIntervalToFrequencyLabel(medianInterval);
+
+      results.push({
+        item_id: group.item_id,
+        item_name: group.item_name,
+        category_name: group.category_name,
+        description_key: group.description_key,
+        occurrences: entries.length,
+        median_interval_days: Number(medianInterval.toFixed(1)),
+        mean_interval_days: Number(meanInterval.toFixed(1)),
+        std_dev_interval_days: Number(stdInterval.toFixed(1)),
+        avg_quantity: Number(avgQty.toFixed(2)),
+        avg_amount: Number(avgAmount.toFixed(2)),
+        last_date: lastDate,
+        last_amount: Number(lastAmount.toFixed(2)),
+        frequency_label: frequencyLabel,
+      });
+    });
+
+    // 5) Ordenar resultados (más interesantes arriba)
+    results.sort((a, b) => {
+      if (b.occurrences !== a.occurrences) {
+        return b.occurrences - a.occurrences;
+      }
+      if (a.median_interval_days !== b.median_interval_days) {
+        return a.median_interval_days - b.median_interval_days;
+      }
+      return b.avg_amount - a.avg_amount;
+    });
+
+    return res.json({ success: true, data: results });
+  } catch (err) {
+    console.error(
+      "Error inesperado en /analytics/recurring-item-patterns:",
+      err
+    );
+    return res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
+
+// ===== Endpoint =====
+router.get("/expense-forecast", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  try {
+    // Params
+    const months = Math.max(
+      1,
+      Math.min(36, parseInt(req.query.months ?? "12", 10) || 12)
+    );
+    const minOccurrences = Math.max(
+      2,
+      parseInt(req.query.min_occurrences ?? "3", 10) || 3
+    );
+    const limit = Math.max(
+      1,
+      Math.min(50, parseInt(req.query.limit ?? "15", 10) || 15)
+    );
+
+    const includeOccasional =
+      String(req.query.include_occasional ?? "false") === "true";
+
+    // incluir “ruido” (gastos no-recurrentes) por categoría
+    const includeNoise = String(req.query.include_noise ?? "true") === "true";
+
+    const minIntervalDays = Math.max(
+      1,
+      parseInt(req.query.min_interval_days ?? "3", 10) || 3
+    );
+    const maxIntervalDays = Math.max(
+      minIntervalDays,
+      parseInt(req.query.max_interval_days ?? "70", 10) || 70
+    );
+
+    const maxCoefVariation = Number.isFinite(
+      Number(req.query.max_coef_variation)
+    )
+      ? Number(req.query.max_coef_variation)
+      : 0.6;
+
+    // Fechas
+    const rawFrom = (req.query.date_from || "").trim();
+    const rawTo = (req.query.date_to || "").trim();
+
+    let dateFromObj;
+    let dateToObj;
+
+    if (!rawFrom && !rawTo) {
+      // Mes actual completo
+      dateFromObj = firstDayOfMonth(new Date());
+      dateToObj = lastDayOfMonth(new Date());
+    } else if (rawFrom && !rawTo) {
+      // Si solo viene from: DESDE ese día hasta fin de ese mes
+      const base = new Date(rawFrom);
+      if (Number.isNaN(base.getTime())) {
+        return res
+          .status(400)
+          .json({ error: "date_from inválida (YYYY-MM-DD)" });
+      }
+      dateFromObj = base;
+      dateToObj = lastDayOfMonth(base);
+    } else if (!rawFrom && rawTo) {
+      // Si solo viene to: mes completo de ese "to"
+      const base = new Date(rawTo);
+      if (Number.isNaN(base.getTime())) {
+        return res.status(400).json({ error: "date_to inválida (YYYY-MM-DD)" });
+      }
+      dateFromObj = firstDayOfMonth(base);
+      dateToObj = base; // respeta el día exacto
+    } else {
+      // ambos vienen
+      const f = new Date(rawFrom);
+      const t = new Date(rawTo);
+      if (Number.isNaN(f.getTime()) || Number.isNaN(t.getTime())) {
+        return res
+          .status(400)
+          .json({ error: "date_from/date_to inválidas (YYYY-MM-DD)" });
+      }
+      if (f > t) {
+        return res
+          .status(400)
+          .json({ error: "date_from no puede ser mayor que date_to" });
+      }
+      dateFromObj = f;
+      dateToObj = t;
+    }
+
+    const date_from = toISODate(dateFromObj);
+    const date_to = toISODate(dateToObj);
+
+    // Historial: últimos N meses hacia atrás desde date_from
+    const historyToObj = new Date(dateFromObj);
+    const historyFromObj = new Date(dateFromObj);
+    historyFromObj.setMonth(historyFromObj.getMonth() - months);
+
+    const history_from = toISODate(historyFromObj);
+    const history_to = toISODate(historyToObj);
+
+    // Traer transacciones históricas (expenses)
+    const { data, error } = await supabase
+      .from("transactions")
+      .select(
+        `
+        id,
+        amount,
+        date,
+        category_id,
+        description,
+        categories:categories!transactions_category_id_fkey (
+          name,
+          stability_type
+        )
+      `
+      )
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .gte("date", history_from)
+      .lte("date", history_to);
+
+    if (error) {
+      console.error("Error supabase /analytics/expense-forecast:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    const rawTxs = (data || [])
+      .map((tx) => ({
+        id: tx.id,
+        date: tx.date,
+        amount: Number(tx.amount) || 0,
+        category_id: tx.category_id,
+        category_name: tx.categories?.name || "Sin categoría",
+        category_stability: tx.categories?.stability_type || "variable",
+        description: tx.description || "",
+      }))
+      .filter((tx) => tx.amount > 0 && !!tx.date);
+
+    // filtrar ocasionales si el usuario no los incluye
+    const txs = rawTxs.filter((tx) =>
+      includeOccasional ? true : tx.category_stability !== "occasional"
+    );
+
+    // Normalizar descripción
+    const txsNorm = txs.map((tx) => ({
+      ...tx,
+      norm: normalizeText(tx.description),
+    }));
+
+    // Agrupar por categoría y “clusters” por similitud
+    const byCategory = {};
+    for (const tx of txsNorm) {
+      const catKey = String(tx.category_id || "sin_cat");
+      if (!byCategory[catKey]) byCategory[catKey] = [];
+      byCategory[catKey].push(tx);
+    }
+
+    const SIM_THRESHOLD = 0.45; // ajustable
+    const clusters = []; // { category_id, category_name, rep_norm, rep_grams, entries: [.] }
+
+    for (const catKey of Object.keys(byCategory)) {
+      const list = byCategory[catKey];
+
+      // construir clusters greedy
+      const catClusters = [];
+      for (const tx of list) {
+        const grams = trigrams(tx.norm || "");
+        let bestIdx = -1;
+        let bestScore = 0;
+
+        for (let i = 0; i < catClusters.length; i++) {
+          const score = jaccard(grams, catClusters[i].rep_grams);
+          if (score > bestScore) {
+            bestScore = score;
+            bestIdx = i;
+          }
         }
 
-        const groupKey = `${itemId}::${descKey || ""}`;
+        if (bestIdx >= 0 && bestScore >= SIM_THRESHOLD) {
+          catClusters[bestIdx].entries.push(tx);
+          // opcional: actualizar representante si aparece uno más “limpio”
+          if (
+            (tx.norm || "").length >
+            (catClusters[bestIdx].rep_norm || "").length
+          ) {
+            catClusters[bestIdx].rep_norm = tx.norm;
+            catClusters[bestIdx].rep_grams = grams;
+          }
+        } else {
+          catClusters.push({
+            category_id: tx.category_id,
+            category_name: tx.category_name,
+            rep_norm: tx.norm,
+            rep_grams: grams,
+            entries: [tx],
+          });
+        }
+      }
 
-        if (!groups[groupKey]) {
-          groups[groupKey] = {
-            item_id: itemId,
-            item_name: itemName,
-            category_name: categoryName,
-            description_key: descKey,
-            entries: [], // { date, quantity, amount }
+      clusters.push(...catClusters);
+    }
+
+    // Calcular patrones por cluster
+    const recurringPatterns = [];
+    const recurringTxIds = new Set();
+
+    for (const c of clusters) {
+      const entries = c.entries;
+      if (!entries || entries.length < minOccurrences) continue;
+
+      // ordenar por fecha
+      entries.sort((a, b) => a.date.localeCompare(b.date));
+
+      const intervals = [];
+      for (let i = 1; i < entries.length; i++) {
+        const d = diffInDays(entries[i - 1].date, entries[i].date);
+        if (d > 0) intervals.push(d);
+      }
+      if (intervals.length < 2) continue;
+
+      const medInterval = median(intervals);
+      const mu = mean(intervals);
+      const sd = stdDev(intervals);
+      const coefVar = mu > 0 ? sd / mu : 999;
+
+      if (medInterval < minIntervalDays || medInterval > maxIntervalDays)
+        continue;
+      if (coefVar > maxCoefVariation) continue;
+
+      const amounts = entries
+        .map((e) => e.amount)
+        .filter((a) => Number.isFinite(a) && a > 0);
+
+      const medAmount = median(amounts);
+      if (!Number.isFinite(medAmount) || medAmount <= 0) continue;
+
+      const last = entries[entries.length - 1];
+      const lastDate = last.date;
+
+      // Simular ocurrencias esperadas dentro del rango
+      let next = addDays(lastDate, Math.round(medInterval));
+      let expectedCount = 0;
+
+      while (new Date(next) <= new Date(date_to)) {
+        if (new Date(next) >= new Date(date_from)) expectedCount++;
+        next = addDays(next, Math.round(medInterval));
+      }
+
+      if (expectedCount <= 0) continue;
+
+      const projected = expectedCount * medAmount;
+
+      // marcar tx usadas por patrones recurrentes (para excluirlas del ruido)
+      for (const e of entries) recurringTxIds.add(e.id);
+
+      recurringPatterns.push({
+        type: "recurring",
+        category: c.category_name,
+        pattern: `${c.category_name} · ${c.rep_norm || "sin descripcion"}`.trim(),
+        projection: Number(projected.toFixed(2)),
+        expected_count: expectedCount,
+        median_interval_days: Number(medInterval.toFixed(1)),
+        median_amount: Number(medAmount.toFixed(2)),
+        last_date: lastDate,
+
+        // debug columns
+        proj_a: null,
+        proj_b: null,
+      });
+    }
+
+    // ===== “Gastos ruidosos” (no recurrentes) por categoría =====
+    // CAMBIO (C):
+    // - Proj A = rate por día (total/historyDays * targetDays)
+    // - Proj B = expectedCount * medAmount (ocurrencias * ticket típico)
+    // - projection = MIN(Proj B, Proj A)  => NO inventa compras si el rate no lo soporta
+    let noisePatterns = [];
+    if (includeNoise) {
+      const historyDays = Math.max(1, diffInDays(history_from, history_to) + 1);
+      const targetDays = Math.max(1, diffInDays(date_from, date_to) + 1);
+
+      const noiseByCat = {}; // key: category_id
+
+      for (const tx of txsNorm) {
+        if (recurringTxIds.has(tx.id)) continue; // explicado por patrón
+
+        const catKey = String(tx.category_id || "sin_cat");
+        if (!noiseByCat[catKey]) {
+          noiseByCat[catKey] = {
+            category_id: tx.category_id,
+            category_name: tx.category_name,
+            amounts: [],
+            total: 0,
+            count: 0,
           };
         }
 
-        groups[groupKey].entries.push({
-          date,
-          quantity: qty,
-          amount: lineAmount,
-        });
+        noiseByCat[catKey].amounts.push(tx.amount);
+        noiseByCat[catKey].total += tx.amount;
+        noiseByCat[catKey].count += 1;
       }
 
-      // 4) Calcular métricas por grupo
-      const results = [];
+      noisePatterns = Object.values(noiseByCat)
+        .map((c) => {
+          // Reglas anti-ruido: debe haber suficientes transacciones sueltas
+          if (c.count < 3) return null;
 
-      Object.values(groups).forEach((group) => {
-        const entries = group.entries;
-        if (!entries || entries.length < minOccurrences) {
-          return; // no cumple mínimo de ocurrencias
-        }
+          const medAmount = median(c.amounts);
 
-        // Ordenar por fecha ascendente
-        entries.sort((a, b) => a.date.localeCompare(b.date));
+          // A: rate por día
+          const meanPerDay = c.total / historyDays;
+          const projectedA = meanPerDay * targetDays;
 
-        const dates = entries.map((e) => e.date);
+          // expected_count por densidad histórica (sin forzar 1 si es muy bajita)
+          const expectedCountRaw = (c.count / historyDays) * targetDays;
+          const expectedCount =
+            expectedCountRaw >= 0.75 ? Math.round(expectedCountRaw) : 0;
 
-        // Intervalos en días entre compras consecutivas
-        const intervals = [];
-        for (let i = 1; i < dates.length; i++) {
-          const dPrev = dates[i - 1];
-          const dCurr = dates[i];
-          const diff = diffInDays(dPrev, dCurr);
-          if (diff > 0) intervals.push(diff);
-        }
+          // B: ocurrencias * ticket típico (si no hay ocurrencias, es 0)
+          const projectedB =
+            expectedCount > 0 ? expectedCount * (Number(medAmount) || 0) : 0;
 
-        if (intervals.length === 0) {
-          return; // no hay al menos 2 fechas válidas
-        }
+          // PROJECTION (modo C): no exceder el rate histórico
+          const projection = Math.min(projectedB, projectedA);
 
-        const medianInterval = median(intervals);
-        const meanInterval = mean(intervals);
-        const stdInterval = stdDev(intervals);
+          // si termina en 0, no lo mostramos
+          if (!Number.isFinite(projection) || projection <= 0) return null;
 
-        const totalQty = entries.reduce(
-          (sum, e) => sum + (Number(e.quantity) || 0),
-          0
-        );
-        const totalAmount = entries.reduce(
-          (sum, e) => sum + (Number(e.amount) || 0),
-          0
-        );
+          return {
+            type: "event",
+            category: c.category_name,
+            pattern: `${c.category_name} · gastos eventuales`,
+            projection: Number(projection.toFixed(2)),
+            expected_count: expectedCount,
+            median_interval_days: null,
+            median_amount: Number((Number(medAmount) || 0).toFixed(2)),
+            last_date: null,
 
-        const avgQty =
-          entries.length > 0 ? totalQty / entries.length : 0;
-        const avgAmount =
-          entries.length > 0 ? totalAmount / entries.length : 0;
-
-        const lastEntry = entries[entries.length - 1];
-        const lastDate = lastEntry?.date || null;
-        const lastAmount = lastEntry?.amount || 0;
-
-        const frequencyLabel = mapIntervalToFrequencyLabel(
-          medianInterval
-        );
-
-        results.push({
-          item_id: group.item_id,
-          item_name: group.item_name,
-          category_name: group.category_name,
-          description_key: group.description_key,
-          occurrences: entries.length,
-          median_interval_days: Number(medianInterval.toFixed(1)),
-          mean_interval_days: Number(meanInterval.toFixed(1)),
-          std_dev_interval_days: Number(stdInterval.toFixed(1)),
-          avg_quantity: Number(avgQty.toFixed(2)),
-          avg_amount: Number(avgAmount.toFixed(2)),
-          last_date: lastDate,
-          last_amount: Number(lastAmount.toFixed(2)),
-          frequency_label: frequencyLabel,
-        });
-      });
-
-      // 5) Ordenar resultados (más interesantes arriba)
-      results.sort((a, b) => {
-        if (b.occurrences !== a.occurrences) {
-          return b.occurrences - a.occurrences;
-        }
-        if (a.median_interval_days !== b.median_interval_days) {
-          return a.median_interval_days - b.median_interval_days;
-        }
-        return b.avg_amount - a.avg_amount;
-      });
-
-      return res.json({ success: true, data: results });
-    } catch (err) {
-      console.error(
-        "Error inesperado en /analytics/recurring-item-patterns:",
-        err
-      );
-      return res
-        .status(500)
-        .json({ error: "Error interno del servidor" });
+            // debug columns
+            proj_a: Number(projectedA.toFixed(2)),
+            proj_b: Number(projectedB.toFixed(2)),
+          };
+        })
+        .filter(Boolean);
     }
-  }
-);
 
+    // Mezclar: patrones recurrentes + ruido
+    const combined = [...recurringPatterns, ...noisePatterns];
+
+    // Ordenar y limitar
+    combined.sort((a, b) => (b.projection || 0) - (a.projection || 0));
+    const top = combined.slice(0, limit);
+
+    const total_projected = top.reduce((s, r) => s + (r.projection || 0), 0);
+    const transactions_expected = top.reduce(
+      (s, r) => s + (r.expected_count || 0),
+      0
+    );
+
+    return res.json({
+      success: true,
+      meta: {
+        date_from,
+        date_to,
+        history_from,
+        history_to,
+        months,
+        min_occurrences: minOccurrences,
+        include_occasional: includeOccasional,
+        include_noise: includeNoise,
+      },
+      summary: {
+        total_projected: Number(total_projected.toFixed(2)),
+        transactions_expected,
+      },
+      data: top,
+    });
+  } catch (err) {
+    console.error("Error en /analytics/expense-forecast:", {
+      message: err?.message,
+      cause: err?.cause,
+      stack: err?.stack,
+    });
+    return res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
+
+// ===== Helpers (si ya los tienes, no dupliques) =====
+function toISODate(d) {
+  return new Date(d).toISOString().split("T")[0];
+}
+function firstDayOfMonth(dateObj = new Date()) {
+  return new Date(dateObj.getFullYear(), dateObj.getMonth(), 1);
+}
+function lastDayOfMonth(dateObj = new Date()) {
+  return new Date(dateObj.getFullYear(), dateObj.getMonth() + 1, 0);
+}
+function addDays(dateStr, days) {
+  const d = new Date(dateStr);
+  d.setDate(d.getDate() + days);
+  return toISODate(d);
+}
+function diffInDays(a, b) {
+  const da = new Date(a);
+  const db = new Date(b);
+  return Math.round((db - da) / (1000 * 60 * 60 * 24));
+}
+function mean(arr) {
+  if (!arr?.length) return 0;
+  return arr.reduce((s, v) => s + v, 0) / arr.length;
+}
+function median(arr) {
+  if (!arr?.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+function stdDev(arr) {
+  if (!arr?.length) return 0;
+  const m = mean(arr);
+  const v = arr.reduce((s, x) => s + (x - m) ** 2, 0) / arr.length;
+  return Math.sqrt(v);
+}
+
+// Normalización general (no user-specific)
+function stripAccents(s) {
+  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+function normalizeText(raw) {
+  const s = stripAccents(String(raw || "").toLowerCase())
+    .replace(/[_|/\\]+/g, " ")
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .replace(/\d+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!s) return "";
+
+  const stop = new Set([
+    "de",
+    "del",
+    "la",
+    "el",
+    "los",
+    "las",
+    "y",
+    "o",
+    "para",
+    "por",
+    "con",
+    "un",
+    "una",
+    "unos",
+    "unas",
+    "mi",
+    "mis",
+    "tu",
+    "tus",
+    "su",
+    "sus",
+    "en",
+    "a",
+    "al",
+    "se",
+    "me",
+    "te",
+    "que",
+    "como",
+  ]);
+
+  const tokens = s.split(" ").filter((t) => t.length >= 2 && !stop.has(t));
+  return tokens.slice(0, 6).join(" ");
+}
+
+// Trigramas + similitud Jaccard
+function trigrams(s) {
+  const t = `  ${s}  `;
+  const grams = new Set();
+  for (let i = 0; i < t.length - 2; i++) grams.add(t.slice(i, i + 3));
+  return grams;
+}
+function jaccard(a, b) {
+  if (!a.size || !b.size) return 0;
+  let inter = 0;
+  for (const x of a) if (b.has(x)) inter++;
+  const union = a.size + b.size - inter;
+  return union > 0 ? inter / union : 0;
+}
 
 module.exports = router;
-
