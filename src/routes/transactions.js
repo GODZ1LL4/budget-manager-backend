@@ -758,5 +758,618 @@ router.put("/:id", authenticateUser, async (req, res) => {
   }
 });
 
+// ===============================
+// ✅ Shopping List V2 (Preview + Resolve Conflicts)
+// Endpoints:
+//   POST /transactions/shopping-list/preview
+//   POST /transactions/shopping-list
+// ===============================
+
+const EPSILON = 0.0001;
+
+function nearlyEqual(a, b, eps = EPSILON) {
+  return Math.abs(Number(a || 0) - Number(b || 0)) <= eps;
+}
+
+function toNumber(x, fallback = 0) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function round2(n) {
+  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+}
+
+async function fetchItemsTaxAndLatestPrice({ supabase, user_id, itemIds }) {
+  // 1) Info de impuestos (items + taxes)
+  const { data: itemsData, error: itemsError } = await supabase
+    .from("items")
+    .select("id, user_id, tax_id, taxes:tax_id(rate, is_exempt)")
+    .in("id", itemIds);
+
+  if (itemsError) {
+    console.error("❌ Error leyendo items:", itemsError);
+    throw new Error("No se pudieron leer los artículos");
+  }
+
+  const ownedItems = (itemsData || []).filter((it) => it.user_id === user_id);
+  const itemTaxMap = new Map(ownedItems.map((it) => [it.id, it]));
+
+  // 2) latest_price (vista items_with_price)
+  const { data: latestData, error: latestErr } = await supabase
+    .from("items_with_price")
+    .select("id, latest_price, user_id")
+    .eq("user_id", user_id)
+    .in("id", itemIds);
+
+  if (latestErr) {
+    console.error("❌ Error leyendo items_with_price:", latestErr);
+    throw new Error("No se pudieron leer los precios latest_price");
+  }
+
+  const latestMap = new Map(
+    (latestData || []).map((r) => [r.id, toNumber(r.latest_price, 0)])
+  );
+
+  return { itemTaxMap, latestMap };
+}
+
+async function fetchExistingPricesOnDate({ supabase, user_id, date, itemIds }) {
+  // Nota: item_prices no tiene user_id. Por seguridad hacemos join a items
+  // para filtrar por el usuario (similar a tu /item-prices/by-date).
+  const { data, error } = await supabase
+    .from("item_prices")
+    .select("id, item_id, price, date, items:item_id (user_id)")
+    .eq("date", date)
+    .in("item_id", itemIds);
+
+  if (error) {
+    console.error("❌ Error leyendo item_prices:", error);
+    throw new Error("No se pudieron leer los precios existentes para esa fecha");
+  }
+
+  const filtered = (data || []).filter(
+    (row) => row.items && row.items.user_id === user_id
+  );
+
+  const existingMap = new Map(
+    filtered.map((row) => [
+      row.item_id,
+      { id: row.id, price: toNumber(row.price, 0), date: row.date },
+    ])
+  );
+
+  return existingMap;
+}
+
+// Calcula todo lo necesario por línea (net/gross)
+// Retorna:
+// - unit_price_net
+// - unit_price_final
+// - line_total_gross (antes de descuento)
+// - tax_rate, is_exempt, tax_amount, net_total
+function computeLine({ qty, taxRate, isExempt, price_input_mode, unit_price_net_input, gross_total_input }) {
+  const q = qty > 0 ? qty : 1;
+  const rate = isExempt ? 0 : toNumber(taxRate, 0);
+  const factor = 1 + rate / 100;
+
+  if (price_input_mode === "gross") {
+    const grossTotal = toNumber(gross_total_input, 0);
+    if (!grossTotal || grossTotal <= 0) {
+      throw new Error("gross_total debe ser > 0 en modo 'gross'");
+    }
+
+    // net_total = gross_total / (1 + rate)
+    const netTotal = factor > 0 ? grossTotal / factor : grossTotal;
+    const taxAmount = grossTotal - netTotal;
+
+    const unitNet = netTotal / q;
+    const unitFinal = grossTotal / q;
+
+    return {
+      unit_price_net: unitNet,
+      unit_price_final: unitFinal,
+      line_total_gross: grossTotal, // ya incluye ITBIS
+      net_total: netTotal,
+      tax_amount: taxAmount,
+      tax_rate_used: rate,
+      is_exempt_used: isExempt === true,
+    };
+  }
+
+  // default: net
+  const unitNet = toNumber(unit_price_net_input, 0);
+  if (!unitNet || unitNet <= 0) {
+    throw new Error("unit_price_net debe ser > 0 en modo 'net'");
+  }
+
+  const netTotal = unitNet * q;
+  const taxAmount = netTotal * (rate / 100);
+  const grossTotal = netTotal + taxAmount;
+  const unitFinal = grossTotal / q;
+
+  return {
+    unit_price_net: unitNet,
+    unit_price_final: unitFinal,
+    line_total_gross: grossTotal,
+    net_total: netTotal,
+    tax_amount: taxAmount,
+    tax_rate_used: rate,
+    is_exempt_used: isExempt === true,
+  };
+}
+
+// -------------------------------
+// POST /transactions/shopping-list/preview
+// -------------------------------
+router.post("/shopping-list/preview", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  const { date, discount = 0, lines = [] } = req.body;
+
+  if (!date) {
+    return res.status(400).json({ error: "Falta 'date' (YYYY-MM-DD)" });
+  }
+
+  if (!Array.isArray(lines) || lines.length === 0) {
+    return res.status(400).json({ error: "Debes enviar 'lines' con al menos 1 fila" });
+  }
+
+  try {
+    const itemIds = Array.from(
+      new Set(
+        lines
+          .map((l) => l.item_id)
+          .filter((id) => typeof id === "string" && id.length > 0)
+      )
+    );
+
+    if (itemIds.length === 0) {
+      return res.status(400).json({ error: "No hay item_id válidos en lines" });
+    }
+
+    const { itemTaxMap, latestMap } = await fetchItemsTaxAndLatestPrice({
+      supabase,
+      user_id,
+      itemIds,
+    });
+
+    // Precios existentes para esa fecha
+    const existingMap = await fetchExistingPricesOnDate({
+      supabase,
+      user_id,
+      date,
+      itemIds,
+    });
+
+    const discountPct = toNumber(discount, 0);
+    const discountFactor = discountPct > 0 ? 1 - discountPct / 100 : 1;
+
+    const previewLines = [];
+    let totalBeforeDiscount = 0;
+
+    for (const raw of lines) {
+      const item_id = raw.item_id;
+      const qty = toNumber(raw.quantity, 1);
+      const price_input_mode = raw.price_input_mode === "gross" ? "gross" : "net";
+
+      const itemRow = itemTaxMap.get(item_id);
+      if (!itemRow) {
+        // item no es del usuario o no existe → lo marcamos como invalid
+        previewLines.push({
+          item_id,
+          status: "invalid_item",
+          message: "Artículo no encontrado o no pertenece al usuario",
+        });
+        continue;
+      }
+
+      const taxRate = toNumber(itemRow.taxes?.rate, 0);
+      const isExempt = itemRow.taxes?.is_exempt === true;
+
+      // Inputs de precio:
+      const unit_price_net_input = toNumber(raw.unit_price_net, 0);
+      const gross_total_input = toNumber(raw.gross_total, 0);
+
+      let computed;
+      try {
+        computed = computeLine({
+          qty,
+          taxRate,
+          isExempt,
+          price_input_mode,
+          unit_price_net_input,
+          gross_total_input,
+        });
+      } catch (e) {
+        previewLines.push({
+          item_id,
+          quantity: qty,
+          price_input_mode,
+          status: "invalid_price",
+          message: e.message,
+        });
+        continue;
+      }
+
+      const latest_price = latestMap.get(item_id) ?? 0;
+
+      const existing = existingMap.get(item_id) || null;
+      const existing_price_on_date = existing ? existing.price : null;
+
+      // Comparación dura contra el precio del día (si existe)
+      let price_status = "insert_new";
+      let needs_resolution = false;
+      let default_resolution = "insert_new";
+
+      if (existing) {
+        if (nearlyEqual(existing.price, computed.unit_price_net)) {
+          price_status = "same_as_existing";
+          needs_resolution = false;
+          default_resolution = "use_existing";
+        } else {
+          price_status = "conflict";
+          needs_resolution = true;
+          default_resolution = "use_existing";
+        }
+      } else {
+        // No existe precio ese día
+        // (Opcional) si es igual al latest, igual insertamos precio del día para trazabilidad.
+        price_status = "insert_new";
+        needs_resolution = false;
+        default_resolution = "insert_new";
+      }
+
+      totalBeforeDiscount += computed.line_total_gross;
+
+      previewLines.push({
+        item_id,
+        quantity: qty,
+        price_input_mode,
+
+        // Inputs originales
+        input: {
+          unit_price_net: price_input_mode === "net" ? unit_price_net_input : null,
+          gross_total: price_input_mode === "gross" ? gross_total_input : null,
+        },
+
+        // Datos fiscales
+        tax_rate: isExempt ? 0 : taxRate,
+        is_exempt: isExempt,
+
+        // Referencias
+        latest_price,
+        existing_price_on_date,
+        existing_price_id: existing ? existing.id : null,
+
+        // Computados (neto unitario y totales)
+        computed: {
+          unit_price_net: round2(computed.unit_price_net),
+          unit_price_final: round2(computed.unit_price_final),
+          net_total: round2(computed.net_total),
+          tax_amount: round2(computed.tax_amount),
+          line_total_gross: round2(computed.line_total_gross),
+        },
+
+        // Estado
+        price_status, // same_as_existing | insert_new | conflict | invalid_*
+        needs_resolution,
+        default_resolution,
+      });
+    }
+
+    const totalAfterDiscount = totalBeforeDiscount * discountFactor;
+
+    return res.json({
+      success: true,
+      data: {
+        date,
+        discount: discountPct,
+        totals: {
+          totalBeforeDiscount: round2(totalBeforeDiscount),
+          totalAfterDiscount: round2(totalAfterDiscount),
+        },
+        lines: previewLines,
+      },
+    });
+  } catch (e) {
+    console.error("❌ Error en /transactions/shopping-list/preview:", e);
+    return res.status(500).json({ error: e.message || "Error interno" });
+  }
+});
+
+// -------------------------------
+// POST /transactions/shopping-list
+// Crea transacción + transaction_items
+// y aplica decisiones de precios por línea.
+// -------------------------------
+router.post("/shopping-list", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  const {
+    account_id,
+    category_id,
+    date,
+    description = "",
+    discount = 0,
+    lines = [],
+  } = req.body;
+
+  if (!account_id || !category_id || !date) {
+    return res.status(400).json({ error: "Faltan account_id, category_id o date" });
+  }
+
+  if (!Array.isArray(lines) || lines.length === 0) {
+    return res.status(400).json({ error: "Debes enviar 'lines' con al menos 1 fila" });
+  }
+
+  try {
+    const itemIds = Array.from(
+      new Set(
+        lines
+          .map((l) => l.item_id)
+          .filter((id) => typeof id === "string" && id.length > 0)
+      )
+    );
+
+    if (itemIds.length === 0) {
+      return res.status(400).json({ error: "No hay item_id válidos en lines" });
+    }
+
+    const { itemTaxMap, latestMap } = await fetchItemsTaxAndLatestPrice({
+      supabase,
+      user_id,
+      itemIds,
+    });
+
+    const existingMap = await fetchExistingPricesOnDate({
+      supabase,
+      user_id,
+      date,
+      itemIds,
+    });
+
+    const discountPct = toNumber(discount, 0);
+    const discountFactor = discountPct > 0 ? 1 - discountPct / 100 : 1;
+
+    const pricesToInsert = [];
+    const pricesToUpdate = [];
+
+    const txItemsToInsert = [];
+    let totalBeforeDiscount = 0;
+
+    for (const raw of lines) {
+      const item_id = raw.item_id;
+      const qty = toNumber(raw.quantity, 1);
+
+      const resolution = raw.resolution; 
+      // resolution esperado:
+      // - "insert_new"
+      // - "use_existing"
+      // - "update_existing"
+
+      const price_input_mode = raw.price_input_mode === "gross" ? "gross" : "net";
+      const unit_price_net_input = toNumber(raw.unit_price_net, 0);
+      const gross_total_input = toNumber(raw.gross_total, 0);
+
+      const itemRow = itemTaxMap.get(item_id);
+      if (!itemRow) {
+        return res.status(400).json({
+          error: "INVALID_ITEM",
+          message: `Artículo inválido o no pertenece al usuario: ${item_id}`,
+        });
+      }
+
+      const taxRate = toNumber(itemRow.taxes?.rate, 0);
+      const isExempt = itemRow.taxes?.is_exempt === true;
+
+      // Computo del "nuevo" neto por si se necesita insertar/actualizar
+      const computed = computeLine({
+        qty,
+        taxRate,
+        isExempt,
+        price_input_mode,
+        unit_price_net_input,
+        gross_total_input,
+      });
+
+      const existing = existingMap.get(item_id) || null;
+
+      // Determinar si hay conflicto real
+      const conflict =
+        existing && !nearlyEqual(existing.price, computed.unit_price_net);
+
+      // Validación de resolución
+      if (conflict) {
+        if (!resolution || !["use_existing", "update_existing"].includes(resolution)) {
+          return res.status(400).json({
+            error: "MISSING_RESOLUTION",
+            message: `Conflicto de precio detectado para item_id=${item_id} en date=${date}. Debes elegir resolution: use_existing | update_existing.`,
+            item_id,
+            existing_price_on_date: existing.price,
+            computed_unit_price_net: computed.unit_price_net,
+          });
+        }
+      } else {
+        // Si no hay conflicto, resolution puede venir o no. Normalizamos.
+        // Si existe precio del día y es igual, "use_existing" (no tocamos item_prices)
+        // Si no existe precio del día, "insert_new" (insertamos precio del día)
+      }
+
+      // Aplicar la decisión de precio del día (item_prices)
+      let usedUnitNet;
+
+      if (existing) {
+        if (conflict) {
+          if (resolution === "use_existing") {
+            usedUnitNet = existing.price;
+          } else if (resolution === "update_existing") {
+            usedUnitNet = computed.unit_price_net;
+            pricesToUpdate.push({ id: existing.id, price: usedUnitNet });
+          }
+        } else {
+          // igual al existente
+          usedUnitNet = existing.price;
+        }
+      } else {
+        // no existe precio ese día
+        usedUnitNet = computed.unit_price_net;
+        pricesToInsert.push({
+          item_id,
+          price: usedUnitNet,
+          date,
+        });
+      }
+
+      // Calcular línea para transaction_items usando el "usedUnitNet" definitivo
+      const rate = isExempt ? 0 : taxRate;
+      const netTotal = usedUnitNet * qty;
+      const taxAmount = netTotal * (rate / 100);
+      const lineGross = netTotal + taxAmount;
+
+      totalBeforeDiscount += lineGross;
+
+      const lineTotalFinal = lineGross * discountFactor;
+      const unitFinal = qty > 0 ? lineTotalFinal / qty : lineTotalFinal;
+
+      txItemsToInsert.push({
+        item_id,
+        quantity: qty,
+        unit_price_net: usedUnitNet,
+        unit_price_final: unitFinal,
+        line_total_final: lineTotalFinal,
+        tax_rate_used: rate,
+        is_exempt_used: isExempt === true,
+
+        // extra opcional por si quieres debug en frontend
+        meta: {
+          latest_price: latestMap.get(item_id) ?? 0,
+          existing_price_on_date: existing ? existing.price : null,
+          computed_unit_price_net: computed.unit_price_net,
+          conflict,
+          resolution: conflict ? resolution : (existing ? "use_existing" : "insert_new"),
+        },
+      });
+    }
+
+    if (txItemsToInsert.length === 0) {
+      return res.status(400).json({
+        error: "EMPTY_LINES",
+        message: "No hay líneas válidas para crear la lista de compra",
+      });
+    }
+
+    const totalAfterDiscount = totalBeforeDiscount * discountFactor;
+
+    // 1) Insertar precios nuevos (si aplica)
+    if (pricesToInsert.length > 0) {
+      const { error: insertErr } = await supabase
+        .from("item_prices")
+        .insert(
+          pricesToInsert.map((p) => ({
+            item_id: p.item_id,
+            price: p.price,
+            date: p.date,
+          }))
+        );
+
+      if (insertErr) {
+        console.error("❌ Error insertando item_prices:", insertErr);
+        return res.status(500).json({
+          error: "ITEM_PRICES_INSERT_FAILED",
+          message: "No se pudieron insertar nuevos precios del día",
+        });
+      }
+    }
+
+    // 2) Actualizar precios existentes (si aplica)
+    if (pricesToUpdate.length > 0) {
+      const updateResults = await Promise.all(
+        pricesToUpdate.map((p) =>
+          supabase.from("item_prices").update({ price: p.price }).eq("id", p.id)
+        )
+      );
+      const someError = updateResults.find((r) => r.error);
+      if (someError) {
+        console.error("❌ Error actualizando item_prices:", someError.error);
+        return res.status(500).json({
+          error: "ITEM_PRICES_UPDATE_FAILED",
+          message: "No se pudieron actualizar algunos precios del día",
+        });
+      }
+    }
+
+    // 3) Crear transacción
+    const { data: tx, error: txErr } = await supabase
+      .from("transactions")
+      .insert([
+        {
+          user_id,
+          account_id,
+          category_id,
+          amount: totalAfterDiscount,
+          type: "expense",
+          description: description || "Lista de compra",
+          date,
+          discount_percent: discountPct,
+          is_shopping_list: true,
+        },
+      ])
+      .select()
+      .single();
+
+    if (txErr || !tx) {
+      console.error("❌ Error creando transacción:", txErr);
+      return res.status(500).json({
+        error: "TRANSACTION_CREATE_FAILED",
+        message: "No se pudo crear la transacción de lista de compras",
+      });
+    }
+
+    // 4) Insertar transaction_items
+    const txItemsRows = txItemsToInsert.map((row) => ({
+      transaction_id: tx.id,
+      item_id: row.item_id,
+      quantity: row.quantity,
+      unit_price_net: row.unit_price_net,
+      unit_price_final: row.unit_price_final,
+      line_total_final: row.line_total_final,
+      tax_rate_used: row.tax_rate_used,
+      is_exempt_used: row.is_exempt_used,
+    }));
+
+    const { error: txItemsErr } = await supabase
+      .from("transaction_items")
+      .insert(txItemsRows);
+
+    if (txItemsErr) {
+      console.error("❌ Error insertando transaction_items:", txItemsErr);
+      return res.status(500).json({
+        error: "TRANSACTION_ITEMS_FAILED",
+        message: "La transacción se creó, pero falló el detalle de artículos",
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        transaction: tx,
+        totals: {
+          totalBeforeDiscount: round2(totalBeforeDiscount),
+          totalAfterDiscount: round2(totalAfterDiscount),
+          discount: discountPct,
+        },
+        lines: txItemsRows.length,
+      },
+    });
+  } catch (e) {
+    console.error("❌ Error en /transactions/shopping-list:", e);
+    return res.status(500).json({
+      error: "SHOPPING_LIST_FAILED",
+      message: e.message || "Error inesperado creando lista de compra",
+    });
+  }
+});
+
 
 module.exports = router;
