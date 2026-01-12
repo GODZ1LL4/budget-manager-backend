@@ -763,31 +763,80 @@ router.get("/top-variable-categories", authenticateUser, async (req, res) => {
 
 /* ========= METAS ========= */
 
+
 router.get("/goals-progress", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
-  const { data, error } = await supabase
-    .from("goals")
-    .select("name, target_amount, current_amount")
-    .eq("user_id", user_id);
+  try {
+    // 1) Metas (puedes filtrar solo activas/pausadas)
+    const { data: goals, error: gErr } = await supabase
+      .from("goals")
+      .select("id, name, target_amount, status")
+      .eq("user_id", user_id)
+      .in("status", ["active", "paused"]);
 
-  if (error) return res.status(500).json({ error: error.message });
+    if (gErr) return res.status(500).json({ error: gErr.message });
 
-  const result = (data || []).map((goal) => {
-    const current = parseFloat(goal.current_amount);
-    const target = parseFloat(goal.target_amount) || 1;
-    const progress = Math.min((current / target) * 100, 100);
+    const goalIds = (goals || []).map((g) => g.id);
 
-    return {
-      name: goal.name,
-      current,
-      target,
-      progress,
-    };
-  });
+    // Si no hay metas
+    if (!goalIds.length) {
+      return res.json({ success: true, data: [] });
+    }
 
-  res.json({ success: true, data: result });
+    // 2) Movimientos de esas metas
+    const { data: movements, error: mErr } = await supabase
+      .from("goal_movements")
+      .select("goal_id, type, amount")
+      .eq("user_id", user_id)
+      .in("goal_id", goalIds);
+
+    if (mErr) return res.status(500).json({ error: mErr.message });
+
+    // 3) Reserved net por meta
+    const reservedByGoal = {};
+    for (const m of movements || []) {
+      const amt = Number(m.amount) || 0;
+
+      // Ajusta aquí si tienes más tipos
+      const sign =
+        m.type === "deposit" || m.type === "adjust"
+          ? 1
+          : m.type === "withdraw" || m.type === "auto_withdraw"
+          ? -1
+          : 0;
+
+      reservedByGoal[m.goal_id] = (reservedByGoal[m.goal_id] || 0) + sign * amt;
+    }
+
+    // 4) Respuesta
+    const result = (goals || []).map((g) => {
+      const current = Number(reservedByGoal[g.id] || 0);
+      const target = Number(g.target_amount || 0);
+
+      const progress = target > 0 ? Math.min((current / target) * 100, 100) : 0;
+
+      return {
+        id: g.id,
+        name: g.name || "Meta",
+        current: Number(current.toFixed(2)),
+        target: Number(target.toFixed(2)),
+        progress: Number(progress.toFixed(1)),
+        status: g.status,
+      };
+    });
+
+    // Opcional: ordena más útil (más prioridad: más progreso, o target grande, etc.)
+    result.sort((a, b) => b.progress - a.progress);
+
+    return res.json({ success: true, data: result });
+  } catch (err) {
+    console.error("Error goals-progress:", err);
+    return res.status(500).json({ error: "Error interno del servidor" });
+  }
 });
+
+
 
 /* ========= PROYECCIONES POR CATEGORÍA (INGRESO / GASTO) ========= */
 
@@ -1835,7 +1884,10 @@ router.get(
 
 /* ========= BURN RATE (RITMO DE GASTO DEL MES ACTUAL) ========= */
 
-router.get("/spending-burn-rate-current-month", authenticateUser, async (req, res) => {
+router.get(
+  "/spending-burn-rate-current-month",
+  authenticateUser,
+  async (req, res) => {
     const user_id = req.user.id;
 
     try {
@@ -1979,6 +2031,29 @@ router.get("/spending-burn-rate-current-month", authenticateUser, async (req, re
   }
 );
 
+function weekdayFromISODate(dateStr) {
+  // dateStr: "YYYY-MM-DD"
+  const [yS, mS, dS] = String(dateStr).split("-");
+  const y = Number(yS);
+  const m = Number(mS);
+  const d = Number(dS);
+  if (!y || !m || !d) return null;
+
+  // Sakamoto algorithm -> 0=Sunday..6=Saturday
+  const t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+  let yy = y;
+  if (m < 3) yy -= 1;
+  return (
+    (yy +
+      Math.floor(yy / 4) -
+      Math.floor(yy / 100) +
+      Math.floor(yy / 400) +
+      t[m - 1] +
+      d) %
+    7
+  );
+}
+
 router.get("/expense-by-weekday", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
@@ -2001,10 +2076,10 @@ router.get("/expense-by-weekday", authenticateUser, async (req, res) => {
   ];
 
   (data || []).forEach((tx) => {
-    const d = new Date(tx.date);
-    const wd = d.getDay(); // 0 = domingo
-    const amt = parseFloat(tx.amount) || 0;
+    const wd = weekdayFromISODate(tx.date); // ✅ estable, sin timezone
+    if (wd == null) return;
 
+    const amt = parseFloat(tx.amount) || 0;
     totals[wd].total += amt;
     totals[wd].count += 1;
   });
@@ -2849,17 +2924,18 @@ function normalizeDescriptionKey(raw) {
 
 function mapIntervalToFrequencyLabel(medianDays) {
   if (!Number.isFinite(medianDays) || medianDays <= 0) return "irregular";
-
-  if (medianDays <= 9) return "semanal"; // ~ 7 días
-  if (medianDays <= 20) return "quincenal"; // ~ 15 días
-  if (medianDays <= 40) return "mensual"; // ~ 30 días
-  if (medianDays <= 70) return "bimestral"; // ~ 60 días
-
+  if (medianDays <= 9) return "semanal";
+  if (medianDays <= 20) return "quincenal";
+  if (medianDays <= 40) return "mensual";
+  if (medianDays <= 70) return "bimestral";
   return "irregular";
 }
 
 /**
  * GET /analytics/recurring-item-patterns
+ * ✅ Agrupa por item_id (NO por descripción)
+ * ✅ Consolida por día: (item_id + date) sumando quantity y amount
+ *    => cada día cuenta como 1 “evento real de compra” para intervalos/occurrences
  */
 router.get("/recurring-item-patterns", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -2898,13 +2974,9 @@ router.get("/recurring-item-patterns", authenticateUser, async (req, res) => {
             type,
             description,
             category_id,
-            categories (
-              name
-            )
+            categories ( name )
           ),
-          items!inner (
-            name
-          )
+          items!inner ( name )
         `
       )
       .eq("transactions.user_id", user_id)
@@ -2921,7 +2993,8 @@ router.get("/recurring-item-patterns", authenticateUser, async (req, res) => {
 
     const rows = data || [];
 
-    // 3) Agrupar por (item_id, description_key)
+    // 3) Agrupar por item_id y consolidar por día (item_id + date)
+    //    groups[itemId] = { dailyMap: { [date]: { date, quantity, amount, last_descKey, last_categoryName } }, ... }
     const groups = {};
 
     for (const row of rows) {
@@ -2932,16 +3005,16 @@ router.get("/recurring-item-patterns", authenticateUser, async (req, res) => {
       const itemId = row.item_id;
       if (!itemId) continue;
 
-      const itemName = itemRel.name || "Sin nombre";
-      const categoryName = trx.categories?.name || null; // 👈 ahora viene de transactions
-      const descKey = normalizeDescriptionKey(trx.description);
-
       const date = trx.date;
       if (!date) continue;
 
+      const itemName = itemRel.name || "Sin nombre";
+      const categoryName = trx.categories?.name || null;
+      const descKey = normalizeDescriptionKey(trx.description);
+
       const qty = Number(row.quantity || 0);
 
-      // Calcular monto de la línea
+      // Monto de la línea (final si existe, si no net*qty)
       let lineAmount = 0;
       if (row.line_total_final != null) {
         lineAmount = Number(row.line_total_final) || 0;
@@ -2950,51 +3023,64 @@ router.get("/recurring-item-patterns", authenticateUser, async (req, res) => {
         lineAmount = netPrice * qty;
       }
 
-      const groupKey = `${itemId}::${descKey || ""}`;
-
-      if (!groups[groupKey]) {
-        groups[groupKey] = {
+      if (!groups[itemId]) {
+        groups[itemId] = {
           item_id: itemId,
           item_name: itemName,
-          category_name: categoryName,
-          description_key: descKey,
-          entries: [], // { date, quantity, amount }
+          dailyMap: {}, // date => { date, quantity, amount, last_descKey, last_categoryName }
+          last_seen_date: date,
+          last_description_key: descKey,
+          last_category_name: categoryName,
         };
       }
 
-      groups[groupKey].entries.push({
-        date,
-        quantity: qty,
-        amount: lineAmount,
-      });
+      // Consolidación por día
+      if (!groups[itemId].dailyMap[date]) {
+        groups[itemId].dailyMap[date] = {
+          date,
+          quantity: 0,
+          amount: 0,
+          last_descKey: descKey,
+          last_categoryName: categoryName,
+        };
+      }
+
+      groups[itemId].dailyMap[date].quantity += qty;
+      groups[itemId].dailyMap[date].amount += lineAmount;
+
+      // Guardar "último concepto" y "última categoría" del día (por si hay varias transacciones ese mismo día)
+      groups[itemId].dailyMap[date].last_descKey = descKey;
+      groups[itemId].dailyMap[date].last_categoryName = categoryName;
+
+      // Mantener "último concepto" global (más reciente por fecha)
+      if (date >= (groups[itemId].last_seen_date || "")) {
+        groups[itemId].last_seen_date = date;
+        groups[itemId].last_description_key = descKey;
+        groups[itemId].last_category_name = categoryName;
+      }
     }
 
-    // 4) Calcular métricas por grupo
+    // 4) Calcular métricas por ítem usando los "días consolidados"
     const results = [];
 
     Object.values(groups).forEach((group) => {
-      const entries = group.entries;
-      if (!entries || entries.length < minOccurrences) {
-        return; // no cumple mínimo de ocurrencias
-      }
+      const entries = Object.values(group.dailyMap || {});
+      if (!entries || entries.length < minOccurrences) return;
 
       // Ordenar por fecha ascendente
       entries.sort((a, b) => a.date.localeCompare(b.date));
 
       const dates = entries.map((e) => e.date);
 
-      // Intervalos en días entre compras consecutivas
+      // Intervalos en días entre "días con compra" consecutivos
       const intervals = [];
       for (let i = 1; i < dates.length; i++) {
-        const dPrev = dates[i - 1];
-        const dCurr = dates[i];
-        const diff = diffInDays(dPrev, dCurr);
+        const diff = diffInDays(dates[i - 1], dates[i]);
         if (diff > 0) intervals.push(diff);
       }
 
-      if (intervals.length === 0) {
-        return; // no hay al menos 2 fechas válidas
-      }
+      // Si solo hay 1 día o fechas inválidas no hay patrón
+      if (intervals.length === 0) return;
 
       const medianInterval = median(intervals);
       const meanInterval = mean(intervals);
@@ -3009,8 +3095,9 @@ router.get("/recurring-item-patterns", authenticateUser, async (req, res) => {
         0
       );
 
-      const avgQty = entries.length > 0 ? totalQty / entries.length : 0;
-      const avgAmount = entries.length > 0 ? totalAmount / entries.length : 0;
+      // Promedios por "evento diario"
+      const avgQty = totalQty / entries.length;
+      const avgAmount = totalAmount / entries.length;
 
       const lastEntry = entries[entries.length - 1];
       const lastDate = lastEntry?.date || null;
@@ -3021,28 +3108,33 @@ router.get("/recurring-item-patterns", authenticateUser, async (req, res) => {
       results.push({
         item_id: group.item_id,
         item_name: group.item_name,
-        category_name: group.category_name,
-        description_key: group.description_key,
+
+        // ✅ contexto: lo más reciente (no afecta agrupación)
+        category_name: group.last_category_name || null,
+        description_key: group.last_description_key || null,
+
+        // ✅ occurrences ahora = # de días con compra (evento real)
         occurrences: entries.length,
+
         median_interval_days: Number(medianInterval.toFixed(1)),
         mean_interval_days: Number(meanInterval.toFixed(1)),
         std_dev_interval_days: Number(stdInterval.toFixed(1)),
+
         avg_quantity: Number(avgQty.toFixed(2)),
         avg_amount: Number(avgAmount.toFixed(2)),
+
         last_date: lastDate,
         last_amount: Number(lastAmount.toFixed(2)),
+
         frequency_label: frequencyLabel,
       });
     });
 
     // 5) Ordenar resultados (más interesantes arriba)
     results.sort((a, b) => {
-      if (b.occurrences !== a.occurrences) {
-        return b.occurrences - a.occurrences;
-      }
-      if (a.median_interval_days !== b.median_interval_days) {
+      if (b.occurrences !== a.occurrences) return b.occurrences - a.occurrences;
+      if (a.median_interval_days !== b.median_interval_days)
         return a.median_interval_days - b.median_interval_days;
-      }
       return b.avg_amount - a.avg_amount;
     });
 
@@ -3312,7 +3404,9 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       recurringPatterns.push({
         type: "recurring",
         category: c.category_name,
-        pattern: `${c.category_name} · ${c.rep_norm || "sin descripcion"}`.trim(),
+        pattern: `${c.category_name} · ${
+          c.rep_norm || "sin descripcion"
+        }`.trim(),
         projection: Number(projected.toFixed(2)),
         expected_count: expectedCount,
         median_interval_days: Number(medInterval.toFixed(1)),
@@ -3512,8 +3606,35 @@ function normalizeText(raw) {
   if (!s) return "";
 
   const stop = new Set([
-    "de","del","la","el","los","las","y","o","para","por","con","un","una","unos","unas",
-    "mi","mis","tu","tus","su","sus","en","a","al","se","me","te","que","como",
+    "de",
+    "del",
+    "la",
+    "el",
+    "los",
+    "las",
+    "y",
+    "o",
+    "para",
+    "por",
+    "con",
+    "un",
+    "una",
+    "unos",
+    "unas",
+    "mi",
+    "mis",
+    "tu",
+    "tus",
+    "su",
+    "sus",
+    "en",
+    "a",
+    "al",
+    "se",
+    "me",
+    "te",
+    "que",
+    "como",
   ]);
 
   const tokens = s.split(" ").filter((t) => t.length >= 2 && !stop.has(t));
@@ -3534,7 +3655,6 @@ function jaccard(a, b) {
   const union = a.size + b.size - inter;
   return union > 0 ? inter / union : 0;
 }
-
 
 // GET /analytics/advanced-burn-rate-current-month
 // - Fechas internas: primer y último día del mes actual
@@ -3752,7 +3872,9 @@ router.get(
         recurringPatterns.push({
           type: "recurring",
           category: c.category_name,
-          pattern: `${c.category_name} · ${c.rep_norm || "sin descripcion"}`.trim(),
+          pattern: `${c.category_name} · ${
+            c.rep_norm || "sin descripcion"
+          }`.trim(),
           median_interval_days: Number(medInterval.toFixed(1)),
           median_amount: Number(medAmount.toFixed(2)),
           last_date: lastDate,
@@ -3764,7 +3886,10 @@ router.get(
       // =========================
       let noisePatterns = [];
       if (includeNoise) {
-        const historyDays = Math.max(1, diffInDays(history_from, history_to) + 1);
+        const historyDays = Math.max(
+          1,
+          diffInDays(history_from, history_to) + 1
+        );
         const targetDays = Math.max(1, diffInDays(date_from, date_to) + 1);
 
         const noiseByCat = {};
@@ -3910,8 +4035,10 @@ router.get(
         });
       }
 
-      const expected_total = series[days_in_month - 1]?.expected_cumulative || 0;
-      const expected_to_date = series[day_of_month - 1]?.expected_cumulative || 0;
+      const expected_total =
+        series[days_in_month - 1]?.expected_cumulative || 0;
+      const expected_to_date =
+        series[day_of_month - 1]?.expected_cumulative || 0;
       const actual_to_date = series[day_of_month - 1]?.actual_cumulative || 0;
 
       const projected_end_of_month =
@@ -3959,7 +4086,87 @@ router.get(
         },
       });
     } catch (err) {
-      console.error("Error en /analytics/advanced-burn-rate-current-month:", err);
+      console.error(
+        "Error en /analytics/advanced-burn-rate-current-month:",
+        err
+      );
+      return res.status(500).json({ error: "Error interno del servidor" });
+    }
+  }
+);
+
+/**
+ * GET /analytics/income-vs-expense-monthly?months=6
+ * Devuelve ingresos vs gastos agregados por mes calendario
+ */
+router.get(
+  "/income-vs-expense-monthly",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+
+    const monthsParam = parseInt(req.query.months, 10);
+    const months =
+      Number.isNaN(monthsParam) || monthsParam <= 0 ? 6 : monthsParam;
+
+    try {
+      // 1) Mes inicial (YYYY-MM-01)
+      const now = new Date();
+      const start = new Date(
+        now.getFullYear(),
+        now.getMonth() - (months - 1),
+        1
+      );
+      const startDate = start.toISOString().split("T")[0];
+
+      // 2) Traer transacciones
+      const { data, error } = await supabase
+        .from("transactions")
+        .select("date, type, amount")
+        .eq("user_id", user_id)
+        .gte("date", startDate);
+
+      if (error) {
+        console.error("Error income-vs-expense-monthly:", error);
+        return res.status(500).json({ error: error.message });
+      }
+
+      // 3) Inicializar meses vacíos
+      const map = {};
+      for (let i = 0; i < months; i++) {
+        const d = new Date(start.getFullYear(), start.getMonth() + i, 1);
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
+          2,
+          "0"
+        )}`;
+        map[key] = {
+          month: key,
+          income: 0,
+          expense: 0,
+        };
+      }
+
+      // 4) Agregar montos
+      (data || []).forEach((tx) => {
+        if (!tx.date || !tx.amount) return;
+        const monthKey = tx.date.slice(0, 7); // YYYY-MM (sin Date, sin TZ)
+        if (!map[monthKey]) return;
+
+        const amt = Number(tx.amount) || 0;
+        if (tx.type === "income") map[monthKey].income += amt;
+        if (tx.type === "expense") map[monthKey].expense += amt;
+      });
+
+      // 5) Resultado final
+      const result = Object.values(map).map((m) => ({
+        month: m.month,
+        income: Number(m.income.toFixed(2)),
+        expense: Number(m.expense.toFixed(2)),
+      }));
+
+      return res.json({ success: true, data: result });
+    } catch (err) {
+      console.error("Error inesperado income-vs-expense-monthly:", err);
       return res.status(500).json({ error: "Error interno del servidor" });
     }
   }
