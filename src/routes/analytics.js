@@ -411,41 +411,56 @@ router.get(
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
-    const year = new Date().getFullYear();
+
+    const rawYear = parseInt(req.query.year, 10);
+    const currentYear = new Date().getFullYear();
+    const year =
+      Number.isFinite(rawYear) && rawYear >= 2000 && rawYear <= currentYear + 1
+        ? rawYear
+        : currentYear;
+
     const { start, end } = getYearRange(year);
 
     const { data, error } = await supabase
       .from("transactions")
       .select("amount, type, date")
       .eq("user_id", user_id)
+      .in("type", ["income", "expense"])
       .gte("date", start)
       .lte("date", end);
 
     if (error) return res.status(500).json({ error: error.message });
 
-    const grouped = {};
-    (data || []).forEach((tx) => {
-      const [y, m] = tx.date.split("-");
-      const key = `${y}-${m}`;
-      if (!grouped[key]) grouped[key] = { income: 0, expense: 0 };
-
-      const amount = parseFloat(tx.amount);
-      if (tx.type === "income") grouped[key].income += amount;
-      else if (tx.type === "expense") grouped[key].expense += amount;
+    // Pre-cargar los 12 meses para que el gráfico no "brinque" y sea consistente
+    const months = Array.from({ length: 12 }, (_, i) => {
+      const mm = String(i + 1).padStart(2, "0");
+      return `${year}-${mm}`;
     });
 
-    const result = Object.entries(grouped)
-      .map(([month, { income, expense }]) => {
-        income = Number(income ?? 0);
-        expense = Number(expense ?? 0);
-        return {
-          month,
-          income,
-          expense,
-          balance: income - expense,
-        };
-      })
-      .sort((a, b) => a.month.localeCompare(b.month));
+    const grouped = {};
+    months.forEach((m) => (grouped[m] = { income: 0, expense: 0 }));
+
+    (data || []).forEach((tx) => {
+      const month = typeof tx.date === "string" ? tx.date.slice(0, 7) : null;
+      if (!month || !grouped[month]) return;
+
+      const amount = parseFloat(tx.amount);
+      if (!Number.isFinite(amount) || amount <= 0) return;
+
+      if (tx.type === "income") grouped[month].income += amount;
+      else if (tx.type === "expense") grouped[month].expense += amount;
+    });
+
+    const result = months.map((month) => {
+      const income = Number(grouped[month].income || 0);
+      const expense = Number(grouped[month].expense || 0);
+      return {
+        month,
+        income: Number(income.toFixed(2)),
+        expense: Number(expense.toFixed(2)),
+        balance: Number((income - expense).toFixed(2)),
+      };
+    });
 
     res.json({ success: true, data: result });
   }
@@ -573,89 +588,214 @@ router.get("/budget-vs-actual-history", authenticateUser, async (req, res) => {
   res.json({ success: true, data: result });
 });
 
+// GET /api/analytics/budget-vs-actual-summary-yearly?year=2026&view=monthly
+// GET /api/analytics/budget-vs-actual-summary-yearly?year=2026&view=categories
 router.get(
   "/budget-vs-actual-summary-yearly",
   authenticateUser,
   async (req, res) => {
     try {
       const user_id = req.user.id;
-      const year = new Date().getFullYear();
+
+      const rawYear = parseInt(req.query.year, 10);
+      const currentYear = new Date().getFullYear();
+      const year =
+        Number.isFinite(rawYear) &&
+        rawYear >= 2000 &&
+        rawYear <= currentYear + 1
+          ? rawYear
+          : currentYear;
+
+      const view = String(req.query.view || "monthly"); // "monthly" | "categories"
 
       const { start, end } = getYearRange(year);
-      // p.ej. start = `${year}-01-01`, end = `${year}-12-31`
 
-      // 1) Presupuestos del año actual (por mes)
+      // 1) Presupuestos del año (por mes y categoría)
       const { data: budgets, error: budgetError } = await supabase
         .from("budgets")
-        .select("month, limit_amount")
+        .select("month, limit_amount, category_id, categories(name, type)")
         .eq("user_id", user_id)
         .gte("month", `${year}-01`)
         .lte("month", `${year}-12`);
 
-      if (budgetError) {
+      if (budgetError)
         return res.status(500).json({ error: budgetError.message });
-      }
 
-      // 2) Gastos del año actual (MISMA lógica que monthly-income-expense-avg)
+      // 2) Gastos del año (por categoría y fecha)
       const { data: expenses, error: expenseError } = await supabase
         .from("transactions")
-        .select("amount, type, date")
+        .select("amount, date, category_id, categories(name)")
         .eq("user_id", user_id)
         .eq("type", "expense")
         .gte("date", start)
         .lte("date", end);
 
-      if (expenseError) {
+      if (expenseError)
         return res.status(500).json({ error: expenseError.message });
-      }
 
-      // 3) Inicializar todos los meses del año con 0
-      const totals = {};
-      for (let i = 1; i <= 12; i++) {
-        const key = `${year}-${String(i).padStart(2, "0")}`;
-        totals[key] = {
-          month: key,
-          budgeted: 0,
-          spent: 0,
-          diff: 0, // diferencia global del mes
-        };
-      }
+      // Helpers
+      const toMonthKey = (isoDate) =>
+        typeof isoDate === "string" ? isoDate.slice(0, 7) : null;
 
-      // 4) Sumar presupuesto mensual
-      (budgets || []).forEach((b) => {
-        const monthKey = b.month; // viene como YYYY-MM
-        if (totals[monthKey]) {
-          totals[monthKey].budgeted += parseFloat(b.limit_amount) || 0;
+      // ---------------------------
+      // VIEW: MONTHLY (12 meses)
+      // ---------------------------
+      if (view === "monthly") {
+        const totals = {};
+        for (let i = 1; i <= 12; i++) {
+          const key = `${year}-${String(i).padStart(2, "0")}`;
+          totals[key] = { month: key, budgeted: 0, spent: 0, diff: 0 };
         }
-      });
 
-      // 5) Sumar gasto mensual (igual que monthly-income-expense-avg)
-      (expenses || []).forEach((tx) => {
-        const [y, m] = tx.date.split("-");
-        const key = `${y}-${m}`;
-        if (!totals[key]) return;
+        (budgets || []).forEach((b) => {
+          // Si existieran budgets de income, los ignoramos (en tu app budgets parecen ser de gasto)
+          if (b.categories?.type && b.categories.type !== "expense") return;
 
-        const amount = parseFloat(tx.amount) || 0;
-        totals[key].spent += amount;
-      });
+          const monthKey = b.month; // YYYY-MM
+          if (!totals[monthKey]) return;
+          totals[monthKey].budgeted += parseFloat(b.limit_amount) || 0;
+        });
 
-      // 6) Calcular diferencia por mes (spent - budgeted)
-      const result = Object.values(totals)
-        .map((row) => {
-          const budgeted = row.budgeted || 0;
-          const spent = row.spent || 0;
-          const diff = spent - budgeted; // puede ser + o -
+        (expenses || []).forEach((tx) => {
+          const monthKey = toMonthKey(tx.date);
+          if (!monthKey || !totals[monthKey]) return;
+          totals[monthKey].spent += parseFloat(tx.amount) || 0;
+        });
+
+        const result = Object.values(totals)
+          .map((row) => {
+            const budgeted = row.budgeted || 0;
+            const spent = row.spent || 0;
+            const diff = spent - budgeted;
+            return {
+              month: row.month,
+              budgeted: Number(budgeted.toFixed(2)),
+              spent: Number(spent.toFixed(2)),
+              diff: Number(diff.toFixed(2)),
+            };
+          })
+          .sort((a, b) => a.month.localeCompare(b.month));
+
+        return res.json({ success: true, data: result, meta: { year, view } });
+      }
+
+      // ---------------------------
+      // VIEW: CATEGORIES (anual)
+      // ---------------------------
+      if (view === "categories") {
+        const budgetByCat = {};
+        (budgets || []).forEach((b) => {
+          if (!b?.category_id) return;
+          if (b.categories?.type && b.categories.type !== "expense") return;
+
+          const id = b.category_id;
+          if (!budgetByCat[id]) {
+            budgetByCat[id] = {
+              category_id: id,
+              category: b.categories?.name || "Sin categoría",
+              budgeted: 0,
+            };
+          }
+          budgetByCat[id].budgeted += parseFloat(b.limit_amount) || 0;
+        });
+
+        const spentByCat = {};
+        (expenses || []).forEach((tx) => {
+          if (!tx?.category_id) return;
+          const id = tx.category_id;
+
+          if (!spentByCat[id]) {
+            spentByCat[id] = {
+              category_id: id,
+              category: tx.categories?.name || "Sin categoría",
+              spent: 0,
+            };
+          }
+          spentByCat[id].spent += parseFloat(tx.amount) || 0;
+        });
+
+        const allIds = new Set([
+          ...Object.keys(budgetByCat),
+          ...Object.keys(spentByCat),
+        ]);
+
+        let rows = Array.from(allIds).map((id) => {
+          const b = budgetByCat[id];
+          const s = spentByCat[id];
+          const budgeted = b?.budgeted || 0;
+          const spent = s?.spent || 0;
 
           return {
-            ...row,
-            budgeted,
-            spent,
-            diff,
+            category_id: id,
+            category: b?.category || s?.category || "Sin categoría",
+            budgeted: Number(budgeted.toFixed(2)),
+            spent: Number(spent.toFixed(2)),
+            diff: Number((spent - budgeted).toFixed(2)),
           };
-        })
-        .sort((a, b) => a.month.localeCompare(b.month));
+        });
 
-      return res.json({ success: true, data: result });
+        // Orden por gasto para que sea útil
+        rows.sort((a, b) => b.spent - a.spent);
+
+        // (Recomendación práctica) limitar a Top 12 + "Otros" para que el chart no se vuelva ilegible
+        const LIMIT = 12; // o 15 si quieres, pero el punto es "Otros" clickeable
+
+        if (rows.length > LIMIT) {
+          const top = rows.slice(0, LIMIT);
+          const rest = rows.slice(LIMIT);
+
+          const other = rest.reduce(
+            (acc, r) => {
+              acc.budgeted += Number(r.budgeted) || 0;
+              acc.spent += Number(r.spent) || 0;
+              return acc;
+            },
+            { category_id: "others", category: "Otros", budgeted: 0, spent: 0 }
+          );
+
+          other.budgeted = Number(other.budgeted.toFixed(2));
+          other.spent = Number(other.spent.toFixed(2));
+          other.diff = Number((other.spent - other.budgeted).toFixed(2));
+
+          // ✅ IMPORTANTE: desglose ordenado (por gasto desc)
+          const othersBreakdown = rest
+            .map((r) => ({
+              category_id: r.category_id,
+              category: r.category,
+              budgeted: Number((Number(r.budgeted) || 0).toFixed(2)),
+              spent: Number((Number(r.spent) || 0).toFixed(2)),
+              diff: Number(
+                (Number(r.spent || 0) - Number(r.budgeted || 0)).toFixed(2)
+              ),
+            }))
+            .sort((a, b) => b.spent - a.spent);
+
+          rows = [...top, other];
+
+          return res.json({
+            success: true,
+            data: rows,
+            meta: {
+              year,
+              view,
+              limit: LIMIT,
+              others_breakdown: othersBreakdown,
+            },
+          });
+        }
+
+        // si no hay "otros"
+        return res.json({
+          success: true,
+          data: rows,
+          meta: { year, view, limit: LIMIT },
+        });
+      }
+
+      // view inválido
+      return res
+        .status(400)
+        .json({ error: "view inválido. Usa 'monthly' o 'categories'." });
     } catch (err) {
       console.error(
         "Error en /analytics/budget-vs-actual-summary-yearly:",
@@ -763,7 +903,6 @@ router.get("/top-variable-categories", authenticateUser, async (req, res) => {
 
 /* ========= METAS ========= */
 
-
 router.get("/goals-progress", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
@@ -835,8 +974,6 @@ router.get("/goals-progress", authenticateUser, async (req, res) => {
     return res.status(500).json({ error: "Error interno del servidor" });
   }
 });
-
-
 
 /* ========= PROYECCIONES POR CATEGORÍA (INGRESO / GASTO) ========= */
 
@@ -2054,181 +2191,426 @@ function weekdayFromISODate(dateStr) {
   );
 }
 
+// BACKEND
+// GET /api/analytics/expense-by-weekday?year=2026
+// Devuelve: total, count, avg_txn (ticket promedio) y avg_day (promedio por día calendario)
+
 router.get("/expense-by-weekday", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
+
+  const rawYear = parseInt(req.query.year, 10);
+  const currentYear = new Date().getFullYear();
+  const year =
+    Number.isFinite(rawYear) && rawYear >= 2000 && rawYear <= currentYear + 1
+      ? rawYear
+      : currentYear;
+
+  const { start, end } = getYearRange(year);
 
   const { data, error } = await supabase
     .from("transactions")
     .select("amount, date")
     .eq("user_id", user_id)
-    .eq("type", "expense");
+    .eq("type", "expense")
+    .gte("date", start)
+    .lte("date", end);
 
   if (error) return res.status(500).json({ error: error.message });
 
   const totals = [
-    { weekday: 0, label: "Dom", total: 0, count: 0 },
-    { weekday: 1, label: "Lun", total: 0, count: 0 },
-    { weekday: 2, label: "Mar", total: 0, count: 0 },
-    { weekday: 3, label: "Mié", total: 0, count: 0 },
-    { weekday: 4, label: "Jue", total: 0, count: 0 },
-    { weekday: 5, label: "Vie", total: 0, count: 0 },
-    { weekday: 6, label: "Sáb", total: 0, count: 0 },
+    { weekday: 0, label: "Dom", total: 0, count: 0, days_in_period: 0 },
+    { weekday: 1, label: "Lun", total: 0, count: 0, days_in_period: 0 },
+    { weekday: 2, label: "Mar", total: 0, count: 0, days_in_period: 0 },
+    { weekday: 3, label: "Mié", total: 0, count: 0, days_in_period: 0 },
+    { weekday: 4, label: "Jue", total: 0, count: 0, days_in_period: 0 },
+    { weekday: 5, label: "Vie", total: 0, count: 0, days_in_period: 0 },
+    { weekday: 6, label: "Sáb", total: 0, count: 0, days_in_period: 0 },
   ];
 
+  // Contar cuántas veces aparece cada día de semana en el rango del año
+  // (promedio por día calendario, no por transacción)
+  const toISO = (d) => {
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(d.getUTCDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  };
+
+  // start/end vienen como YYYY-MM-DD; iteramos seguro usando UTC
+  const startDate = new Date(`${start}T00:00:00Z`);
+  const endDate = new Date(`${end}T00:00:00Z`);
+
+  for (
+    let d = new Date(startDate);
+    d <= endDate;
+    d.setUTCDate(d.getUTCDate() + 1)
+  ) {
+    const iso = toISO(d);
+    const wd = weekdayFromISODate(iso); // 0..6, estable
+    if (wd == null) continue;
+    totals[wd].days_in_period += 1;
+  }
+
+  // Agregar transacciones
   (data || []).forEach((tx) => {
     const wd = weekdayFromISODate(tx.date); // ✅ estable, sin timezone
     if (wd == null) return;
 
-    const amt = parseFloat(tx.amount) || 0;
+    const amt = parseFloat(tx.amount);
+    if (!Number.isFinite(amt) || amt <= 0) return;
+
     totals[wd].total += amt;
     totals[wd].count += 1;
   });
 
-  const result = totals.map((t) => ({
-    ...t,
-    total: Number(t.total.toFixed(2)),
-    avg: t.count > 0 ? Number((t.total / t.count).toFixed(2)) : 0,
-  }));
+  const result = totals.map((t) => {
+    const avgTxn = t.count > 0 ? t.total / t.count : 0;
+    const avgDay = t.days_in_period > 0 ? t.total / t.days_in_period : 0;
 
-  res.json({ success: true, data: result });
+    return {
+      weekday: t.weekday,
+      label: t.label,
+      total: Number(t.total.toFixed(2)),
+      count: t.count,
+      avg_txn: Number(avgTxn.toFixed(2)),
+      avg_day: Number(avgDay.toFixed(2)),
+      days_in_period: t.days_in_period, // por si lo quieres mostrar
+    };
+  });
+
+  return res.json({ success: true, data: result });
 });
+
+// GET /api/analytics/budget-coverage?year=2026
+// Cobertura mensual REAL:
+// Un gasto está cubierto SOLO si existe un presupuesto
+// para la misma categoría en el mismo mes (YYYY-MM)
 
 router.get("/budget-coverage", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
-  const year = parseInt(req.query.year, 10) || new Date().getFullYear();
-  const { start, end } = getYearRange(year); // ya definido arriba
+
+  const rawYear = parseInt(req.query.year, 10);
+  const currentYear = new Date().getFullYear();
+  const year =
+    Number.isFinite(rawYear) && rawYear >= 2000 && rawYear <= currentYear + 1
+      ? rawYear
+      : currentYear;
+
+  const { start, end } = getYearRange(year); // { start: "YYYY-01-01", end: "YYYY-12-31" }
 
   try {
-    // 1) Presupuestos del año por categoría
+    /* ------------------------------------------------------------------
+     * 1) Presupuestos del año (clave: category_id + month)
+     * ------------------------------------------------------------------ */
     const { data: budgets, error: budgetErr } = await supabase
       .from("budgets")
-      .select("category_id, limit_amount, categories(name)")
+      .select("category_id, month, categories(type)")
       .eq("user_id", user_id)
       .gte("month", `${year}-01`)
       .lte("month", `${year}-12`);
 
     if (budgetErr) {
-      console.error(budgetErr);
+      console.error("budgetErr:", budgetErr);
       return res.status(500).json({ error: budgetErr.message });
     }
 
-    const budgetByCat = {};
+    // Set de presupuestos válidos (solo categorías expense)
+    const budgetKeySet = new Set();
     (budgets || []).forEach((b) => {
-      const catId = b.category_id;
-      if (!catId) return;
-
-      if (!budgetByCat[catId]) {
-        budgetByCat[catId] = {
-          category_id: catId,
-          category_name: b.categories?.name || `Categoría ${catId}`,
-          total_budget: 0,
-        };
-      }
-      budgetByCat[catId].total_budget += parseFloat(b.limit_amount) || 0;
+      if (!b?.category_id || !b?.month) return;
+      if (b.categories?.type !== "expense") return;
+      budgetKeySet.add(`${b.category_id}|${b.month}`);
     });
 
-    // 2) Gastos del año por categoría
+    /* ------------------------------------------------------------------
+     * 2) Gastos del año
+     * ------------------------------------------------------------------ */
     const { data: expenses, error: expenseErr } = await supabase
       .from("transactions")
-      .select("category_id, amount, categories(name)")
+      .select("category_id, amount, date, categories(name)")
       .eq("user_id", user_id)
       .eq("type", "expense")
       .gte("date", start)
       .lte("date", end);
 
     if (expenseErr) {
-      console.error(expenseErr);
+      console.error("expenseErr:", expenseErr);
       return res.status(500).json({ error: expenseErr.message });
     }
 
-    const expenseByCat = {};
+    /* ------------------------------------------------------------------
+     * 3) Agregaciones
+     * ------------------------------------------------------------------ */
+    const monthFromDate = (d) =>
+      typeof d === "string" && d.length >= 7 ? d.slice(0, 7) : null;
+
+    const monthlyAgg = {}; // month -> { covered, uncovered, total }
+    const unbudgetedByCategory = {}; // catId -> { category_id, category_name, uncovered_total }
+    const unbudgetedByMonth = {}; // month -> uncovered_total
+
+    let totalExpense = 0;
+    let totalCovered = 0;
+    let totalUncovered = 0;
+
     (expenses || []).forEach((tx) => {
-      const catId = tx.category_id;
-      if (!catId) return;
+      const month = monthFromDate(tx.date);
+      if (!month) return;
 
-      if (!expenseByCat[catId]) {
-        expenseByCat[catId] = {
+      const amount = parseFloat(tx.amount);
+      if (!Number.isFinite(amount) || amount <= 0) return;
+
+      const catId = tx.category_id || "__uncategorized__";
+      const catName = tx.category_id
+        ? tx.categories?.name || "Categoría"
+        : "Sin categoría";
+
+      const key = `${catId}|${month}`;
+      const isCovered = budgetKeySet.has(key);
+
+      if (!monthlyAgg[month]) {
+        monthlyAgg[month] = { covered: 0, uncovered: 0, total: 0 };
+      }
+
+      monthlyAgg[month].total += amount;
+      totalExpense += amount;
+
+      if (isCovered) {
+        monthlyAgg[month].covered += amount;
+        totalCovered += amount;
+      } else {
+        monthlyAgg[month].uncovered += amount;
+        totalUncovered += amount;
+
+        if (!unbudgetedByCategory[catId]) {
+          unbudgetedByCategory[catId] = {
+            category_id: catId,
+            category_name: catName,
+            uncovered_total: 0,
+          };
+        }
+        unbudgetedByCategory[catId].uncovered_total += amount;
+
+        unbudgetedByMonth[month] = (unbudgetedByMonth[month] || 0) + amount;
+      }
+    });
+
+    /* ------------------------------------------------------------------
+     * 4) Construir meses del año (siempre 12)
+     * ------------------------------------------------------------------ */
+    const months = Array.from({ length: 12 }, (_, i) => {
+      const mm = String(i + 1).padStart(2, "0");
+      return `${year}-${mm}`;
+    });
+
+    const monthly = months.map((m) => {
+      const row = monthlyAgg[m] || { covered: 0, uncovered: 0, total: 0 };
+      const coveragePct = row.total > 0 ? (row.covered / row.total) * 100 : 0;
+
+      return {
+        month: m,
+        covered: Number(row.covered.toFixed(2)),
+        uncovered: Number(row.uncovered.toFixed(2)),
+        total: Number(row.total.toFixed(2)),
+        coverage_pct: Number(coveragePct.toFixed(2)),
+      };
+    });
+
+    const topUnbudgetedCategories = Object.values(unbudgetedByCategory)
+      .sort((a, b) => b.uncovered_total - a.uncovered_total)
+      .slice(0, 10)
+      .map((x) => ({
+        category_id: x.category_id,
+        category_name: x.category_name,
+        uncovered_total: Number(x.uncovered_total.toFixed(2)),
+      }));
+
+    const topUnbudgetedMonths = Object.entries(unbudgetedByMonth)
+      .map(([month, uncovered_total]) => ({ month, uncovered_total }))
+      .sort((a, b) => b.uncovered_total - a.uncovered_total)
+      .slice(0, 6)
+      .map((x) => ({
+        month: x.month,
+        uncovered_total: Number(x.uncovered_total.toFixed(2)),
+      }));
+
+    const totalCoveragePct =
+      totalExpense > 0 ? (totalCovered / totalExpense) * 100 : 0;
+
+    /* ------------------------------------------------------------------
+     * 5) Response
+     * ------------------------------------------------------------------ */
+    return res.json({
+      success: true,
+      data: {
+        year,
+        range: { start, end },
+        totals: {
+          total_expense: Number(totalExpense.toFixed(2)),
+          covered: Number(totalCovered.toFixed(2)),
+          uncovered: Number(totalUncovered.toFixed(2)),
+          coverage_pct: Number(totalCoveragePct.toFixed(2)),
+        },
+        monthly,
+        top_unbudgeted_categories: topUnbudgetedCategories,
+        top_unbudgeted_months: topUnbudgetedMonths,
+      },
+    });
+  } catch (err) {
+    console.error("Error en /budget-coverage:", err);
+    return res.status(500).json({
+      error: "Error interno calculando cobertura mensual de presupuestos",
+    });
+  }
+});
+
+// BACKEND
+// GET /analytics/budget-coverage/details?year=2025&month=2025-06
+// Devuelve detalle del mes: gasto cubierto vs sin presupuesto + top categorías sin presupuesto + (opcional) transacciones sin presupuesto
+
+router.get("/budget-coverage/details", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  const rawYear = parseInt(req.query.year, 10);
+  const currentYear = new Date().getFullYear();
+  const year =
+    Number.isFinite(rawYear) && rawYear >= 2000 && rawYear <= currentYear + 1
+      ? rawYear
+      : currentYear;
+
+  const month = String(req.query.month || "").trim(); // "YYYY-MM"
+  const isValidMonth =
+    /^\d{4}-\d{2}$/.test(month) && month.startsWith(`${year}-`);
+  if (!isValidMonth) {
+    return res.status(400).json({
+      error:
+        "Parámetro 'month' inválido. Debe ser YYYY-MM y coincidir con el year.",
+    });
+  }
+
+  // Rango robusto: [month-01, nextMonth-01)
+  const dateFrom = `${month}-01`;
+
+  const [yy, mm] = month.split("-").map((x) => parseInt(x, 10));
+  const nextYear = mm === 12 ? yy + 1 : yy;
+  const nextMonth = mm === 12 ? 1 : mm + 1;
+  const dateTo = `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`;
+
+  try {
+    // 1) Budgets del mes (solo expense)
+    const { data: budgets, error: budgetErr } = await supabase
+      .from("budgets")
+      .select("category_id, month, categories(type)")
+      .eq("user_id", user_id)
+      .eq("month", month);
+
+    if (budgetErr) {
+      console.error("budgetErr:", budgetErr);
+      return res.status(500).json({ error: budgetErr.message });
+    }
+
+    const budgetCatSet = new Set();
+    (budgets || []).forEach((b) => {
+      if (!b?.category_id) return;
+      if (b.categories?.type !== "expense") return;
+      budgetCatSet.add(b.category_id);
+    });
+
+    // 2) Gastos del mes: date >= dateFrom AND date < dateTo
+    const { data: expenses, error: expenseErr } = await supabase
+      .from("transactions")
+      .select("id, category_id, amount, date, description, categories(name)")
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .gte("date", dateFrom)
+      .lt("date", dateTo) // 👈 clave
+      .order("date", { ascending: false });
+
+    if (expenseErr) {
+      console.error("expenseErr:", expenseErr);
+      return res.status(500).json({ error: expenseErr.message });
+    }
+
+    let total = 0;
+    let covered = 0;
+    let uncovered = 0;
+
+    const uncoveredByCategory = {};
+    const uncoveredTx = [];
+
+    (expenses || []).forEach((tx) => {
+      const amount = parseFloat(tx.amount);
+      if (!Number.isFinite(amount) || amount <= 0) return;
+
+      total += amount;
+
+      const catId = tx.category_id || "__uncategorized__";
+      const catName = tx.category_id
+        ? tx.categories?.name || "Categoría"
+        : "Sin categoría";
+
+      const isCovered = tx.category_id
+        ? budgetCatSet.has(tx.category_id)
+        : false;
+
+      if (isCovered) {
+        covered += amount;
+      } else {
+        uncovered += amount;
+
+        if (!uncoveredByCategory[catId]) {
+          uncoveredByCategory[catId] = {
+            category_id: catId,
+            category_name: catName,
+            uncovered_total: 0,
+          };
+        }
+        uncoveredByCategory[catId].uncovered_total += amount;
+
+        uncoveredTx.push({
+          id: tx.id,
+          date: tx.date,
+          description: tx.description || "",
+          amount: Number(amount.toFixed(2)),
           category_id: catId,
-          category_name: tx.categories?.name || `Categoría ${catId}`,
-          total_expense: 0,
-        };
-      }
-      expenseByCat[catId].total_expense += parseFloat(tx.amount) || 0;
-    });
-
-    const totalExpense = Object.values(expenseByCat).reduce(
-      (sum, row) => sum + row.total_expense,
-      0
-    );
-
-    // 3) Cálculos de cobertura
-    let expenseWithBudget = 0;
-
-    const categoriesWithBoth = [];
-    const categoriesWithExpenseOnly = [];
-    const categoriesWithBudgetOnly = [];
-
-    const allCatIds = new Set([
-      ...Object.keys(expenseByCat),
-      ...Object.keys(budgetByCat),
-    ]);
-
-    allCatIds.forEach((catId) => {
-      const exp = expenseByCat[catId];
-      const bud = budgetByCat[catId];
-
-      if (exp && bud) {
-        expenseWithBudget += exp.total_expense;
-
-        categoriesWithBoth.push({
-          category_id: Number(catId),
-          category_name: exp.category_name || bud.category_name,
-          total_expense: Number(exp.total_expense.toFixed(2)),
-          total_budget: Number(bud.total_budget.toFixed(2)),
-          diff: Number((exp.total_expense - bud.total_budget).toFixed(2)),
-        });
-      } else if (exp && !bud) {
-        categoriesWithExpenseOnly.push({
-          category_id: Number(catId),
-          category_name: exp.category_name,
-          total_expense: Number(exp.total_expense.toFixed(2)),
-        });
-      } else if (!exp && bud) {
-        categoriesWithBudgetOnly.push({
-          category_id: Number(catId),
-          category_name: bud.category_name,
-          total_budget: Number(bud.total_budget.toFixed(2)),
+          category_name: catName,
         });
       }
     });
 
-    categoriesWithBoth.sort((a, b) => b.total_expense - a.total_expense);
-    categoriesWithExpenseOnly.sort((a, b) => b.total_expense - a.total_expense);
-    categoriesWithBudgetOnly.sort((a, b) => b.total_budget - a.total_budget);
+    const coveragePct = total > 0 ? (covered / total) * 100 : 0;
 
-    const coveragePct =
-      totalExpense > 0 ? (expenseWithBudget / totalExpense) * 100 : 0;
+    const topUnbudgetedCategories = Object.values(uncoveredByCategory)
+      .sort((a, b) => b.uncovered_total - a.uncovered_total)
+      .slice(0, 20)
+      .map((x) => ({
+        category_id: x.category_id,
+        category_name: x.category_name,
+        uncovered_total: Number(x.uncovered_total.toFixed(2)),
+      }));
+
+    const txLimit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
 
     return res.json({
       success: true,
       data: {
         year,
-        total_expense: Number(totalExpense.toFixed(2)),
-        expense_with_budget: Number(expenseWithBudget.toFixed(2)),
-        expense_without_budget: Number(
-          (totalExpense - expenseWithBudget).toFixed(2)
-        ),
-        coverage_pct: Number(coveragePct.toFixed(2)),
-        categories_with_both: categoriesWithBoth,
-        categories_with_expense_only: categoriesWithExpenseOnly,
-        categories_with_budget_only: categoriesWithBudgetOnly,
+        month,
+        range: { dateFrom, dateTo }, // dateTo es exclusivo
+        totals: {
+          total: Number(total.toFixed(2)),
+          covered: Number(covered.toFixed(2)),
+          uncovered: Number(uncovered.toFixed(2)),
+          coverage_pct: Number(coveragePct.toFixed(2)),
+        },
+        top_unbudgeted_categories: topUnbudgetedCategories,
+        uncovered_transactions: uncoveredTx.slice(0, txLimit),
       },
     });
   } catch (err) {
-    console.error("Error en /analytics/budget-coverage:", err);
+    console.error("Error en /budget-coverage/details:", err);
     return res
       .status(500)
-      .json({ error: "Error interno calculando cobertura de presupuestos" });
+      .json({ error: "Error interno calculando detalle del mes" });
   }
 });
 
@@ -4099,78 +4481,383 @@ router.get(
  * GET /analytics/income-vs-expense-monthly?months=6
  * Devuelve ingresos vs gastos agregados por mes calendario
  */
-router.get(
-  "/income-vs-expense-monthly",
-  authenticateUser,
-  async (req, res) => {
-    const user_id = req.user.id;
+router.get("/income-vs-expense-monthly", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
 
-    const monthsParam = parseInt(req.query.months, 10);
-    const months =
-      Number.isNaN(monthsParam) || monthsParam <= 0 ? 6 : monthsParam;
+  const monthsParam = parseInt(req.query.months, 10);
+  const months =
+    Number.isNaN(monthsParam) || monthsParam <= 0 ? 6 : monthsParam;
 
-    try {
-      // 1) Mes inicial (YYYY-MM-01)
-      const now = new Date();
-      const start = new Date(
-        now.getFullYear(),
-        now.getMonth() - (months - 1),
-        1
-      );
-      const startDate = start.toISOString().split("T")[0];
+  try {
+    // 1) Mes inicial (YYYY-MM-01)
+    const now = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth() - (months - 1), 1);
+    const startDate = start.toISOString().split("T")[0];
 
-      // 2) Traer transacciones
-      const { data, error } = await supabase
-        .from("transactions")
-        .select("date, type, amount")
-        .eq("user_id", user_id)
-        .gte("date", startDate);
+    // 2) Traer transacciones
+    const { data, error } = await supabase
+      .from("transactions")
+      .select("date, type, amount")
+      .eq("user_id", user_id)
+      .gte("date", startDate);
 
-      if (error) {
-        console.error("Error income-vs-expense-monthly:", error);
-        return res.status(500).json({ error: error.message });
+    if (error) {
+      console.error("Error income-vs-expense-monthly:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    // 3) Inicializar meses vacíos
+    const map = {};
+    for (let i = 0; i < months; i++) {
+      const d = new Date(start.getFullYear(), start.getMonth() + i, 1);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
+        2,
+        "0"
+      )}`;
+      map[key] = {
+        month: key,
+        income: 0,
+        expense: 0,
+      };
+    }
+
+    // 4) Agregar montos
+    (data || []).forEach((tx) => {
+      if (!tx.date || !tx.amount) return;
+      const monthKey = tx.date.slice(0, 7); // YYYY-MM (sin Date, sin TZ)
+      if (!map[monthKey]) return;
+
+      const amt = Number(tx.amount) || 0;
+      if (tx.type === "income") map[monthKey].income += amt;
+      if (tx.type === "expense") map[monthKey].expense += amt;
+    });
+
+    // 5) Resultado final
+    const result = Object.values(map).map((m) => ({
+      month: m.month,
+      income: Number(m.income.toFixed(2)),
+      expense: Number(m.expense.toFixed(2)),
+    }));
+
+    return res.json({ success: true, data: result });
+  } catch (err) {
+    console.error("Error inesperado income-vs-expense-monthly:", err);
+    return res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
+
+// ✅ Cobertura real (robusta): cubierto hasta el límite, exceso y sin presupuesto
+router.get("/budget-coverage-robust", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  // Año opcional: ?year=2025
+  const rawYear = parseInt(req.query.year, 10);
+  const nowYear = new Date().getFullYear();
+  const year =
+    Number.isFinite(rawYear) && rawYear >= 2000 && rawYear <= nowYear + 1
+      ? rawYear
+      : nowYear;
+
+  const { start, end } = getYearRange(year);
+
+  try {
+    // 1) Presupuestos del año (por mes/categoría)
+    const { data: budgets, error: budgetErr } = await supabase
+      .from("budgets")
+      .select("month, category_id, limit_amount, categories(name, type)")
+      .eq("user_id", user_id)
+      .gte("month", `${year}-01`)
+      .lte("month", `${year}-12`);
+
+    if (budgetErr) {
+      console.error(budgetErr);
+      return res.status(500).json({ error: budgetErr.message });
+    }
+
+    // 2) Gastos del año (por fecha/categoría)
+    const { data: expenses, error: expenseErr } = await supabase
+      .from("transactions")
+      .select("amount, date, category_id, categories(name)")
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .gte("date", start)
+      .lte("date", end);
+
+    if (expenseErr) {
+      console.error(expenseErr);
+      return res.status(500).json({ error: expenseErr.message });
+    }
+
+    const monthKeyFromDate = (iso) =>
+      typeof iso === "string" && iso.length >= 7 ? iso.slice(0, 7) : null;
+
+    // catNameMap: id -> nombre
+    const catNameMap = {};
+
+    // budgetsByMonth[YYYY-MM][catId] = total presupuesto
+    const budgetsByMonth = {};
+    (budgets || []).forEach((b) => {
+      if (!b?.category_id) return;
+      // Solo presupuesto de categorías expense (si aplica)
+      if (b.categories?.type && b.categories.type !== "expense") return;
+
+      const m = b.month; // YYYY-MM
+      if (!m) return;
+
+      if (!budgetsByMonth[m]) budgetsByMonth[m] = {};
+      budgetsByMonth[m][b.category_id] =
+        (budgetsByMonth[m][b.category_id] || 0) + (parseFloat(b.limit_amount) || 0);
+
+      if (!catNameMap[b.category_id]) {
+        catNameMap[b.category_id] = b.categories?.name || "Sin categoría";
       }
+    });
 
-      // 3) Inicializar meses vacíos
-      const map = {};
-      for (let i = 0; i < months; i++) {
-        const d = new Date(start.getFullYear(), start.getMonth() + i, 1);
-        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
-          2,
-          "0"
-        )}`;
-        map[key] = {
-          month: key,
-          income: 0,
-          expense: 0,
-        };
+    // expensesByMonth[YYYY-MM][catId] = total gasto
+    const expensesByMonth = {};
+    (expenses || []).forEach((tx) => {
+      if (!tx?.category_id) return;
+      const m = monthKeyFromDate(tx.date);
+      if (!m) return;
+
+      if (!expensesByMonth[m]) expensesByMonth[m] = {};
+      expensesByMonth[m][tx.category_id] =
+        (expensesByMonth[m][tx.category_id] || 0) + (parseFloat(tx.amount) || 0);
+
+      if (!catNameMap[tx.category_id]) {
+        catNameMap[tx.category_id] = tx.categories?.name || "Sin categoría";
       }
+    });
 
-      // 4) Agregar montos
-      (data || []).forEach((tx) => {
-        if (!tx.date || !tx.amount) return;
-        const monthKey = tx.date.slice(0, 7); // YYYY-MM (sin Date, sin TZ)
-        if (!map[monthKey]) return;
+    // Acumuladores anuales
+    let totalExpenseYear = 0;
+    let totalCoveredYear = 0;
+    let totalOverBudgetYear = 0;
+    let totalWithoutBudgetYear = 0;
 
-        const amt = Number(tx.amount) || 0;
-        if (tx.type === "income") map[monthKey].income += amt;
-        if (tx.type === "expense") map[monthKey].expense += amt;
+    // Ranking anual
+    const overByCategory = {}; // catId -> exceso anual
+    const withoutByCategory = {}; // catId -> sin presupuesto anual
+
+    // ✅ detalle por mes para modal
+    const month_details = {};
+
+    // ✅ meses del año garantizados
+    const months = [];
+
+    for (let i = 1; i <= 12; i++) {
+      const m = `${year}-${String(i).padStart(2, "0")}`;
+
+      const expCats = expensesByMonth[m] || {};
+      const budCats = budgetsByMonth[m] || {};
+
+      let monthTotalExpense = 0;
+      let monthCovered = 0;
+      let monthOver = 0;
+      let monthWithout = 0;
+
+      const allCatIds = new Set([
+        ...Object.keys(expCats),
+        ...Object.keys(budCats),
+      ]);
+
+      // ✅ detalle para modal
+      const monthDetail = {
+        month: m,
+        totals: {
+          expense_total: 0,
+          covered: 0,
+          over_budget: 0,
+          without_budget: 0,
+          uncovered_total: 0,
+          coverage_pct: 0,
+        },
+        without_budget_categories: [],
+        over_budget_categories: [],
+        categories_summary: [], // por categoría (para top 15)
+      };
+
+      allCatIds.forEach((catId) => {
+        const exp = Number(expCats[catId] || 0);
+        const bud = Number(budCats[catId] || 0);
+
+        if (exp <= 0 && bud <= 0) return;
+
+        const name = catNameMap[catId] || "Sin categoría";
+
+        // total gasto del mes solo suma el gasto
+        monthTotalExpense += exp;
+
+        if (bud > 0) {
+          const covered = Math.min(exp, bud);
+          const over = Math.max(exp - bud, 0);
+
+          monthCovered += covered;
+          monthOver += over;
+
+          if (over > 0) {
+            overByCategory[catId] = (overByCategory[catId] || 0) + over;
+
+            monthDetail.over_budget_categories.push({
+              category_id: catId,
+              category_name: name,
+              budgeted: Number(bud.toFixed(2)),
+              spent: Number(exp.toFixed(2)),
+              over_budget: Number(over.toFixed(2)),
+            });
+          }
+
+          monthDetail.categories_summary.push({
+            category_id: catId,
+            category_name: name,
+            budgeted: Number(bud.toFixed(2)),
+            spent: Number(exp.toFixed(2)),
+            diff: Number((exp - bud).toFixed(2)),
+            covered: Number(covered.toFixed(2)),
+            over_budget: Number(over.toFixed(2)),
+            without_budget: 0,
+          });
+        } else {
+          // sin presupuesto en ese mes
+          if (exp > 0) {
+            monthWithout += exp;
+
+            withoutByCategory[catId] = (withoutByCategory[catId] || 0) + exp;
+
+            monthDetail.without_budget_categories.push({
+              category_id: catId,
+              category_name: name,
+              spent: Number(exp.toFixed(2)),
+            });
+
+            monthDetail.categories_summary.push({
+              category_id: catId,
+              category_name: name,
+              budgeted: 0,
+              spent: Number(exp.toFixed(2)),
+              diff: Number(exp.toFixed(2)),
+              covered: 0,
+              over_budget: 0,
+              without_budget: Number(exp.toFixed(2)),
+            });
+          }
+        }
       });
 
-      // 5) Resultado final
-      const result = Object.values(map).map((m) => ({
-        month: m.month,
-        income: Number(m.income.toFixed(2)),
-        expense: Number(m.expense.toFixed(2)),
-      }));
+      // Totales anuales
+      totalExpenseYear += monthTotalExpense;
+      totalCoveredYear += monthCovered;
+      totalOverBudgetYear += monthOver;
+      totalWithoutBudgetYear += monthWithout;
 
-      return res.json({ success: true, data: result });
-    } catch (err) {
-      console.error("Error inesperado income-vs-expense-monthly:", err);
-      return res.status(500).json({ error: "Error interno del servidor" });
+      const uncoveredTotalMonth = monthOver + monthWithout;
+      const coveragePctMonth =
+        monthTotalExpense > 0 ? (monthCovered / monthTotalExpense) * 100 : 0;
+
+      // ✅ fila mensual para el chart
+      months.push({
+        month: m,
+        expense_total: Number(monthTotalExpense.toFixed(2)),
+        covered: Number(monthCovered.toFixed(2)),
+        over_budget: Number(monthOver.toFixed(2)),
+        without_budget: Number(monthWithout.toFixed(2)),
+        uncovered_total: Number(uncoveredTotalMonth.toFixed(2)),
+        coverage_pct: Number(coveragePctMonth.toFixed(2)),
+      });
+
+      // ✅ ordenar detalle para modal
+      monthDetail.without_budget_categories.sort((a, b) => b.spent - a.spent);
+      monthDetail.over_budget_categories.sort(
+        (a, b) => b.over_budget - a.over_budget
+      );
+      monthDetail.categories_summary.sort((a, b) => b.spent - a.spent);
+
+      // ✅ totales del mes (desde el detalle)
+      const expSum = monthDetail.categories_summary.reduce(
+        (s, r) => s + (Number(r.spent) || 0),
+        0
+      );
+      const coveredSum = monthDetail.categories_summary.reduce(
+        (s, r) => s + (Number(r.covered) || 0),
+        0
+      );
+      const overSum = monthDetail.categories_summary.reduce(
+        (s, r) => s + (Number(r.over_budget) || 0),
+        0
+      );
+      const withoutSum = monthDetail.categories_summary.reduce(
+        (s, r) => s + (Number(r.without_budget) || 0),
+        0
+      );
+
+      monthDetail.totals.expense_total = Number(expSum.toFixed(2));
+      monthDetail.totals.covered = Number(coveredSum.toFixed(2));
+      monthDetail.totals.over_budget = Number(overSum.toFixed(2));
+      monthDetail.totals.without_budget = Number(withoutSum.toFixed(2));
+      monthDetail.totals.uncovered_total = Number((overSum + withoutSum).toFixed(2));
+      monthDetail.totals.coverage_pct =
+        expSum > 0 ? Number(((coveredSum / expSum) * 100).toFixed(2)) : 0;
+
+      month_details[m] = monthDetail;
     }
+
+    // ✅ Top categorías anual
+    const topOver = Object.entries(overByCategory)
+      .map(([category_id, amount]) => ({
+        category_id,
+        category_name: catNameMap[category_id] || "Sin categoría",
+        total_over_budget: Number(Number(amount).toFixed(2)),
+      }))
+      .sort((a, b) => b.total_over_budget - a.total_over_budget)
+      .slice(0, 5);
+
+    const topWithout = Object.entries(withoutByCategory)
+      .map(([category_id, amount]) => ({
+        category_id,
+        category_name: catNameMap[category_id] || "Sin categoría",
+        total_without_budget: Number(Number(amount).toFixed(2)),
+      }))
+      .sort((a, b) => b.total_without_budget - a.total_without_budget)
+      .slice(0, 5);
+
+    // ✅ meses con más no-cubierto (exceso + sin presupuesto)
+    const topUncoveredMonths = [...months]
+      .sort((a, b) => b.uncovered_total - a.uncovered_total)
+      .slice(0, 5)
+      .map((m) => ({ month: m.month, uncovered_total: m.uncovered_total }));
+
+    const coveragePctYear =
+      totalExpenseYear > 0 ? (totalCoveredYear / totalExpenseYear) * 100 : 0;
+
+    return res.json({
+      success: true,
+      data: {
+        year,
+        totals: {
+          expense_total: Number(totalExpenseYear.toFixed(2)),
+          covered: Number(totalCoveredYear.toFixed(2)),
+          over_budget: Number(totalOverBudgetYear.toFixed(2)),
+          without_budget: Number(totalWithoutBudgetYear.toFixed(2)),
+          uncovered_total: Number(
+            (totalOverBudgetYear + totalWithoutBudgetYear).toFixed(2)
+          ),
+          coverage_pct: Number(coveragePctYear.toFixed(2)),
+        },
+        months, // para el chart
+        month_details, // ✅ para el modal por mes
+        top_categories_over_budget: topOver,
+        top_categories_without_budget: topWithout,
+        top_uncovered_months: topUncoveredMonths,
+      },
+    });
+  } catch (err) {
+    console.error("Error en /analytics/budget-coverage-robust:", err);
+    return res
+      .status(500)
+      .json({ error: "Error interno calculando cobertura robusta" });
   }
-);
+});
+
 
 
 module.exports = router;
