@@ -1,3 +1,4 @@
+// backend/routes/dashboard.js
 const express = require("express");
 const router = express.Router();
 const supabase = require("../lib/supabase");
@@ -8,13 +9,18 @@ const authenticateUser = require("../middlewares/auth");
    ============================================================ */
 router.get("/summary", authenticateUser, async (req, res) => {
   const user_id = req.user?.id;
-  const now = new Date();
+
+  // ✅ Normalizar "now" a RD (GMT-4) para evitar desfaces de mes/día
+  const userTZOffset = -4;
+  const nowUtc = new Date();
+  const now = new Date(nowUtc.getTime() + userTZOffset * 60 * 60 * 1000);
+
   const year = now.getFullYear();
   const month = String(now.getMonth() + 1).padStart(2, "0");
 
   const start = `${year}-${month}-01`;
   const lastDay = new Date(year, now.getMonth() + 1, 0).getDate();
-  const end = `${year}-${month}-${lastDay}`;
+  const end = `${year}-${month}-${String(lastDay).padStart(2, "0")}`;
 
   try {
     /* ------------------------------------------------------------
@@ -35,17 +41,22 @@ router.get("/summary", authenticateUser, async (req, res) => {
 
     tx.forEach((t) => {
       const amt = parseFloat(t.amount) || 0;
+
       if (t.type === "income") totalIncome += amt;
+
       if (t.type === "expense") {
         totalExpense += amt;
-        expensesByCategory[t.category_id] =
-          (expensesByCategory[t.category_id] || 0) + amt;
+
+        // ✅ Evitar category_id null
+        const catId = t.category_id || "__uncategorized__";
+        expensesByCategory[catId] = (expensesByCategory[catId] || 0) + amt;
       }
     });
 
     const balance = totalIncome - totalExpense;
     const savingRate =
       totalIncome > 0 ? (1 - totalExpense / totalIncome) * 100 : 0;
+
     const daysPassed = now.getDate();
     const averageDailyExpense = daysPassed > 0 ? totalExpense / daysPassed : 0;
 
@@ -57,11 +68,13 @@ router.get("/summary", authenticateUser, async (req, res) => {
       return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
     });
 
-    const { data: pastTx } = await supabase
+    const { data: pastTx, error: pastErr } = await supabase
       .from("transactions")
       .select("amount, type, date, categories(stability_type)")
       .eq("user_id", user_id)
       .eq("type", "expense");
+
+    if (pastErr) throw pastErr;
 
     const monthlyTotals = {};
 
@@ -70,8 +83,7 @@ router.get("/summary", authenticateUser, async (req, res) => {
       if (!["fixed", "variable"].includes(stab)) return;
       const key = t.date.slice(0, 7);
       if (pastMonths.includes(key)) {
-        monthlyTotals[key] =
-          (monthlyTotals[key] || 0) + parseFloat(t.amount || 0);
+        monthlyTotals[key] = (monthlyTotals[key] || 0) + (parseFloat(t.amount) || 0);
       }
     });
 
@@ -82,23 +94,28 @@ router.get("/summary", authenticateUser, async (req, res) => {
     /* ------------------------------------------------------------
        3) MES ANTERIOR (COMPARACIÓN)
        ------------------------------------------------------------ */
+    // ✅ Esto maneja el cambio de año automáticamente (Enero -> Diciembre del año anterior)
     const prevDate = new Date(year, now.getMonth() - 1, 1);
     const prevMonth = `${prevDate.getFullYear()}-${String(
       prevDate.getMonth() + 1
     ).padStart(2, "0")}`;
+
     const prevStart = `${prevMonth}-01`;
-    const prevEnd = `${prevMonth}-${new Date(
+    const prevLastDay = new Date(
       prevDate.getFullYear(),
       prevDate.getMonth() + 1,
       0
-    ).getDate()}`;
+    ).getDate();
+    const prevEnd = `${prevMonth}-${String(prevLastDay).padStart(2, "0")}`;
 
-    const { data: prevTx } = await supabase
+    const { data: prevTx, error: prevErr } = await supabase
       .from("transactions")
       .select("amount, type")
       .eq("user_id", user_id)
       .gte("date", prevStart)
       .lte("date", prevEnd);
+
+    if (prevErr) throw prevErr;
 
     let prevIncome = 0;
     let prevExpense = 0;
@@ -109,6 +126,7 @@ router.get("/summary", authenticateUser, async (req, res) => {
       if (t.type === "expense") prevExpense += amt;
     });
 
+    // (Estos % se mantienen por compatibilidad, pero tu dashboard ya usa abs arriba)
     const incomeDiffPercent =
       prevIncome > 0 ? ((totalIncome - prevIncome) / prevIncome) * 100 : 0;
 
@@ -128,10 +146,12 @@ router.get("/summary", authenticateUser, async (req, res) => {
     /* ------------------------------------------------------------
        4) METAS DE AHORRO
        ------------------------------------------------------------ */
-    const { data: goalsData } = await supabase
+    const { data: goalsData, error: goalsErr } = await supabase
       .from("goals")
       .select("current_amount, target_amount")
       .eq("user_id", user_id);
+
+    if (goalsErr) throw goalsErr;
 
     const goalsSafe = goalsData || [];
     const completedGoals = goalsSafe.filter(
@@ -143,18 +163,19 @@ router.get("/summary", authenticateUser, async (req, res) => {
     /* ------------------------------------------------------------
        5) TRANSACCIONES CON ESTABILIDAD (AÑO EN CURSO)
        ------------------------------------------------------------ */
-    const { data: txWithStability } = await supabase
-      .from("transactions")
-      .select(
-        "amount, type, date, category_id, categories(stability_type, name)"
-      )
-      .eq("user_id", user_id)
-      .gte("date", `${year}-01-01`)
-      .lte("date", end);
+       const { data: txWithStability, error: stabErr } = await supabase
+       .from("transactions")
+       .select("amount, type, date, category_id, categories(stability_type, name)")
+       .eq("user_id", user_id)
+       .gte("date", prevStart)   // ✅ incluye mes anterior aunque sea del año pasado
+       .lte("date", end);
+     
+     if (stabErr) throw stabErr;
+     
 
     // Para variaciones por categoría (solo fijos/variables)
-    let fixedVarCurrentByCat = {};
-    let fixedVarPrevByCat = {};
+    const fixedVarCurrentByCat = {};
+    const fixedVarPrevByCat = {};
 
     // Para ingreso fijo promedio
     const fixedIncomeByMonth = {};
@@ -165,21 +186,21 @@ router.get("/summary", authenticateUser, async (req, res) => {
       const monthKey = t.date.slice(0, 7);
 
       if (t.type === "income" && stab === "fixed") {
-        fixedIncomeByMonth[monthKey] =
-          (fixedIncomeByMonth[monthKey] || 0) + amt;
+        fixedIncomeByMonth[monthKey] = (fixedIncomeByMonth[monthKey] || 0) + amt;
       }
 
       if (t.type !== "expense") return;
       if (!["fixed", "variable"].includes(stab)) return;
 
+      // ✅ Evitar category_id null también aquí
+      const catId = t.category_id || "__uncategorized__";
+
       if (t.date >= start && t.date <= end) {
-        fixedVarCurrentByCat[t.category_id] =
-          (fixedVarCurrentByCat[t.category_id] || 0) + amt;
+        fixedVarCurrentByCat[catId] = (fixedVarCurrentByCat[catId] || 0) + amt;
       }
 
       if (t.date >= prevStart && t.date <= prevEnd) {
-        fixedVarPrevByCat[t.category_id] =
-          (fixedVarPrevByCat[t.category_id] || 0) + amt;
+        fixedVarPrevByCat[catId] = (fixedVarPrevByCat[catId] || 0) + amt;
       }
     });
 
@@ -193,6 +214,7 @@ router.get("/summary", authenticateUser, async (req, res) => {
     // Variación por categoría (solo fijos + variables)
     const diffByCategory = {};
     const variationByCategory = {};
+
     const allCatsFixedVar = new Set([
       ...Object.keys(fixedVarCurrentByCat),
       ...Object.keys(fixedVarPrevByCat),
@@ -204,34 +226,34 @@ router.get("/summary", authenticateUser, async (req, res) => {
       const diff = cur - prev;
 
       diffByCategory[cat] = diff;
+
+      // % solo para compatibilidad con otros usos (tu tarjeta usa abs)
       variationByCategory[cat] = prev > 0 ? (diff / prev) * 100 : 0;
     });
 
-    // =========================
-    // NUEVA LÓGICA CORREGIDA
-    // =========================
+    // ✅ NUEVO: devolver current/previous/diff en la categoría ganadora
     let mostIncreasedCategoryAbs = null;
     let mostDecreasedCategoryAbs = null;
 
-    for (const [cat, diff] of Object.entries(diffByCategory)) {
-      // Mayor aumento -> solo diffs POSITIVOS
+    for (const cat of allCatsFixedVar) {
+      const current = fixedVarCurrentByCat[cat] || 0;
+      const previous = fixedVarPrevByCat[cat] || 0;
+      const diff = diffByCategory[cat] || 0;
+
       if (diff > 0) {
         if (!mostIncreasedCategoryAbs || diff > mostIncreasedCategoryAbs.diff) {
-          mostIncreasedCategoryAbs = { category_id: cat, diff };
+          mostIncreasedCategoryAbs = { category_id: cat, current, previous, diff };
         }
       }
 
-      // Mayor disminución -> solo diffs NEGATIVOS
       if (diff < 0) {
         if (!mostDecreasedCategoryAbs || diff < mostDecreasedCategoryAbs.diff) {
-          mostDecreasedCategoryAbs = { category_id: cat, diff };
+          mostDecreasedCategoryAbs = { category_id: cat, current, previous, diff };
         }
       }
     }
 
-    const sortedVar = Object.entries(variationByCategory).sort(
-      (a, b) => b[1] - a[1]
-    );
+    const sortedVar = Object.entries(variationByCategory).sort((a, b) => b[1] - a[1]);
 
     const mostIncreasedCategory = sortedVar[0]
       ? { category_id: sortedVar[0][0], percent: sortedVar[0][1] }
@@ -247,9 +269,7 @@ router.get("/summary", authenticateUser, async (req, res) => {
     /* ------------------------------------------------------------
        6) TOP CATEGORÍA DEL MES ACTUAL
        ------------------------------------------------------------ */
-    const topCatEntry = Object.entries(expensesByCategory).sort(
-      (a, b) => b[1] - a[1]
-    )[0];
+    const topCatEntry = Object.entries(expensesByCategory).sort((a, b) => b[1] - a[1])[0];
 
     const topCategoryThisMonth = topCatEntry
       ? { category_id: topCatEntry[0], amount: topCatEntry[1] }
@@ -261,23 +281,28 @@ router.get("/summary", authenticateUser, async (req, res) => {
     const categoryIdsNeeded = Array.from(
       new Set([
         ...Object.keys(expensesByCategory),
-        ...allCatsFixedVar,
+        ...Array.from(allCatsFixedVar),
         topCategoryThisMonth?.category_id,
       ])
     ).filter(Boolean);
 
-    let categoryNameMap = {};
+    const categoryNameMap = {};
 
     if (categoryIdsNeeded.length > 0) {
-      const { data: catNames } = await supabase
+      const { data: catNames, error: catErr } = await supabase
         .from("categories")
         .select("id, name")
         .in("id", categoryIdsNeeded);
+
+      if (catErr) throw catErr;
 
       catNames?.forEach((c) => {
         categoryNameMap[c.id] = c.name;
       });
     }
+
+    // ✅ Nombre consistente para "sin categoría"
+    categoryNameMap["__uncategorized__"] = "Sin categoría";
 
     const topCategoryName = topCategoryThisMonth
       ? categoryNameMap[topCategoryThisMonth.category_id] || "Sin nombre"
@@ -288,30 +313,29 @@ router.get("/summary", authenticateUser, async (req, res) => {
        ------------------------------------------------------------ */
     const totalTransactions = tx.length;
 
-    const { data: budgetsThisMonth } = await supabase
+    const { data: budgetsThisMonth, error: budErr } = await supabase
       .from("budgets")
       .select("limit_amount")
       .eq("user_id", user_id)
       .eq("month", `${year}-${month}`);
 
-    const totalMonthlyBudget =
-      budgetsThisMonth?.reduce(
-        (sum, b) => sum + parseFloat(b.limit_amount || 0),
-        0
-      ) || 0;
+    if (budErr) throw budErr;
 
-    const { data: budgetedCategories } = await supabase
+    const totalMonthlyBudget =
+      budgetsThisMonth?.reduce((sum, b) => sum + parseFloat(b.limit_amount || 0), 0) || 0;
+
+    const { data: budgetedCategories, error: budCatErr } = await supabase
       .from("budgets")
       .select("category_id")
       .eq("user_id", user_id)
       .eq("month", `${year}-${month}`);
 
+    if (budCatErr) throw budCatErr;
+
     const budgetedCatIds = (budgetedCategories || []).map((b) => b.category_id);
 
     const budgetedExpenseTotal = tx
-      .filter(
-        (t) => t.type === "expense" && budgetedCatIds.includes(t.category_id)
-      )
+      .filter((t) => t.type === "expense" && budgetedCatIds.includes(t.category_id))
       .reduce((s, t) => s + parseFloat(t.amount || 0), 0);
 
     const budgetBalance = totalMonthlyBudget - budgetedExpenseTotal;
@@ -347,6 +371,9 @@ router.get("/summary", authenticateUser, async (req, res) => {
     /* ------------------------------------------------------------
        9) RESPUESTA FINAL
        ------------------------------------------------------------ */
+    const currentMonthKey = `${year}-${month}`;
+    const previousMonthKey = prevMonth;
+
     res.json({
       success: true,
       data: {
@@ -370,12 +397,19 @@ router.get("/summary", authenticateUser, async (req, res) => {
         // metas
         goalsSummary: { totalGoals, completedGoals },
 
-        // variaciones por categoría (solo fijos/variables)
+        // ✅ variaciones por categoría (solo fijos/variables) - enriquecidas
         mostIncreasedCategoryAbs,
         mostDecreasedCategoryAbs,
         mostIncreasedCategory,
         mostDecreasedCategory,
         categoryNameMap,
+
+        // ✅ meta para que el frontend muestre contra qué meses compara
+        categoryVariationMeta: {
+          currentMonthKey,
+          previousMonthKey,
+          scope: "fixed+variable",
+        },
 
         // para métricas de presupuesto
         totalMonthlyBudget,
@@ -448,12 +482,16 @@ router.get("/transactions-by-category", authenticateUser, async (req, res) => {
 
   if (!category_id) return res.status(400).json({ error: "Falta category_id" });
 
-  const now = new Date();
+  // ✅ Usar mismo "now" en RD para coherencia mensual
+  const userTZOffset = -4;
+  const nowUtc = new Date();
+  const now = new Date(nowUtc.getTime() + userTZOffset * 60 * 60 * 1000);
+
   const year = now.getFullYear();
   const month = String(now.getMonth() + 1).padStart(2, "0");
   const start = `${year}-${month}-01`;
   const lastDay = new Date(year, now.getMonth() + 1, 0).getDate();
-  const end = `${year}-${month}-${lastDay}`;
+  const end = `${year}-${month}-${String(lastDay).padStart(2, "0")}`;
 
   try {
     const { data, error } = await supabase
