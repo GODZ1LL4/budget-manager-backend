@@ -3530,12 +3530,35 @@ router.get("/recurring-item-patterns", authenticateUser, async (req, res) => {
   }
 });
 
-// ===== Endpoint =====
+/**
+ * ===== Endpoint =====
+ * GET /analytics/expense-forecast
+ *
+ * ✅ Ahora soporta:
+ * - types=expense               (default)
+ * - types=expense,income        (flujo)
+ * - include_balance=true        (solo recomendado con flujo)
+ *
+ * Respuesta:
+ *  meta: incluye types + include_balance
+ *  summary: total_income, total_expense, net_projected y balance (si aplica)
+ *  data: cada fila incluye tx_type: "expense"|"income"
+ */
+function parseISODateOnly(iso) {
+  const [y, m, d] = String(iso || "")
+    .split("-")
+    .map(Number);
+  if (!y || !m || !d) return null;
+  return new Date(Date.UTC(y, m - 1, d)); // ✅ date-only en UTC
+}
+
 router.get("/expense-forecast", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
   try {
-    // Params
+    // =========================
+    // Params base
+    // =========================
     const months = Math.max(
       1,
       Math.min(36, parseInt(req.query.months ?? "12", 10) || 12)
@@ -3552,7 +3575,7 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
     const includeOccasional =
       String(req.query.include_occasional ?? "false") === "true";
 
-    // incluir “ruido” (gastos no-recurrentes) por categoría
+    // incluir “ruido” (no-recurrentes) por categoría
     const includeNoise = String(req.query.include_noise ?? "true") === "true";
 
     const minIntervalDays = Math.max(
@@ -3570,7 +3593,24 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       ? Number(req.query.max_coef_variation)
       : 0.6;
 
-    // Fechas
+    // =========================
+    // ✅ NUEVO: types + balance
+    // =========================
+    const types = String(req.query.types || "expense")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const allowed = new Set(["expense", "income"]);
+    const safeTypes = types.filter((t) => allowed.has(t));
+    if (safeTypes.length === 0) safeTypes.push("expense");
+
+    const includeBalance =
+      String(req.query.include_balance ?? "false") === "true";
+
+    // =========================
+    // Fechas (date_from/date_to)
+    // =========================
     const rawFrom = (req.query.date_from || "").trim();
     const rawTo = (req.query.date_to || "").trim();
 
@@ -3583,8 +3623,8 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       dateToObj = lastDayOfMonth(new Date());
     } else if (rawFrom && !rawTo) {
       // Si solo viene from: DESDE ese día hasta fin de ese mes
-      const base = new Date(rawFrom);
-      if (Number.isNaN(base.getTime())) {
+      const base = parseISODateOnly(rawFrom);
+      if (!base || Number.isNaN(base.getTime())) {
         return res
           .status(400)
           .json({ error: "date_from inválida (YYYY-MM-DD)" });
@@ -3593,16 +3633,16 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       dateToObj = lastDayOfMonth(base);
     } else if (!rawFrom && rawTo) {
       // Si solo viene to: mes completo de ese "to"
-      const base = new Date(rawTo);
-      if (Number.isNaN(base.getTime())) {
+      const base = parseISODateOnly(rawTo);
+      if (!base || Number.isNaN(base.getTime())) {
         return res.status(400).json({ error: "date_to inválida (YYYY-MM-DD)" });
       }
       dateFromObj = firstDayOfMonth(base);
       dateToObj = base; // respeta el día exacto
     } else {
       // ambos vienen
-      const f = new Date(rawFrom);
-      const t = new Date(rawTo);
+      const f = parseISODateOnly(rawFrom);
+      const t = parseISODateOnly(rawTo);
       if (Number.isNaN(f.getTime()) || Number.isNaN(t.getTime())) {
         return res
           .status(400)
@@ -3620,15 +3660,22 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
     const date_from = toISODate(dateFromObj);
     const date_to = toISODate(dateToObj);
 
+    // =========================
     // Historial: últimos N meses hacia atrás desde date_from
-    const historyToObj = new Date(dateFromObj);
+    // ✅ NOTA: history_to = date_from (tal como lo tenías)
+    // =========================
+    const historyToObj = new Date(dateFromObj); // ya viene UTC
+
     const historyFromObj = new Date(dateFromObj);
-    historyFromObj.setMonth(historyFromObj.getMonth() - months);
+    historyFromObj.setUTCDate(1); // ✅ siempre día 1 sin drift
+    historyFromObj.setUTCMonth(historyFromObj.getUTCMonth() - months);
 
     const history_from = toISODate(historyFromObj);
     const history_to = toISODate(historyToObj);
 
-    // Traer transacciones históricas (expenses)
+    // =========================
+    // Traer transacciones históricas (expenses/income)
+    // =========================
     const { data, error } = await supabase
       .from("transactions")
       .select(
@@ -3636,6 +3683,7 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
         id,
         amount,
         date,
+        type,
         category_id,
         description,
         categories:categories!transactions_category_id_fkey (
@@ -3645,7 +3693,7 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       `
       )
       .eq("user_id", user_id)
-      .eq("type", "expense")
+      .in("type", safeTypes)
       .gte("date", history_from)
       .lte("date", history_to);
 
@@ -3654,17 +3702,21 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
+    // =========================
+    // Normalización base
+    // =========================
     const rawTxs = (data || [])
       .map((tx) => ({
         id: tx.id,
         date: tx.date,
         amount: Number(tx.amount) || 0,
+        tx_type: tx.type, // ✅ income|expense
         category_id: tx.category_id,
         category_name: tx.categories?.name || "Sin categoría",
         category_stability: tx.categories?.stability_type || "variable",
         description: tx.description || "",
       }))
-      .filter((tx) => tx.amount > 0 && !!tx.date);
+      .filter((tx) => tx.amount > 0 && !!tx.date && !!tx.tx_type);
 
     // filtrar ocasionales si el usuario no los incluye
     const txs = rawTxs.filter((tx) =>
@@ -3677,21 +3729,22 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       norm: normalizeText(tx.description),
     }));
 
-    // Agrupar por categoría y “clusters” por similitud
+    // =========================
+    // Agrupar por (tx_type + category) y clusters por similitud
+    // =========================
     const byCategory = {};
     for (const tx of txsNorm) {
-      const catKey = String(tx.category_id || "sin_cat");
+      const catKey = `${tx.tx_type}::${String(tx.category_id || "sin_cat")}`;
       if (!byCategory[catKey]) byCategory[catKey] = [];
       byCategory[catKey].push(tx);
     }
 
     const SIM_THRESHOLD = 0.45; // ajustable
-    const clusters = []; // { category_id, category_name, rep_norm, rep_grams, entries: [.] }
+    const clusters = []; // { tx_type, category_id, category_name, rep_norm, rep_grams, entries: [.] }
 
     for (const catKey of Object.keys(byCategory)) {
       const list = byCategory[catKey];
 
-      // construir clusters greedy
       const catClusters = [];
       for (const tx of list) {
         const grams = trigrams(tx.norm || "");
@@ -3708,7 +3761,6 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
 
         if (bestIdx >= 0 && bestScore >= SIM_THRESHOLD) {
           catClusters[bestIdx].entries.push(tx);
-          // opcional: actualizar representante si aparece uno más “limpio”
           if (
             (tx.norm || "").length >
             (catClusters[bestIdx].rep_norm || "").length
@@ -3718,6 +3770,7 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
           }
         } else {
           catClusters.push({
+            tx_type: tx.tx_type, // ✅
             category_id: tx.category_id,
             category_name: tx.category_name,
             rep_norm: tx.norm,
@@ -3730,7 +3783,9 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       clusters.push(...catClusters);
     }
 
-    // Calcular patrones por cluster
+    // =========================
+    // Calcular patrones recurrentes por cluster
+    // =========================
     const recurringPatterns = [];
     const recurringTxIds = new Set();
 
@@ -3738,7 +3793,6 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       const entries = c.entries;
       if (!entries || entries.length < minOccurrences) continue;
 
-      // ordenar por fecha
       entries.sort((a, b) => a.date.localeCompare(b.date));
 
       const intervals = [];
@@ -3784,11 +3838,12 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       for (const e of entries) recurringTxIds.add(e.id);
 
       recurringPatterns.push({
+        tx_type: c.tx_type, // ✅ income|expense
         type: "recurring",
         category: c.category_name,
-        pattern: `${c.category_name} · ${
-          c.rep_norm || "sin descripcion"
-        }`.trim(),
+        pattern: `${c.tx_type === "income" ? "Ingreso" : "Gasto"} · ${
+          c.category_name
+        } · ${c.rep_norm || "sin descripcion"}`.trim(),
         projection: Number(projected.toFixed(2)),
         expected_count: expectedCount,
         median_interval_days: Number(medInterval.toFixed(1)),
@@ -3801,24 +3856,24 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       });
     }
 
-    // ===== “Gastos ruidosos” (no recurrentes) por categoría =====
-    // CAMBIO (C):
-    // - Proj A = rate por día (total/historyDays * targetDays)
-    // - Proj B = expectedCount * medAmount (ocurrencias * ticket típico)
-    // - projection = MIN(Proj B, Proj A)  => NO inventa compras si el rate no lo soporta
+    // =========================
+    // “Ruido” (no recurrentes) por (tx_type + categoría)
+    // PROJECTION = MIN(projB, projA)
+    // =========================
     let noisePatterns = [];
     if (includeNoise) {
       const historyDays = Math.max(1, diffInDays(history_from, history_to) + 1);
       const targetDays = Math.max(1, diffInDays(date_from, date_to) + 1);
 
-      const noiseByCat = {}; // key: category_id
+      const noiseByCat = {}; // key: tx_type::category_id
 
       for (const tx of txsNorm) {
-        if (recurringTxIds.has(tx.id)) continue; // explicado por patrón
+        if (recurringTxIds.has(tx.id)) continue;
 
-        const catKey = String(tx.category_id || "sin_cat");
+        const catKey = `${tx.tx_type}::${String(tx.category_id || "sin_cat")}`;
         if (!noiseByCat[catKey]) {
           noiseByCat[catKey] = {
+            tx_type: tx.tx_type, // ✅
             category_id: tx.category_id,
             category_name: tx.category_name,
             amounts: [],
@@ -3834,7 +3889,6 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
 
       noisePatterns = Object.values(noiseByCat)
         .map((c) => {
-          // Reglas anti-ruido: debe haber suficientes transacciones sueltas
           if (c.count < 3) return null;
 
           const medAmount = median(c.amounts);
@@ -3843,25 +3897,27 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
           const meanPerDay = c.total / historyDays;
           const projectedA = meanPerDay * targetDays;
 
-          // expected_count por densidad histórica (sin forzar 1 si es muy bajita)
+          // expected_count por densidad histórica
           const expectedCountRaw = (c.count / historyDays) * targetDays;
           const expectedCount =
             expectedCountRaw >= 0.75 ? Math.round(expectedCountRaw) : 0;
 
-          // B: ocurrencias * ticket típico (si no hay ocurrencias, es 0)
+          // B: ocurrencias * ticket típico
           const projectedB =
             expectedCount > 0 ? expectedCount * (Number(medAmount) || 0) : 0;
 
-          // PROJECTION (modo C): no exceder el rate histórico
+          // PROJECTION: no exceder el rate histórico
           const projection = Math.min(projectedB, projectedA);
 
-          // si termina en 0, no lo mostramos
           if (!Number.isFinite(projection) || projection <= 0) return null;
 
           return {
+            tx_type: c.tx_type, // ✅
             type: "event",
             category: c.category_name,
-            pattern: `${c.category_name} · gastos eventuales`,
+            pattern: `${c.tx_type === "income" ? "Ingreso" : "Gasto"} · ${
+              c.category_name
+            } · movimientos eventuales`,
             projection: Number(projection.toFixed(2)),
             expected_count: expectedCount,
             median_interval_days: null,
@@ -3876,18 +3932,63 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
         .filter(Boolean);
     }
 
-    // Mezclar: patrones recurrentes + ruido
+    // =========================
+    // Mezclar + ordenar + limitar
+    // =========================
     const combined = [...recurringPatterns, ...noisePatterns];
-
-    // Ordenar y limitar
     combined.sort((a, b) => (b.projection || 0) - (a.projection || 0));
     const top = combined.slice(0, limit);
 
+    // =========================
+    // Summary ampliado
+    // =========================
     const total_projected = top.reduce((s, r) => s + (r.projection || 0), 0);
+
+    const total_expense = top
+      .filter((r) => r.tx_type === "expense")
+      .reduce((s, r) => s + (r.projection || 0), 0);
+
+    const total_income = top
+      .filter((r) => r.tx_type === "income")
+      .reduce((s, r) => s + (r.projection || 0), 0);
+
+    const net_projected = total_income - total_expense;
+
     const transactions_expected = top.reduce(
       (s, r) => s + (r.expected_count || 0),
       0
     );
+
+    // =========================
+    // ✅ Balance (available) desde account_balances_extended
+    // =========================
+    let balance = null;
+    if (includeBalance) {
+      const { data: acc, error: balErr } = await supabase
+        .from("account_balances_extended")
+        .select("current_balance, reserved_total, available_balance")
+        .eq("user_id", user_id);
+
+      if (balErr) {
+        console.error("balance extended error:", balErr);
+      } else {
+        const totals = (acc || []).reduce(
+          (a, r) => {
+            a.current += Number(r.current_balance || 0);
+            a.reserved += Number(r.reserved_total || 0);
+            a.available += Number(r.available_balance || 0);
+            return a;
+          },
+          { current: 0, reserved: 0, available: 0 }
+        );
+
+        balance = {
+          total_current: Number(totals.current.toFixed(2)),
+          total_reserved: Number(totals.reserved.toFixed(2)),
+          total_available: Number(totals.available.toFixed(2)),
+        };
+      }
+    }
 
     return res.json({
       success: true,
@@ -3900,10 +4001,16 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
         min_occurrences: minOccurrences,
         include_occasional: includeOccasional,
         include_noise: includeNoise,
+        types: safeTypes,
+        include_balance: includeBalance,
       },
       summary: {
         total_projected: Number(total_projected.toFixed(2)),
+        total_income: Number(total_income.toFixed(2)),
+        total_expense: Number(total_expense.toFixed(2)),
+        net_projected: Number(net_projected.toFixed(2)),
         transactions_expected,
+        ...(balance ? { balance } : {}),
       },
       data: top,
     });
@@ -3941,10 +4048,11 @@ function toISODate(d) {
 }
 
 function addDays(dateStr, days) {
-  const d = new Date(dateStr);
-  d.setDate(d.getDate() + days);
-  return toISODate(d);
+  const base = parseISODateOnly(dateStr);
+  base.setUTCDate(base.getUTCDate() + days);
+  return toISODate(base);
 }
+
 
 function diffInDays(a, b) {
   const da = new Date(a);
@@ -4606,7 +4714,8 @@ router.get("/budget-coverage-robust", authenticateUser, async (req, res) => {
 
       if (!budgetsByMonth[m]) budgetsByMonth[m] = {};
       budgetsByMonth[m][b.category_id] =
-        (budgetsByMonth[m][b.category_id] || 0) + (parseFloat(b.limit_amount) || 0);
+        (budgetsByMonth[m][b.category_id] || 0) +
+        (parseFloat(b.limit_amount) || 0);
 
       if (!catNameMap[b.category_id]) {
         catNameMap[b.category_id] = b.categories?.name || "Sin categoría";
@@ -4622,7 +4731,8 @@ router.get("/budget-coverage-robust", authenticateUser, async (req, res) => {
 
       if (!expensesByMonth[m]) expensesByMonth[m] = {};
       expensesByMonth[m][tx.category_id] =
-        (expensesByMonth[m][tx.category_id] || 0) + (parseFloat(tx.amount) || 0);
+        (expensesByMonth[m][tx.category_id] || 0) +
+        (parseFloat(tx.amount) || 0);
 
       if (!catNameMap[tx.category_id]) {
         catNameMap[tx.category_id] = tx.categories?.name || "Sin categoría";
@@ -4794,7 +4904,9 @@ router.get("/budget-coverage-robust", authenticateUser, async (req, res) => {
       monthDetail.totals.covered = Number(coveredSum.toFixed(2));
       monthDetail.totals.over_budget = Number(overSum.toFixed(2));
       monthDetail.totals.without_budget = Number(withoutSum.toFixed(2));
-      monthDetail.totals.uncovered_total = Number((overSum + withoutSum).toFixed(2));
+      monthDetail.totals.uncovered_total = Number(
+        (overSum + withoutSum).toFixed(2)
+      );
       monthDetail.totals.coverage_pct =
         expSum > 0 ? Number(((coveredSum / expSum) * 100).toFixed(2)) : 0;
 
@@ -4857,7 +4969,5 @@ router.get("/budget-coverage-robust", authenticateUser, async (req, res) => {
       .json({ error: "Error interno calculando cobertura robusta" });
   }
 });
-
-
 
 module.exports = router;

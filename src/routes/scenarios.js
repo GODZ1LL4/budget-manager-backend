@@ -37,6 +37,20 @@ function addByRecurrence(d, recurrence) {
   }
 }
 
+function computeHistoryRange({ focusedMonthStart, months }) {
+  const focused = dayjs(focusedMonthStart, "YYYY-MM-DD", true).startOf("month");
+
+  const end = focused.subtract(1, "month").endOf("month");
+  const start = end.subtract(months - 1, "month").startOf("month");
+
+  return {
+    historyFrom: start.format("YYYY-MM-DD"),
+    historyTo: end.format("YYYY-MM-DD"),
+  };
+}
+
+
+
 /**
  * Expande una regla a fechas concretas dentro de [from..to] (ambos inclusive).
  * Respeta type, exclude_weekends, recurrence.
@@ -145,6 +159,46 @@ function rollupByMonthAndCategory(instances) {
   );
 }
 
+function advanceToRangeStart(ruleStart, rangeStart, recurrence) {
+  let s = dayjs(ruleStart);
+  const r = dayjs(rangeStart);
+
+  if (!recurrence) return s;
+
+  // si ya está dentro/igual, no mover
+  if (!s.isBefore(r)) return s;
+
+  if (recurrence === "daily") {
+    return r; // diario: ok anclar al rango
+  }
+
+  if (recurrence === "weekly" || recurrence === "biweekly") {
+    const interval = recurrence === "weekly" ? 7 : 14;
+    const diffDays = r.diff(s, "day");
+    const jumps = Math.ceil(diffDays / interval);
+    return s.add(jumps * interval, "day");
+  }
+
+  if (recurrence === "monthly") {
+    let m = r.diff(s, "month"); // entero
+    if (m < 0) m = 0;
+    let cand = s.add(m, "month");
+    if (cand.isBefore(r)) cand = cand.add(1, "month");
+    return cand;
+  }
+
+  // fallback seguro
+  // avanza iterando por si meten otro tipo
+  let c = s;
+  let guard = 0;
+  while (c.isBefore(r) && guard < 5000) {
+    c = addByRecurrence(c, recurrence);
+    guard++;
+  }
+  return c;
+}
+
+
 /**
  * 📌 Crear un nuevo escenario con reglas
  */
@@ -236,6 +290,14 @@ router.get("/:id/rules", authenticateUser, async (req, res) => {
   res.json({ success: true, data: rules });
 });
 
+// ⚠️ IMPORTANTE
+// Las reglas SIN recurrence y SIN rango (eventos puntuales)
+// NUNCA deben clamp-earse al rangeStart.
+// Solo se incluyen si start_date ∈ [rangeStart..rangeEnd].
+// Clamplear provoca que eventos de meses anteriores aparezcan
+// el día 1 del mes siguiente (bug histórico).
+
+
 router.get("/:id/projection", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
   const scenario_id = req.params.id;
@@ -245,7 +307,9 @@ router.get("/:id/projection", authenticateUser, async (req, res) => {
   const qStart = req.query.start ? dayjs(req.query.start) : null;
   const qEndRaw = req.query.end ? dayjs(req.query.end) : null;
   const rangeStart = qStart || dayjs().startOf("month");
-  const rangeEnd = qEndRaw ? qEndRaw.subtract(1, "day") : dayjs().endOf("month");
+  const rangeEnd = qEndRaw
+    ? qEndRaw.subtract(1, "day")
+    : dayjs().endOf("month");
 
   // validar escenario
   const { data: scenario, error: scenarioError } = await supabase
@@ -274,21 +338,40 @@ router.get("/:id/projection", authenticateUser, async (req, res) => {
   const isWeekend = (d) => d.day() === 0 || d.day() === 6;
 
   for (const rule of rules) {
-    let start = dayjs(rule.start_date);
-    const endRule = rule.end_date ? dayjs(rule.end_date) : rangeEnd;
-
-    // recortar al rango visible
-    if (start.isBefore(rangeStart)) start = rangeStart;
-    const hardEnd = endRule.isAfter(rangeEnd) ? rangeEnd : endRule;
-    if (start.isAfter(hardEnd)) continue;
-
+    const ruleStart = dayjs(rule.start_date);
+  
+    const hasRange =
+      rule.end_date &&
+      dayjs(rule.start_date).isBefore(dayjs(rule.end_date)); // rango real (multi-día)
+  
+    // ✅ end “real” según el tipo de regla
+    let ruleEnd = null;
+  
+    if (rule.recurrence) {
+      // recurrente: si no hay end_date, se asume hasta el final del rango pedido
+      ruleEnd = rule.end_date ? dayjs(rule.end_date) : rangeEnd;
+    } else if (hasRange) {
+      // sin recurrence pero con rango
+      ruleEnd = dayjs(rule.end_date);
+    } else {
+      // ✅ puntual: el “end” es el mismo start
+      ruleEnd = ruleStart;
+    }
+  
+    const hardEnd = ruleEnd.isAfter(rangeEnd) ? rangeEnd : ruleEnd;
+  
+    // si la regla termina antes del rango visible, saltar
+    if (hardEnd.isBefore(rangeStart)) continue;
+  
     const pushInstance = (d) => {
       projected.push({
-        id: rule.id,
+        id: `${rule.id}-${d.format("YYYYMMDD")}`,
+        real_id: rule.id,
         instance_id: `${rule.id}-${d.format("YYYYMMDD")}`,
+        rule_id: rule.id,
         name: rule.name,
         amount: rule.amount,
-        type: rule.type, // ✅ ingresos y gastos para calendario
+        type: rule.type,
         date: d.format("YYYY-MM-DD"),
         description: rule.description,
         category_id: rule.category_id,
@@ -299,40 +382,51 @@ router.get("/:id/projection", authenticateUser, async (req, res) => {
         account_name: rule.accounts?.name || null,
       });
     };
-
-    // Sin recurrence:
-    // - si hay rango (start..end) → tratar como diario
-    // - si es puntual → 1 sola instancia si cae en el rango
+  
+    // =========================
+    // ✅ 1) NO RECURRENCE
+    // =========================
     if (!rule.recurrence) {
-      if (rule.start_date && rule.end_date && dayjs(rule.start_date).isBefore(dayjs(rule.end_date))) {
-        let c = start;
+      if (hasRange) {
+        // rango multi-día -> diario recortado al rango visible
+        let c = ruleStart.isBefore(rangeStart) ? rangeStart : ruleStart;
         while (c.isSameOrBefore(hardEnd)) {
           if (!rule.exclude_weekends || !isWeekend(c)) pushInstance(c);
           c = c.add(1, "day");
         }
       } else {
-        if (!rule.exclude_weekends || !isWeekend(start)) pushInstance(start);
+        // ✅ puntual -> SOLO si cae dentro del rango visible
+        if (ruleStart.isBefore(rangeStart) || ruleStart.isAfter(rangeEnd)) {
+          continue; // <- CLAVE: no clamplear a rangeStart
+        }
+        if (!rule.exclude_weekends || !isWeekend(ruleStart)) {
+          pushInstance(ruleStart);
+        }
       }
       continue;
     }
-
-    // Con recurrence
+  
+    // =========================
+    // ✅ 2) RECURRENCE (mantener fase)
+    // =========================
+    let start = advanceToRangeStart(ruleStart, rangeStart, rule.recurrence);
+    if (start.isAfter(hardEnd)) continue;
+  
     let c = start;
     while (c.isSameOrBefore(hardEnd)) {
-      if (!rule.exclude_weekends || !isWeekend(c)) pushInstance(c);
-      switch (rule.recurrence) {
-        case "daily": c = c.add(1, "day"); break;
-        case "weekly": c = c.add(1, "week"); break;
-        case "biweekly": c = c.add(2, "week"); break;
-        case "monthly": c = c.add(1, "month"); break;
-        default: c = c.add(1, "day");
+      const weekend = isWeekend(c);
+  
+      if (!rule.exclude_weekends || !weekend) {
+        pushInstance(c);
       }
+  
+      c = addByRecurrence(c, rule.recurrence);
     }
   }
+  
 
   res.json({ success: true, data: projected });
 });
-
 
 router.post("/scenario_transactions", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -449,7 +543,8 @@ router.put("/scenario_transactions/:id", authenticateUser, async (req, res) => {
   res.json({ success: true });
 });
 
-router.delete("/scenario_transactions/:id",
+router.delete(
+  "/scenario_transactions/:id",
   authenticateUser,
   async (req, res) => {
     const user_id = req.user.id;
@@ -873,271 +968,343 @@ router.post("/:id/import-to-budgets", authenticateUser, async (req, res) => {
 // =========================
 
 router.get("/:id/advanced-forecast/preview", authenticateUser, async (req, res) => {
-  const user_id = req.user.id;
-  const scenario_id = req.params.id;
+    const user_id = req.user.id;
+    const scenario_id = req.params.id;
 
-  try {
-    // 1) Validar escenario
-    const { data: scenario, error: scenErr } = await supabase
-      .from("scenarios")
-      .select("id,user_id")
-      .eq("id", scenario_id)
-      .eq("user_id", user_id)
-      .single();
+    try {
+      // 1) Validar escenario
+      const { data: scenario, error: scenErr } = await supabase
+        .from("scenarios")
+        .select("id,user_id")
+        .eq("id", scenario_id)
+        .eq("user_id", user_id)
+        .single();
 
-    if (scenErr || !scenario) {
-      return res.status(404).json({ error: "Escenario no encontrado" });
-    }
+      if (scenErr || !scenario) {
+        return res.status(404).json({ error: "Escenario no encontrado" });
+      }
 
-    // 2) Rango calendario (end exclusivo)
-    const start = req.query.start;
-    const endExcl = req.query.end;
-    if (!start || !endExcl) {
-      return res.status(400).json({ error: "start y end son requeridos" });
-    }
-    const rangeStart = start;
-    const rangeEnd = toISODate(addDaysObj(endExcl, -1)); // inclusive
+      // 2) Rango: por mes enfocado (NO por grid)
+      // acepta:
+      // - focused="YYYY-MM-DD"  (recomendado)
+      // - month="YYYY-MM"       (alternativa)
+      // - fallback: start/end (grid)
+      const focused = req.query.focused || null;
+      const month = req.query.month || null;
 
-    // 3) Params (sin fechas)
-    const months = clampInt(req.query.months, 12, 1, 36);
-    const minOccurrences = clampInt(req.query.min_occurrences, 3, 2, 50);
+      let rangeStartObj = null;
+      let rangeEndObj = null;
 
-    const includeOccasional =
-      String(req.query.include_occasional ?? "false") === "true";
-    const includeNoise = String(req.query.include_noise ?? "true") === "true";
+      if (month && /^\d{4}-\d{2}$/.test(month)) {
+        rangeStartObj = dayjs(`${month}-01`).startOf("month");
+        rangeEndObj = dayjs(`${month}-01`).endOf("month");
+      } else if (focused) {
+        rangeStartObj = dayjs(focused).startOf("month");
+        rangeEndObj = dayjs(focused).endOf("month");
+      } else {
+        // fallback al grid si no mandan focused/month
+        const start = req.query.start;
+        const endExcl = req.query.end;
+        if (!start || !endExcl) {
+          return res
+            .status(400)
+            .json({ error: "focused o month o start/end son requeridos" });
+        }
+        rangeStartObj = dayjs(start);
+        rangeEndObj = dayjs(endExcl).subtract(1, "day"); // end exclusivo -> inclusivo
+      }
 
-    const minIntervalDays = clampInt(req.query.min_interval_days, 3, 1, 365);
-    const maxIntervalDays = clampInt(req.query.max_interval_days, 70, minIntervalDays, 3650);
+      const rangeStart = rangeStartObj.format("YYYY-MM-DD");
+      const rangeEnd = rangeEndObj.format("YYYY-MM-DD");
 
-    const maxCoefVariation = Number.isFinite(Number(req.query.max_coef_variation))
-      ? Number(req.query.max_coef_variation)
-      : 0.6;
+      // 3) Params (sin fechas)
+      const months = clampInt(req.query.months, 12, 1, 36);
+      const minOccurrences = clampInt(req.query.min_occurrences, 3, 2, 50);
 
-    const account_id = req.query.account_id || null;
+      const includeOccasional =
+        String(req.query.include_occasional ?? "false") === "true";
+      const includeNoise = String(req.query.include_noise ?? "true") === "true";
 
-    // 4) Histórico: termina el día antes del rango (sin leakage dentro del rango)
-    const historyTo = toISODate(addDaysObj(rangeStart, -1));
-    const historyFromObj = new Date(rangeStart);
-    historyFromObj.setMonth(historyFromObj.getMonth() - months);
-    const historyFrom = toISODate(historyFromObj);
+      const minIntervalDays = clampInt(req.query.min_interval_days, 3, 1, 365);
+      const maxIntervalDays = clampInt(
+        req.query.max_interval_days,
+        70,
+        minIntervalDays,
+        3650
+      );
 
-    // 5) Leer histórico (expenses)
-    const { data: txData, error: txErr } = await supabase
-      .from("transactions")
-      .select(`
+      const maxCoefVariation = Number.isFinite(
+        Number(req.query.max_coef_variation)
+      )
+        ? Number(req.query.max_coef_variation)
+        : 0.6;
+
+      const account_id = req.query.account_id || null;
+
+      // 4) Histórico: termina el día antes del rango (sin leakage dentro del rango)
+      const { historyFrom, historyTo } = computeHistoryRange({
+        focusedMonthStart: rangeStart,
+        months,
+      });
+      
+
+      // 5) Leer histórico (expenses)
+      const { data: txData, error: txErr } = await supabase
+        .from("transactions")
+        .select(
+          `
         id, amount, date, category_id, description,
         categories:categories!transactions_category_id_fkey ( name, stability_type )
-      `)
-      .eq("user_id", user_id)
-      .eq("type", "expense")
-      .gte("date", historyFrom)
-      .lte("date", historyTo);
+      `
+        )
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", historyFrom)
+        .lte("date", historyTo);
 
-    if (txErr) return res.status(500).json({ error: txErr.message });
+      if (txErr) return res.status(500).json({ error: txErr.message });
 
-    const rows = (txData || [])
-      .map((tx) => ({
-        id: tx.id,
-        date: tx.date,
-        amount: Number(tx.amount) || 0,
-        category_id: tx.category_id,
-        category_name: tx.categories?.name || "Sin categoría",
-        category_stability: tx.categories?.stability_type || "variable",
-        description: tx.description || "",
-        norm: normalizeText(tx.description || ""),
-      }))
-      .filter((r) => r.amount > 0 && !!r.category_id);
+      const rows = (txData || [])
+        .map((tx) => ({
+          id: tx.id,
+          date: tx.date,
+          amount: Number(tx.amount) || 0,
+          category_id: tx.category_id,
+          category_name: tx.categories?.name || "Sin categoría",
+          category_stability: tx.categories?.stability_type || "variable",
+          description: tx.description || "",
+          norm: normalizeText(tx.description || ""),
+        }))
+        .filter((r) => r.amount > 0 && !!r.category_id);
 
-    const filtered = rows.filter((r) =>
-      includeOccasional ? true : r.category_stability !== "occasional"
-    );
+      const filtered = rows.filter((r) =>
+        includeOccasional ? true : r.category_stability !== "occasional"
+      );
 
-    // 6) Construir patrones recurrentes por (category + similitud descripción)
-    const { recurringPatterns, noiseByCategory } = buildAdvancedPatterns({
-      rows: filtered,
-      minOccurrences,
-      minIntervalDays,
-      maxIntervalDays,
-      maxCoefVariation,
-      includeNoise,
-      history_from: historyFrom,
-      history_to: historyTo,
-      range_from: rangeStart,
-      range_to: rangeEnd,
-    });
+      // 6) Construir patrones recurrentes por (category + similitud descripción)
+      const { recurringPatterns, noiseByCategory } = buildAdvancedPatterns({
+        rows: filtered,
+        minOccurrences,
+        minIntervalDays,
+        maxIntervalDays,
+        maxCoefVariation,
+        includeNoise,
+        history_from: historyFrom,
+        history_to: historyTo,
+        range_from: rangeStart,
+        range_to: rangeEnd,
+      });
 
-    // 7) Expandir a instancias dentro del rango (por categoría/patrón)
-    const projected = [];
+      // 7) Expandir a instancias dentro del rango (por categoría/patrón)
+      const projected = [];
 
-    // 7.1 Recurrentes: continuar secuencia (NO reinicia por calendario)
-    for (const p of recurringPatterns) {
-      const interval = Math.max(1, Math.round(p.median_interval_days || 0));
-      const amount = Number(p.median_amount) || 0;
-      if (!interval || amount <= 0 || !p.last_date) continue;
+      // 7.1 Recurrentes: continuar secuencia (NO reinicia por calendario)
+      for (const p of recurringPatterns) {
+        const interval = Math.max(1, Math.round(p.median_interval_days || 0));
+        const amount = Number(p.median_amount) || 0;
+        if (!interval || amount <= 0 || !p.last_date) continue;
 
-      const gap = diffInDays(p.last_date, rangeStart);
-      const n = gap > 0 ? Math.ceil(gap / interval) : 1;
-      let next = addDays(p.last_date, n * interval);
+        const gap = diffInDays(p.last_date, rangeStart);
+        const n = gap > 0 ? Math.ceil(gap / interval) : 1;
+        let next = addDays(p.last_date, n * interval);
 
-      while (new Date(next) <= new Date(rangeEnd)) {
-        projected.push({
-          instance_key: `adv::${scenario_id}::${p.pattern_key}::${next}`,
-          name: p.display_name,
-          amount: Number(amount.toFixed(2)),
-          type: "expense",
-          date: next,
-          category_id: p.category_id,
-          category_name: p.category_name,
-          account_id,
-          isProjected: true,
-          source: "advanced_forecast",
-        });
-
-        next = addDays(next, interval);
-      }
-    }
-
-    // 7.2 Eventuales (noise) por categoría:
-    // Para escenarios/presupuesto es mejor NO “untar por día”,
-    // sino crear N eventos discretos. Aquí lo hacemos simple:
-    // expected_count ≈ (rangeDays/historyDays) * count, con monto mediano.
-    if (includeNoise) {
-      for (const n of noiseByCategory) {
-        const count = n.expected_count || 0;
-        const amt = Number(n.median_amount) || 0;
-        if (count <= 0 || amt <= 0) continue;
-
-        const dates = spreadDates(rangeStart, rangeEnd, count);
-        dates.forEach((d, idx) => {
+        while (new Date(next) <= new Date(rangeEnd)) {
           projected.push({
-            instance_key: `adv::${scenario_id}::noise::${n.category_id}::${d}::${idx}`,
-            name: `${n.category_name} (eventual)`,
-            amount: Number(amt.toFixed(2)),
+            instance_key: `adv::${scenario_id}::${p.pattern_key}::${next}`,
+            name: p.display_name,
+            amount: Number(amount.toFixed(2)),
             type: "expense",
-            date: d,
-            category_id: n.category_id,
-            category_name: n.category_name,
+            date: next,
+            category_id: p.category_id,
+            category_name: p.category_name,
             account_id,
             isProjected: true,
             source: "advanced_forecast",
           });
+
+          next = addDays(next, interval);
+        }
+      }
+
+      // 7.2 Eventuales (noise) por categoría:
+      // Para escenarios/presupuesto es mejor NO “untar por día”,
+      // sino crear N eventos discretos. Aquí lo hacemos simple:
+      // expected_count ≈ (rangeDays/historyDays) * count, con monto mediano.
+      if (includeNoise) {
+        for (const n of noiseByCategory) {
+          const count = n.expected_count || 0;
+          const amt = Number(n.median_amount) || 0;
+          if (count <= 0 || amt <= 0) continue;
+
+          const dates = spreadDates(rangeStart, rangeEnd, count);
+          dates.forEach((d, idx) => {
+            projected.push({
+              instance_key: `adv::${scenario_id}::noise::${n.category_id}::${d}::${idx}`,
+              name: `${n.category_name} (eventual)`,
+              amount: Number(amt.toFixed(2)),
+              type: "expense",
+              date: d,
+              category_id: n.category_id,
+              category_name: n.category_name,
+              account_id,
+              isProjected: true,
+              source: "advanced_forecast",
+            });
+          });
+        }
+      }
+
+      return res.json({
+        success: true,
+        data: projected,
+        meta: {
+          range_from: rangeStart,
+          range_to: rangeEnd,
+          history_from: historyFrom,
+          history_to: historyTo,
+          recurring_patterns_count: recurringPatterns.length,
+          noise_categories_count: noiseByCategory.length,
+        },
+      });
+    } catch (err) {
+      console.error("Error preview advanced-forecast:", err);
+      return res.status(500).json({ error: "Error interno generando preview" });
+    }
+  }
+);
+
+router.post(
+  "/:id/advanced-forecast/register",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+    const scenario_id = req.params.id;
+
+    try {
+      // 1) Validar escenario
+      const { data: scenario, error: scenErr } = await supabase
+        .from("scenarios")
+        .select("id,user_id")
+        .eq("id", scenario_id)
+        .eq("user_id", user_id)
+        .single();
+
+      if (scenErr || !scenario) {
+        return res.status(404).json({ error: "Escenario no encontrado" });
+      }
+
+      const {
+        focused = null,
+        month = null,
+        start = null,
+        end = null,
+        params = {},
+        account_id = null,
+        mode = "replace",
+      } = req.body || {};
+
+      // Prioridad: month/focused -> mes real.
+      // Fallback: start/end (compatibilidad)
+      let rangeStartObj = null;
+      let rangeEndObj = null;
+
+      if (month && /^\d{4}-\d{2}$/.test(month)) {
+        rangeStartObj = dayjs(`${month}-01`).startOf("month");
+        rangeEndObj = dayjs(`${month}-01`).endOf("month");
+      } else if (focused) {
+        rangeStartObj = dayjs(focused).startOf("month");
+        rangeEndObj = dayjs(focused).endOf("month");
+      } else if (start && end) {
+        // compat (si te mandan mes ya recortado)
+        rangeStartObj = dayjs(start);
+        rangeEndObj = dayjs(end);
+      } else {
+        return res
+          .status(400)
+          .json({ error: "focused o month o start/end son requeridos" });
+      }
+
+      const rangeStart = rangeStartObj.format("YYYY-MM-DD");
+      const rangeEnd = rangeEndObj.format("YYYY-MM-DD");
+
+      // 2) Si mode=replace: borrar registros anteriores del forecast avanzado en ese rango
+      if (mode === "replace") {
+        const { error: delErr } = await supabase
+          .from("scenario_transactions")
+          .delete()
+          .eq("scenario_id", scenario_id)
+          .eq("type", "expense")
+          .gte("start_date", rangeStart)
+          .lte("start_date", rangeEnd)
+          .ilike("description", "%[ADV_FORECAST]%");
+
+        if (delErr) {
+          console.error("Delete previous ADV_FORECAST failed:", delErr);
+          return res.status(500).json({ error: delErr.message });
+        }
+      }
+
+      // 3) Llamar internamente el preview para obtener instancias
+      // (aquí lo hacemos llamando a una función común; evita hacer HTTP interno)
+      const preview = await computeAdvancedForecastInstances({
+        supabase,
+        user_id,
+        scenario_id,
+        rangeStart,
+        rangeEnd,
+        account_id,
+        params,
+      });
+
+      const instances = preview.instances || [];
+      if (instances.length === 0) {
+        return res.json({
+          success: true,
+          inserted: 0,
+          data: [],
+          meta: preview.meta,
         });
       }
-    }
 
-    return res.json({
-      success: true,
-      data: projected,
-      meta: {
-        range_from: rangeStart,
-        range_to: rangeEnd,
-        history_from: historyFrom,
-        history_to: historyTo,
-        recurring_patterns_count: recurringPatterns.length,
-        noise_categories_count: noiseByCategory.length,
-      },
-    });
-  } catch (err) {
-    console.error("Error preview advanced-forecast:", err);
-    return res.status(500).json({ error: "Error interno generando preview" });
-  }
-});
+      // 4) Insertar como scenario_transactions puntuales
+      const rowsToInsert = instances.map((ev) => ({
+        scenario_id,
+        name: ev.name,
+        amount: ev.amount,
+        type: "expense",
+        start_date: ev.date,
+        end_date: null,
+        recurrence: null,
+        exclude_weekends: false,
+        category_id: ev.category_id,
+        account_id: ev.account_id,
+        description: `[ADV_FORECAST] ${preview.meta.history_from}→${preview.meta.history_to}`,
+      }));
 
-router.post("/:id/advanced-forecast/register", authenticateUser, async (req, res) => {
-  const user_id = req.user.id;
-  const scenario_id = req.params.id;
-
-  try {
-    // 1) Validar escenario
-    const { data: scenario, error: scenErr } = await supabase
-      .from("scenarios")
-      .select("id,user_id")
-      .eq("id", scenario_id)
-      .eq("user_id", user_id)
-      .single();
-
-    if (scenErr || !scenario) {
-      return res.status(404).json({ error: "Escenario no encontrado" });
-    }
-
-    const { start, end, params = {}, account_id = null, mode = "replace" } = req.body || {};
-    if (!start || !end) {
-      return res.status(400).json({ error: "start y end son requeridos" });
-    }
-
-    // end viene inclusivo aquí (tu decides en frontend)
-    const rangeStart = start;
-    const rangeEnd = end;
-
-    // 2) Si mode=replace: borrar registros anteriores del forecast avanzado en ese rango
-    if (mode === "replace") {
-      const { error: delErr } = await supabase
+      const { data: inserted, error: insErr } = await supabase
         .from("scenario_transactions")
-        .delete()
-        .eq("scenario_id", scenario_id)
-        .gte("start_date", rangeStart)
-        .lte("start_date", rangeEnd)
-        .ilike("description", "%[ADV_FORECAST]%");
+        .insert(rowsToInsert)
+        .select("id, name, amount, type, start_date, category_id, account_id");
 
-      if (delErr) {
-        console.error("Delete previous ADV_FORECAST failed:", delErr);
-        return res.status(500).json({ error: delErr.message });
+      if (insErr) {
+        console.error("Insert scenario_transactions failed:", insErr);
+        return res.status(500).json({ error: insErr.message });
       }
+
+      return res.json({
+        success: true,
+        inserted: inserted?.length || 0,
+        data: inserted || [],
+        meta: preview.meta,
+      });
+    } catch (err) {
+      console.error("Error register advanced-forecast:", err);
+      return res
+        .status(500)
+        .json({ error: "Error interno registrando forecast" });
     }
-
-    // 3) Llamar internamente el preview para obtener instancias
-    // (aquí lo hacemos llamando a una función común; evita hacer HTTP interno)
-    const preview = await computeAdvancedForecastInstances({
-      supabase,
-      user_id,
-      scenario_id,
-      rangeStart,
-      rangeEnd,
-      account_id,
-      params,
-    });
-
-    const instances = preview.instances || [];
-    if (instances.length === 0) {
-      return res.json({ success: true, inserted: 0, data: [], meta: preview.meta });
-    }
-
-    // 4) Insertar como scenario_transactions puntuales
-    const rowsToInsert = instances.map((ev) => ({
-      scenario_id,
-      name: ev.name,
-      amount: ev.amount,
-      type: "expense",
-      start_date: ev.date,
-      end_date: null,
-      recurrence: null,
-      exclude_weekends: false,
-      category_id: ev.category_id,
-      account_id: ev.account_id,
-      description: `[ADV_FORECAST] ${preview.meta.history_from}→${preview.meta.history_to}`,
-    }));
-
-    const { data: inserted, error: insErr } = await supabase
-      .from("scenario_transactions")
-      .insert(rowsToInsert)
-      .select("id, name, amount, type, start_date, category_id, account_id");
-
-    if (insErr) {
-      console.error("Insert scenario_transactions failed:", insErr);
-      return res.status(500).json({ error: insErr.message });
-    }
-
-    return res.json({
-      success: true,
-      inserted: inserted?.length || 0,
-      data: inserted || [],
-      meta: preview.meta,
-    });
-  } catch (err) {
-    console.error("Error register advanced-forecast:", err);
-    return res.status(500).json({ error: "Error interno registrando forecast" });
   }
-});
+);
 
 /* =========================
    Common compute function
@@ -1160,23 +1327,31 @@ async function computeAdvancedForecastInstances({
   const includeNoise = params.include_noise !== false; // default true
 
   const minIntervalDays = clampInt(params.min_interval_days, 3, 1, 365);
-  const maxIntervalDays = clampInt(params.max_interval_days, 70, minIntervalDays, 3650);
+  const maxIntervalDays = clampInt(
+    params.max_interval_days,
+    70,
+    minIntervalDays,
+    3650
+  );
 
   const maxCoefVariation = Number.isFinite(Number(params.max_coef_variation))
     ? Number(params.max_coef_variation)
     : 0.6;
 
-  const historyTo = toISODate(addDaysObj(rangeStart, -1));
-  const historyFromObj = new Date(rangeStart);
-  historyFromObj.setMonth(historyFromObj.getMonth() - months);
-  const historyFrom = toISODate(historyFromObj);
+    const { historyFrom, historyTo } = computeHistoryRange({
+      focusedMonthStart: rangeStart,
+      months,
+    });
+    
 
   const { data: txData, error: txErr } = await supabase
     .from("transactions")
-    .select(`
+    .select(
+      `
       id, amount, date, category_id, description,
       categories:categories!transactions_category_id_fkey ( name, stability_type )
-    `)
+    `
+    )
     .eq("user_id", user_id)
     .eq("type", "expense")
     .gte("date", historyFrom)
@@ -1321,7 +1496,9 @@ function buildAdvancedPatterns({
 
       if (bestIdx >= 0 && bestScore >= SIM_THRESHOLD) {
         catClusters[bestIdx].entries.push(tx);
-        if ((tx.norm || "").length > (catClusters[bestIdx].rep_norm || "").length) {
+        if (
+          (tx.norm || "").length > (catClusters[bestIdx].rep_norm || "").length
+        ) {
           catClusters[bestIdx].rep_norm = tx.norm;
           catClusters[bestIdx].rep_grams = grams;
         }
@@ -1360,10 +1537,13 @@ function buildAdvancedPatterns({
     const sd = stdDev(intervals);
     const coefVar = mu > 0 ? sd / mu : 999;
 
-    if (medInterval < minIntervalDays || medInterval > maxIntervalDays) continue;
+    if (medInterval < minIntervalDays || medInterval > maxIntervalDays)
+      continue;
     if (coefVar > maxCoefVariation) continue;
 
-    const amounts = entries.map((e) => e.amount).filter((a) => Number.isFinite(a) && a > 0);
+    const amounts = entries
+      .map((e) => e.amount)
+      .filter((a) => Number.isFinite(a) && a > 0);
     const medAmount = median(amounts);
     if (!Number.isFinite(medAmount) || medAmount <= 0) continue;
 
@@ -1395,7 +1575,13 @@ function buildAdvancedPatterns({
       if (recurringTxIds.has(tx.id)) continue;
       const k = String(tx.category_id);
       if (!byCat[k]) {
-        byCat[k] = { category_id: tx.category_id, category_name: tx.category_name, total: 0, count: 0, amounts: [] };
+        byCat[k] = {
+          category_id: tx.category_id,
+          category_name: tx.category_name,
+          total: 0,
+          count: 0,
+          amounts: [],
+        };
       }
       byCat[k].total += tx.amount;
       byCat[k].count += 1;
@@ -1406,7 +1592,8 @@ function buildAdvancedPatterns({
       if (c.count < 3) continue;
 
       const expectedCountRaw = (c.count / historyDays) * rangeDays;
-      const expected_count = expectedCountRaw >= 0.75 ? Math.round(expectedCountRaw) : 0;
+      const expected_count =
+        expectedCountRaw >= 0.75 ? Math.round(expectedCountRaw) : 0;
       if (expected_count <= 0) continue;
 
       const medAmount = median(c.amounts);
@@ -1490,8 +1677,35 @@ function normalizeText(raw) {
   if (!s) return "";
 
   const stop = new Set([
-    "de","del","la","el","los","las","y","o","para","por","con","un","una","unos","unas",
-    "mi","mis","tu","tus","su","sus","en","a","al","se","me","te","que","como",
+    "de",
+    "del",
+    "la",
+    "el",
+    "los",
+    "las",
+    "y",
+    "o",
+    "para",
+    "por",
+    "con",
+    "un",
+    "una",
+    "unos",
+    "unas",
+    "mi",
+    "mis",
+    "tu",
+    "tus",
+    "su",
+    "sus",
+    "en",
+    "a",
+    "al",
+    "se",
+    "me",
+    "te",
+    "que",
+    "como",
   ]);
 
   const tokens = s.split(" ").filter((t) => t.length >= 2 && !stop.has(t));
@@ -1529,6 +1743,5 @@ function spreadDates(start, end, count) {
     return d;
   });
 }
-
 
 module.exports = router;
