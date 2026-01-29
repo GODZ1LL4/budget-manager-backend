@@ -6,6 +6,8 @@ const dayjs = require("dayjs");
 const isSameOrBefore = require("dayjs/plugin/isSameOrBefore");
 dayjs.extend(isSameOrBefore);
 
+const ExcelJS = require("exceljs");
+
 router.get("/for-calendar", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
@@ -1368,6 +1370,124 @@ router.post("/shopping-list", authenticateUser, async (req, res) => {
       error: "SHOPPING_LIST_FAILED",
       message: e.message || "Error inesperado creando lista de compra",
     });
+  }
+});
+
+
+
+// ✅ Exportar transacciones a XLSX (con filtros)
+router.get("/export", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  const { description, type, account_id, category_id, date_from, date_to } = req.query;
+
+  try {
+    // Headers de descarga
+    const filename = `transacciones_${dayjs().format("YYYYMMDD_HHmmss")}.xlsx`;
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    // Workbook streaming directo al response
+    const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res });
+    const sheet = workbook.addWorksheet("Transacciones");
+
+    // Columnas requeridas
+    sheet.columns = [
+      { header: "DESCRIPCION", key: "descripcion", width: 40 },
+      { header: "CATEGORIA", key: "categoria", width: 22 },
+      { header: "TIPO TRANSACCION", key: "tipo", width: 18 },
+      { header: "FECHA", key: "fecha", width: 12 },
+      { header: "TOTAL", key: "total", width: 14 },
+    ];
+
+    // Helper: tipo traducido
+    const mapType = (t) =>
+      t === "expense" ? "Gasto" : t === "income" ? "Ingreso" : "Transferencia";
+
+    // Paginación (evita traer todo a memoria)
+    const pageSize = 1000;
+    let from = 0;
+
+    while (true) {
+      let query = supabase
+        .from("transactions")
+        .select(
+          `
+          id,
+          amount,
+          type,
+          description,
+          date,
+          categories ( name )
+        `
+        )
+        .eq("user_id", user_id);
+
+      // 🔍 mismos filtros que tu GET /
+      if (description && description.trim() !== "") {
+        query = query.ilike("description", `%${description.trim()}%`);
+      }
+      if (type && type !== "all") {
+        query = query.eq("type", type);
+      }
+      if (category_id) {
+        query = query.eq("category_id", category_id);
+      }
+      if (account_id) {
+        query = query.or(
+          `account_id.eq.${account_id},account_from_id.eq.${account_id},account_to_id.eq.${account_id}`
+        );
+      }
+      if (date_from) query = query.gte("date", date_from);
+      if (date_to) query = query.lte("date", date_to);
+
+      query = query.order("date", { ascending: false }).range(from, from + pageSize - 1);
+
+      const { data, error } = await query;
+
+      if (error) {
+        console.error("🔥 Error exportando transacciones:", error);
+        // Si ya escribimos algo al stream, igual cerramos bien
+        sheet.addRow({
+          descripcion: "ERROR",
+          categoria: "",
+          tipo: "",
+          fecha: "",
+          total: error.message,
+        }).commit();
+        break;
+      }
+
+      if (!data || data.length === 0) break;
+
+      // escribir filas
+      for (const tx of data) {
+        sheet.addRow({
+          descripcion: tx.description || "",
+          categoria: tx.type === "transfer" ? "" : (tx.categories?.name || ""),
+          tipo: mapType(tx.type),
+          fecha: tx.date, // YYYY-MM-DD
+          total: Number(tx.amount || 0),
+        }).commit();
+      }
+
+      // siguiente página
+      from += pageSize;
+
+      // si vino menos de una página, terminamos
+      if (data.length < pageSize) break;
+    }
+
+    sheet.commit();
+    await workbook.commit(); // esto cierra el stream correctamente
+  } catch (err) {
+    console.error("🔥 Error inesperado en /transactions/export:", err);
+    // Si falla antes de headers/stream, mandamos JSON
+    if (!res.headersSent) {
+      return res.status(500).json({ error: "Error interno exportando XLSX" });
+    }
+    // Si ya envió headers, solo finaliza
+    try { res.end(); } catch {}
   }
 });
 
