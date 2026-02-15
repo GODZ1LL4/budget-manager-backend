@@ -503,45 +503,50 @@ router.get(
   }
 );
 
-router.get(
-  "/yearly-category-variations",
-  authenticateUser,
-  async (req, res) => {
-    const user_id = req.user.id;
-    const year = new Date().getFullYear();
-    const { start, end } = getYearRange(year);
+router.get("/yearly-category-variations", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
 
-    const { data, error } = await supabase
-      .from("transactions")
-      .select("amount, category_id, date")
-      .eq("user_id", user_id)
-      .eq("type", "expense")
-      .gte("date", start)
-      .lte("date", end);
+  const rawYear = req.query.year;
+  const parsedYear = rawYear != null ? Number(rawYear) : new Date().getFullYear();
 
-    if (error) return res.status(500).json({ error: error.message });
-
-    const grouped = {};
-    (data || []).forEach((tx) => {
-      const [y, m] = tx.date.split("-");
-      const key = `${y}-${m}`;
-      const cat = tx.category_id;
-      if (!grouped[key]) grouped[key] = {};
-      if (!grouped[key][cat]) grouped[key][cat] = 0;
-      grouped[key][cat] += parseFloat(tx.amount);
-    });
-
-    const perCategory = {};
-    Object.entries(grouped).forEach(([month, cats]) => {
-      Object.entries(cats).forEach(([catId, amount]) => {
-        if (!perCategory[catId]) perCategory[catId] = [];
-        perCategory[catId].push({ month, amount });
-      });
-    });
-
-    res.json({ success: true, data: perCategory });
+  if (!Number.isFinite(parsedYear) || parsedYear < 2000 || parsedYear > 2100) {
+    return res.status(400).json({ error: "Parámetro year inválido." });
   }
-);
+
+  const year = parsedYear;
+  const { start, end } = getYearRange(year);
+
+  const { data, error } = await supabase
+    .from("transactions")
+    .select("amount, category_id, date")
+    .eq("user_id", user_id)
+    .eq("type", "expense")
+    .gte("date", start)
+    .lte("date", end);
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  const grouped = {};
+  (data || []).forEach((tx) => {
+    const [y, m] = tx.date.split("-");
+    const key = `${y}-${m}`;
+    const cat = tx.category_id;
+    if (!grouped[key]) grouped[key] = {};
+    if (!grouped[key][cat]) grouped[key][cat] = 0;
+    grouped[key][cat] += parseFloat(tx.amount);
+  });
+
+  const perCategory = {};
+  Object.entries(grouped).forEach(([month, cats]) => {
+    Object.entries(cats).forEach(([catId, amount]) => {
+      if (!perCategory[catId]) perCategory[catId] = [];
+      perCategory[catId].push({ month, amount });
+    });
+  });
+
+  res.json({ success: true, data: perCategory, year });
+});
+
 
 /* ========= HISTÓRICO BUDGET VS ACTUAL ========= */
 
