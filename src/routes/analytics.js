@@ -4152,6 +4152,405 @@ function jaccard(a, b) {
   return union > 0 ? inter / union : 0;
 }
 
+router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  try {
+    // =========================
+    // Params
+    // =========================
+    const months = Math.max(
+      1,
+      Math.min(36, parseInt(req.query.months ?? "12", 10) || 12)
+    );
+
+    const minOccurrences = Math.max(
+      2,
+      parseInt(req.query.min_occurrences ?? "3", 10) || 3
+    );
+
+    const limit = Math.max(
+      1,
+      Math.min(50, parseInt(req.query.limit ?? "15", 10) || 15)
+    );
+
+    const includeNoise = String(req.query.include_noise ?? "true") === "true";
+
+    const minIntervalDays = Math.max(
+      1,
+      parseInt(req.query.min_interval_days ?? "3", 10) || 3
+    );
+
+    const maxIntervalDays = Math.max(
+      minIntervalDays,
+      parseInt(req.query.max_interval_days ?? "70", 10) || 70
+    );
+
+    const maxCoefVariation = Number.isFinite(Number(req.query.max_coef_variation))
+      ? Number(req.query.max_coef_variation)
+      : 0.6;
+
+    // =========================
+    // Fechas (igual patrón que /expense-forecast)
+    // =========================
+    const rawFrom = (req.query.date_from || "").trim();
+    const rawTo = (req.query.date_to || "").trim();
+
+    let dateFromObj;
+    let dateToObj;
+
+    if (!rawFrom && !rawTo) {
+      dateFromObj = firstDayOfMonth(new Date());
+      dateToObj = lastDayOfMonth(new Date());
+    } else if (rawFrom && !rawTo) {
+      const base = parseISODateOnly(rawFrom);
+      if (!base || Number.isNaN(base.getTime())) {
+        return res.status(400).json({ error: "date_from inválida (YYYY-MM-DD)" });
+      }
+      dateFromObj = base;
+      dateToObj = lastDayOfMonth(base);
+    } else if (!rawFrom && rawTo) {
+      const base = parseISODateOnly(rawTo);
+      if (!base || Number.isNaN(base.getTime())) {
+        return res.status(400).json({ error: "date_to inválida (YYYY-MM-DD)" });
+      }
+      dateFromObj = firstDayOfMonth(base);
+      dateToObj = base;
+    } else {
+      const f = parseISODateOnly(rawFrom);
+      const t = parseISODateOnly(rawTo);
+      if (!f || !t || Number.isNaN(f.getTime()) || Number.isNaN(t.getTime())) {
+        return res
+          .status(400)
+          .json({ error: "date_from/date_to inválidas (YYYY-MM-DD)" });
+      }
+      if (f > t) return res.status(400).json({ error: "date_from no puede ser mayor que date_to" });
+      dateFromObj = f;
+      dateToObj = t;
+    }
+
+    const date_from = toISODate(dateFromObj);
+    const date_to = toISODate(dateToObj);
+
+    // Historial: últimos N meses hacia atrás desde date_from
+    const historyToObj = new Date(dateFromObj);
+    const historyFromObj = new Date(dateFromObj);
+    historyFromObj.setUTCDate(1);
+    historyFromObj.setUTCMonth(historyFromObj.getUTCMonth() - months);
+
+    const history_from = toISODate(historyFromObj);
+    const history_to = toISODate(historyToObj);
+
+    const historyDays = Math.max(1, diffInDays(history_from, history_to) || 1);
+    const targetDays = Math.max(1, diffInDays(date_from, date_to) + 1);
+
+    // =========================
+    // Data: transaction_items + joins (solo expense)
+    // =========================
+    const { data, error } = await supabase
+      .from("transaction_items")
+      .select(`
+        item_id,
+        quantity,
+        unit_price_net,
+        line_total_final,
+        items!inner (
+          name,
+          user_id,
+          taxes ( rate, is_exempt )
+        ),
+        transactions!inner (
+          date,
+          type,
+          user_id
+        )
+      `)
+      .eq("transactions.user_id", user_id)
+      .eq("items.user_id", user_id)
+      .eq("transactions.type", "expense")
+      .gte("transactions.date", history_from)
+      .lte("transactions.date", history_to);
+
+    if (error) {
+      console.error("Error supabase /analytics/item-expense-forecast:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    // =========================
+    // Agrupar por item + por día
+    // =========================
+    const eventsByItem = {}; // itemId -> date -> { qty, amount }
+    const itemNameMap = {};
+
+    (data || []).forEach((row) => {
+      const trx = row.transactions;
+      const itemRel = row.items;
+      if (!trx || !itemRel) return;
+
+      const itemId = row.item_id;
+      const day = trx.date;
+
+      const qty = Number(row.quantity || 0);
+      if (!itemId || !day || qty <= 0) return;
+
+      itemNameMap[itemId] = itemRel.name || "Sin nombre";
+
+      // monto final con fallback
+      let lineAmount = 0;
+      if (row.line_total_final != null) {
+        lineAmount = Number(row.line_total_final) || 0;
+      } else {
+        const netPrice = Number(row.unit_price_net || 0);
+        const taxRate = itemRel.taxes?.rate != null ? Number(itemRel.taxes.rate) : 0;
+        const isExempt = !!itemRel.taxes?.is_exempt;
+
+        let priceWithTax = netPrice;
+        if (!isExempt && taxRate > 0) priceWithTax = netPrice * (1 + taxRate / 100);
+
+        lineAmount = priceWithTax * qty;
+      }
+
+      if (!eventsByItem[itemId]) eventsByItem[itemId] = {};
+      if (!eventsByItem[itemId][day]) eventsByItem[itemId][day] = { qty: 0, amount: 0 };
+
+      eventsByItem[itemId][day].qty += qty;
+      eventsByItem[itemId][day].amount += lineAmount;
+    });
+
+    // =========================
+    // Helpers: discreto vs continuo
+    // =========================
+    const qtyEps = 0.02;
+    const nearInt = (x) => Math.abs(x - Math.round(x)) <= qtyEps;
+
+    // =========================
+    // Recency hybrid thresholds
+    // =========================
+    const HARD_DROP_DAYS = 90; // >90 => excluir completamente (muerto)
+    // expiry dinámico:
+    // quincenal(14) -> max(3*14=42,45)=45
+    // mensual(30) -> max(90,45)=90
+    const expiryDaysFor = (medianIntervalDays) => {
+      const mi = Math.max(1, Math.round(Number(medianIntervalDays) || 1));
+      return Math.max(3 * mi, 45);
+    };
+
+    // =========================
+    // Construir patrones
+    // =========================
+    const recurring = [];
+    const noise = [];
+
+    for (const itemId of Object.keys(eventsByItem)) {
+      const byDate = eventsByItem[itemId];
+      const dates = Object.keys(byDate).sort();
+      if (dates.length < 2) continue;
+
+      const entries = dates.map((d) => ({
+        date: d,
+        quantity: byDate[d].qty,
+        amount: byDate[d].amount,
+      }));
+
+      // intervalos
+      const intervals = [];
+      for (let i = 1; i < entries.length; i++) {
+        const delta = diffInDays(entries[i - 1].date, entries[i].date);
+        if (Number.isFinite(delta) && delta > 0) intervals.push(delta);
+      }
+      if (intervals.length === 0) continue;
+
+      const medianInterval = median(intervals);
+      const meanInterval = mean(intervals);
+      const stdInterval = stdDev(intervals);
+      const cv = meanInterval > 0 ? stdInterval / meanInterval : 999;
+
+      const amounts = entries.map((e) => Number(e.amount) || 0).filter((x) => x > 0);
+      const qtys = entries.map((e) => Number(e.quantity) || 0).filter((x) => x > 0);
+      if (amounts.length === 0 || qtys.length === 0) continue;
+
+      const medAmount = median(amounts);
+      const avgQty = mean(qtys);
+      const medianQty = median(qtys);
+
+      // discreto/continuo
+      const nearIntRatio = qtys.length > 0 ? qtys.filter(nearInt).length / qtys.length : 0;
+      const isDiscrete = nearIntRatio >= 0.8;
+
+      const typicalQty = isDiscrete
+        ? Math.max(1, Math.round(medianQty))
+        : (Number(avgQty) || 0);
+
+      const lastDate = entries[entries.length - 1].date;
+
+      // recency / expiry
+      const daysSinceLast = diffInDays(lastDate, date_from); // lastDate antes del rango => positivo
+      const expiryDays = expiryDaysFor(medianInterval);
+
+      const isHardExpired = daysSinceLast > HARD_DROP_DAYS;
+      const isSoftExpired = daysSinceLast > expiryDays && !isHardExpired;
+
+      const baseRow = {
+        item_id: itemId,
+        item_name: itemNameMap[itemId] || "Sin nombre",
+        occurrences: entries.length,
+
+        median_interval_days: Number(medianInterval.toFixed(1)),
+        mean_interval_days: Number(meanInterval.toFixed(1)),
+        std_dev_interval_days: Number(stdInterval.toFixed(1)),
+
+        avg_quantity: Number(avgQty.toFixed(2)),
+        median_amount: Number((Number(medAmount) || 0).toFixed(2)),
+        last_date: lastDate,
+
+        // para UI/debug
+        is_discrete: isDiscrete,
+        near_int_ratio: Number(nearIntRatio.toFixed(2)),
+        typical_quantity: isDiscrete
+          ? Number(typicalQty.toFixed(0))
+          : Number(typicalQty.toFixed(2)),
+
+        days_since_last: Number.isFinite(daysSinceLast) ? daysSinceLast : null,
+        expiry_days: expiryDays,
+        recency_status: isHardExpired ? "hard_expired" : isSoftExpired ? "soft_expired" : "fresh",
+      };
+
+      // Si está MUY viejo: excluir del reporte por completo
+      if (isHardExpired) {
+        continue;
+      }
+
+      // candidato recurrente por métricas
+      const isRecurringCandidate =
+        entries.length >= minOccurrences &&
+        medianInterval >= minIntervalDays &&
+        medianInterval <= maxIntervalDays &&
+        cv <= maxCoefVariation;
+
+      // si está soft-expired, NO puede ser recurrente
+      const finalIsRecurring = isRecurringCandidate && !isSoftExpired;
+
+      if (finalIsRecurring) {
+        // recurrente real
+        const interval = Math.max(1, Math.round(medianInterval));
+        const amountPerEvent = Number(medAmount) || 0;
+        if (amountPerEvent <= 0) continue;
+
+        const gap = diffInDays(lastDate, date_from);
+        const n = gap > 0 ? Math.ceil(gap / interval) : 1;
+        let next = addDays(lastDate, n * interval);
+
+        let expectedCount = 0;
+        let projection = 0;
+
+        while (new Date(next) <= new Date(date_to)) {
+          expectedCount += 1;
+          projection += amountPerEvent;
+          next = addDays(next, interval);
+        }
+
+        if (projection > 0) {
+          const expectedQuantity = expectedCount * (Number(typicalQty) || 0);
+
+          recurring.push({
+            ...baseRow,
+            type: "recurring",
+            expected_count: expectedCount,
+            expected_quantity: isDiscrete
+              ? Number(expectedQuantity.toFixed(0))
+              : Number(expectedQuantity.toFixed(2)),
+            projection: Number(projection.toFixed(2)),
+          });
+        }
+      } else {
+        // evento / noise (incluye soft-expired como "ruido", si include_noise)
+        if (!includeNoise) continue;
+
+        // para noise pedimos un mínimo de señal
+        if (entries.length < 3) continue;
+
+        const total = amounts.reduce((s, v) => s + v, 0);
+        const meanPerDay = total / historyDays;
+        const projectedA = meanPerDay * targetDays;
+
+        const expectedCountRaw = (entries.length / historyDays) * targetDays;
+        const expectedCount = expectedCountRaw >= 0.75 ? Math.round(expectedCountRaw) : 0;
+
+        const projectedB = expectedCount > 0 ? expectedCount * (Number(medAmount) || 0) : 0;
+
+        const projection = Math.min(projectedA, projectedB);
+
+        // si es soft-expired, limitamos agresivo para que no domine el top
+        // (alguien que no compra desde hace 2 meses no debería "prometer" mucho)
+        const softExpiryPenalty = isSoftExpired ? 0.35 : 1.0;
+        const finalProjection = projection * softExpiryPenalty;
+
+        if (Number.isFinite(finalProjection) && finalProjection > 0) {
+          const expectedQuantity = expectedCount * (Number(typicalQty) || 0);
+
+          noise.push({
+            ...baseRow,
+            type: "event",
+            expected_count: expectedCount,
+            expected_quantity: isDiscrete
+              ? Number(expectedQuantity.toFixed(0))
+              : Number(expectedQuantity.toFixed(2)),
+            projection: Number(finalProjection.toFixed(2)),
+          });
+        }
+      }
+    }
+
+    const combined = [...recurring, ...noise]
+      .sort((a, b) => (b.projection || 0) - (a.projection || 0))
+      .slice(0, limit);
+
+    const total_projected = combined.reduce((s, r) => s + (r.projection || 0), 0);
+    const quantity_expected = combined.reduce((s, r) => {
+      const q = Number(r.expected_quantity);
+      return s + (Number.isFinite(q) ? q : 0);
+    }, 0);
+
+    return res.json({
+      success: true,
+      meta: {
+        date_from,
+        date_to,
+        history_from,
+        history_to,
+        months,
+        min_occurrences: minOccurrences,
+        include_noise: includeNoise,
+        min_interval_days: minIntervalDays,
+        max_interval_days: maxIntervalDays,
+        max_coef_variation: maxCoefVariation,
+        expiry_rule: {
+          hard_drop_days: HARD_DROP_DAYS,
+          expiry_days: "max(3*median_interval_days, 45)",
+          soft_expired_behavior: "degrade_to_event (penalized)",
+          hard_expired_behavior: "excluded",
+        },
+      },
+      summary: {
+        total_projected: Number(total_projected.toFixed(2)),
+        total_expense: Number(total_projected.toFixed(2)),
+        quantity_expected: Number(quantity_expected.toFixed(2)),
+      },
+      data: combined,
+    });
+  } catch (err) {
+    console.error("Error en /analytics/item-expense-forecast:", {
+      message: err?.message,
+      cause: err?.cause,
+      stack: err?.stack,
+    });
+    return res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
+
+
+
+
 // GET /analytics/advanced-burn-rate-current-month
 // - Fechas internas: primer y último día del mes actual
 // - Acepta parámetros (months, min_occurrences, include_noise, include_occasional, etc.)
@@ -4975,5 +5374,7 @@ router.get("/budget-coverage-robust", authenticateUser, async (req, res) => {
       .json({ error: "Error interno calculando cobertura robusta" });
   }
 });
+
+
 
 module.exports = router;

@@ -432,4 +432,94 @@ router.delete("/:id", authenticateUser, async (req, res) => {
   res.json({ success: true, message: "Meta eliminada" });
 });
 
+// =====================================================
+// POST /goals/:id/complete -> marca completed y libera TODO lo reservado
+// =====================================================
+router.post("/:id/complete", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+  const { id } = req.params;
+  const { note, movement_date } = req.body || {};
+
+  // 1) Obtener meta
+  const { data: goal, error: gErr } = await supabase
+    .from("goals")
+    .select("id, user_id, account_id, status")
+    .eq("id", id)
+    .eq("user_id", user_id)
+    .maybeSingle();
+
+  if (gErr) return res.status(500).json({ error: gErr.message });
+  if (!goal) return res.status(404).json({ error: "Meta no encontrada" });
+
+  const allowed = new Set(["active", "paused"]);
+  if (!allowed.has(goal.status)) {
+    return res.status(400).json({ error: "Solo puedes completar metas activas o pausadas" });
+  }
+
+  // 2) Calcular reservado neto
+  const { data: movs, error: mErr } = await supabase
+    .from("goal_movements")
+    .select("type, amount")
+    .eq("user_id", user_id)
+    .eq("goal_id", goal.id);
+
+  if (mErr) return res.status(500).json({ error: mErr.message });
+
+  const reserved_amount = computeReservedFromMovements(movs);
+  const reserved = Math.abs(reserved_amount) < 0.000001 ? 0 : reserved_amount;
+
+  // 3) Si ya no hay nada reservado, solo marcar completed (no crea movimiento)
+  if (reserved <= 0) {
+    const { data: updated, error: uErr } = await supabase
+      .from("goals")
+      .update({ status: "completed" })
+      .eq("id", id)
+      .eq("user_id", user_id)
+      .select("id, user_id, name, target_amount, due_date, created_at, account_id, status, is_priority")
+      .single();
+
+    if (uErr) return res.status(500).json({ error: uErr.message });
+
+    return res.json({
+      success: true,
+      data: { goal: { ...updated, reserved_amount: 0 }, released_amount: 0 },
+    });
+  }
+
+  // 4) Insertar retiro por el total reservado (libera completamente)
+  const withdrawRow = {
+    user_id,
+    goal_id: goal.id,
+    account_id: goal.account_id || null, // tracking => null
+    type: "withdraw",
+    amount: reserved,
+    linked_transaction_id: null,
+    note: note || "Cierre de meta: liberación total de la reserva.",
+  };
+  if (movement_date) withdrawRow.movement_date = movement_date;
+
+  const { error: wErr } = await supabase.from("goal_movements").insert([withdrawRow]);
+  if (wErr) return res.status(500).json({ error: wErr.message });
+
+  // 5) Marcar meta como completed
+  const { data: updated, error: uErr } = await supabase
+    .from("goals")
+    .update({ status: "completed" })
+    .eq("id", id)
+    .eq("user_id", user_id)
+    .select("id, user_id, name, target_amount, due_date, created_at, account_id, status, is_priority")
+    .single();
+
+  if (uErr) return res.status(500).json({ error: uErr.message });
+
+  return res.json({
+    success: true,
+    data: {
+      goal: { ...updated, reserved_amount: 0 },
+      released_amount: reserved,
+    },
+  });
+});
+
+
 module.exports = router;

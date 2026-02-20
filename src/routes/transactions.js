@@ -8,10 +8,11 @@ dayjs.extend(isSameOrBefore);
 
 const ExcelJS = require("exceljs");
 
+
 router.get("/for-calendar", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
-  // 1. Obtener todas las transacciones (planificadas y reales)
+  // 1) Obtener todas las transacciones del usuario (reales + plantillas)
   const { data: allTxs, error } = await supabase
     .from("transactions")
     .select("*")
@@ -19,34 +20,66 @@ router.get("/for-calendar", authenticateUser, async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
 
-  // 2. Mapear transacciones reales insertadas por recurrencia
+  // 2) Mapear instancias reales creadas por recurrencia
+  //    Clave: `${originId}_${date}`
   const realRecurringTxsSet = new Set();
-
-  for (const tx of allTxs) {
+  for (const tx of allTxs || []) {
     if (tx.recurrence_origin_id) {
-      const key = `${tx.recurrence_origin_id}_${tx.date}`;
-      realRecurringTxsSet.add(key);
+      realRecurringTxsSet.add(`${tx.recurrence_origin_id}_${tx.date}`);
     }
   }
 
   const result = [];
 
-  for (const tx of allTxs) {
-    // Transacción normal (no recurrente)
+  for (const tx of allTxs || []) {
+    // A) Transacción normal (no recurrente) -> se devuelve tal cual
     if (!tx.recurrence) {
       result.push(tx);
       continue;
     }
 
-    const startDate = dayjs(tx.date);
+    // B) Transacción plantilla recurrente -> proyectar
+    const startDate = dayjs(tx.date).startOf("day");
     const endDate = tx.recurrence_end_date
-      ? dayjs(tx.recurrence_end_date)
-      : dayjs().add(3, "months"); // proyección corta si no hay fin
+      ? dayjs(tx.recurrence_end_date).startOf("day")
+      : dayjs().add(3, "months").startOf("day"); // proyección corta si no hay fin
 
+    // Si start > end, nada que proyectar
+    if (startDate.isAfter(endDate, "day")) continue;
+
+    // --- Recurrencia mensual (✅ anclada, sin drift) ---
+    if (tx.recurrence === "monthly") {
+      const anchorDay = startDate.date(); // ej. 30
+      let monthCursor = startDate.startOf("month"); // primer día del mes del start
+
+      while (true) {
+        const lastDay = monthCursor.daysInMonth();
+        const day = Math.min(anchorDay, lastDay);
+        const projected = monthCursor.date(day).startOf("day");
+
+        if (projected.isAfter(endDate, "day")) break;
+
+        const projectedDate = projected.format("YYYY-MM-DD");
+        const key = `${tx.id}_${projectedDate}`;
+
+        if (!realRecurringTxsSet.has(key)) {
+          result.push({
+            ...tx,
+            date: projectedDate,
+            isProjected: true,
+          });
+        }
+
+        monthCursor = monthCursor.add(1, "month").startOf("month");
+      }
+
+      continue; // evita caer al generador general
+    }
+
+    // --- Recurrencias weekly/biweekly ---
     let current = startDate;
 
-    // Generar fechas según recurrencia
-    while (current.isSameOrBefore(endDate)) {
+    while (current.isSameOrBefore(endDate, "day")) {
       const projectedDate = current.format("YYYY-MM-DD");
       const key = `${tx.id}_${projectedDate}`;
 
@@ -54,24 +87,22 @@ router.get("/for-calendar", authenticateUser, async (req, res) => {
         result.push({
           ...tx,
           date: projectedDate,
-          isProjected: true, // útil para diferenciar en UI
+          isProjected: true,
         });
       }
 
-      // Avanzar según recurrencia
       if (tx.recurrence === "weekly") {
         current = current.add(1, "week");
       } else if (tx.recurrence === "biweekly") {
         current = current.add(2, "week");
-      } else if (tx.recurrence === "monthly") {
-        current = current.add(1, "month");
       } else {
+        // fallback para evitar loops infinitos
         current = current.add(1, "day");
       }
     }
   }
 
-  res.json({ success: true, data: result });
+  return res.json({ success: true, data: result });
 });
 
 // ✅ Obtener transacciones del usuario (con filtros)
@@ -653,17 +684,11 @@ router.put("/:id", authenticateUser, async (req, res) => {
   try {
     // 1) Buscar la transacción y validar que es del usuario
     const { data: existing, error: existingError } = await supabase
-      .from("transactions")
-      .select(
-        `
-        id,
-        user_id,
-        is_shopping_list,
-        type
-      `
-      )
-      .eq("id", id)
-      .single();
+    .from("transactions")
+    .select("id, user_id, is_shopping_list, type")
+    .eq("id", id)
+    .eq("user_id", user_id)
+    .single();
 
     if (existingError || !existing) {
       console.error("❌ Error buscando transacción:", existingError);
