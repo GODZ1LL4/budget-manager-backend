@@ -82,7 +82,18 @@ router.delete("/:id", authenticateUser, async (req, res) => {
     .eq("id", id)
     .eq("user_id", user_id);
 
-  if (error) return res.status(500).json({ error: error.message });
+  if (error) {
+    // FK violation (Postgres)
+    // En Supabase suele venir como code: "23503"
+    if (error.code === "23503") {
+      return res.status(409).json({
+        error:
+          "No puedes eliminar esta categoría porque está siendo usada en transacciones, presupuestos o escenarios. Reasigna esos registros primero.",
+      });
+    }
+
+    return res.status(500).json({ error: error.message });
+  }
 
   res.json({ success: true, message: "Categoría eliminada" });
 });

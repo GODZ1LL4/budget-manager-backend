@@ -5376,5 +5376,431 @@ router.get("/budget-coverage-robust", authenticateUser, async (req, res) => {
 });
 
 
+/* ========= GASTOS HORMIGA (CORREGIDO) ========= */
+
+// Normaliza la descripción para agrupar.
+// ✅ IMPORTANTE: este "key" (normalizado) es el que debe usarse en /ant-expenses-detail
+const normalizeDesc = (s) => {
+  const raw = String(s || "").trim();
+
+  // quitar prefijo [AUTO] si existe (por si en algún caso se incluye)
+  const noAuto = raw.replace(/^\[auto\]\s*/i, "");
+
+  return noAuto
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[.,;:¡!¿?()]/g, "")
+    .trim();
+};
+
+router.get("/ant-expenses", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  const {
+    date_from,
+    date_to,
+    max_amount,
+    min_count,
+    group_by,     // "description" | "category"
+    exclude_auto, // "1" para excluir [AUTO]
+    limit,        // top N grupos
+  } = req.query;
+
+  const maxAmt = Number(max_amount) > 0 ? Number(max_amount) : 200;
+  const minCount = Number(min_count) > 0 ? Number(min_count) : 3;
+  const topN = Number(limit) > 0 ? Number(limit) : 15;
+  const groupBy = String(group_by || "description");
+  const excludeAuto = String(exclude_auto || "1") === "1";
+
+  // Default rango: últimos 30 días
+  const now = new Date();
+  const defaultFrom = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate() - 30
+  )
+    .toISOString()
+    .split("T")[0];
+
+  const from = date_from || defaultFrom;
+  const to = date_to || now.toISOString().split("T")[0];
+
+  try {
+    let query = supabase
+      .from("transactions")
+      .select("id, amount, date, description, category_id, categories(name)")
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .gte("date", from)
+      .lte("date", to)
+      .lte("amount", maxAmt);
+
+    // ✅ Excluir autos (misma regla en ambos endpoints)
+    if (excludeAuto) {
+      query = query.not("description", "ilike", "[AUTO]%");
+    }
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
+
+    const groups = {};
+
+    (data || []).forEach((tx) => {
+      const amt = Number(tx.amount || 0);
+      if (!Number.isFinite(amt) || amt <= 0) return;
+
+      let key = "sin_grupo";
+      let label = "Sin grupo";
+
+      if (groupBy === "category") {
+        key = tx.category_id || "sin_categoria";
+        label = tx.categories?.name || "Sin categoría";
+      } else {
+        // ✅ por descripción normalizada (esta key es la que se usa luego en detail)
+        const norm = normalizeDesc(tx.description);
+        key = norm || "sin_descripcion";
+        label = (tx.description || "Sin descripción").trim();
+      }
+
+      if (!groups[key]) {
+        groups[key] = {
+          key,
+          label,
+          count: 0,
+          total: 0,
+          avg: 0,
+          first_date: tx.date,
+          last_date: tx.date,
+          sample: [],
+        };
+      }
+
+      const g = groups[key];
+      g.count += 1;
+      g.total += amt;
+
+      if (tx.date < g.first_date) g.first_date = tx.date;
+      if (tx.date > g.last_date) g.last_date = tx.date;
+
+      g.sample.push({
+        id: tx.id,
+        date: tx.date,
+        amount: amt,
+        description: tx.description || "",
+        category: tx.categories?.name || "Sin categoría",
+      });
+    });
+
+    let rows = Object.values(groups)
+      .map((g) => {
+        g.avg = g.count > 0 ? g.total / g.count : 0;
+
+        // muestra: últimas 5 por fecha desc
+        g.sample.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+        g.sample = g.sample.slice(0, 5);
+
+        return {
+          key: g.key,
+          label: g.label,
+          count: g.count,
+          total: Number(g.total.toFixed(2)),
+          avg: Number(g.avg.toFixed(2)),
+          first_date: g.first_date,
+          last_date: g.last_date,
+          sample: g.sample,
+        };
+      })
+      .filter((g) => g.count >= minCount)
+      .sort((a, b) => (b.total - a.total) || (b.count - a.count))
+      .slice(0, topN);
+
+    return res.json({
+      success: true,
+      meta: {
+        date_from: from,
+        date_to: to,
+        max_amount: maxAmt,
+        min_count: minCount,
+        group_by: groupBy,
+        exclude_auto: excludeAuto,
+        limit: topN,
+      },
+      data: rows,
+    });
+  } catch (err) {
+    console.error("Error ant-expenses:", err);
+    return res.status(500).json({ error: "Error generando gastos hormiga" });
+  }
+});
+
+// GET /api/analytics/ant-expenses-detail
+// ✅ CORRECCIÓN CLAVE:
+// - Si group_by=description, "key" ES LA DESCRIPCIÓN NORMALIZADA (r.key)
+//   y filtramos en backend usando normalizeDesc(), no por igualdad exacta de description.
+// - Si group_by=category, "key" es category_id.
+router.get("/ant-expenses-detail", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  const {
+    group_by = "description",
+    key,
+    date_from,
+    date_to,
+    max_amount,
+    exclude_auto,
+    limit,
+    offset,
+  } = req.query;
+
+  if (!key) return res.status(400).json({ error: "Se requiere key" });
+  if (!date_from || !date_to) {
+    return res.status(400).json({ error: "Se requieren date_from y date_to" });
+  }
+
+  const maxAmt = Number(max_amount) > 0 ? Number(max_amount) : 200;
+  const lim = Number(limit) > 0 ? Math.min(Number(limit), 2000) : 500;
+  const off = Number(offset) >= 0 ? Number(offset) : 0;
+  const exclude = String(exclude_auto || "1") === "1";
+
+  try {
+    // Base query
+    let query = supabase
+      .from("transactions")
+      .select(
+        `
+        id,
+        date,
+        description,
+        amount,
+        category_id,
+        categories ( name )
+      `
+      )
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .gte("date", date_from)
+      .lte("date", date_to)
+      .lte("amount", maxAmt);
+
+    // ✅ misma regla que en /ant-expenses
+    if (exclude) {
+      query = query.not("description", "ilike", "[AUTO]%");
+    }
+
+    // Caso category: filtramos en SQL
+    if (String(group_by) === "category") {
+      query = query.eq("category_id", key).order("date", { ascending: false });
+
+      // paginación directa en SQL
+      query = query.range(off, off + lim - 1);
+
+      const { data, error } = await query;
+      if (error) return res.status(500).json({ error: error.message });
+
+      const rows = (data || []).map((t) => ({
+        id: t.id,
+        date: t.date,
+        description: t.description || "",
+        category: t.categories?.name || "Sin categoría",
+        amount: Number(t.amount || 0),
+      }));
+
+      return res.json({
+        success: true,
+        data: rows,
+        meta: {
+          group_by: "category",
+          key,
+          date_from,
+          date_to,
+          max_amount: maxAmt,
+          exclude_auto: exclude ? 1 : 0,
+          limit: lim,
+          offset: off,
+          returned: rows.length,
+          // (no tenemos total exacto sin count() aquí; si quieres, lo agregamos luego)
+        },
+      });
+    }
+
+    // ✅ Caso description:
+    // "key" es NORMALIZADA, entonces NO podemos hacer eq("description", key).
+    // Hacemos fetch del universo con filtros básicos y filtramos en JS.
+    // (En rangos de 30 días + max_amount pequeño, es manejable. Si crece mucho, hacemos RPC.)
+    query = query.order("date", { ascending: false });
+
+    // Traer un máximo razonable (para evitar reventar). Ajusta si tu data crece.
+    // Nota: Supabase tiene límites; esto es pragmático.
+    const MAX_FETCH = 5000;
+    query = query.range(0, MAX_FETCH - 1);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
+
+    const filtered = (data || []).filter((t) => {
+      const norm = normalizeDesc(t.description);
+      return norm === String(key);
+    });
+
+    // Paginación después del filtro
+    const page = filtered.slice(off, off + lim);
+
+    const rows = page.map((t) => ({
+      id: t.id,
+      date: t.date,
+      description: t.description || "",
+      category: t.categories?.name || "Sin categoría",
+      amount: Number(t.amount || 0),
+    }));
+
+    return res.json({
+      success: true,
+      data: rows,
+      meta: {
+        group_by: "description",
+        key,
+        date_from,
+        date_to,
+        max_amount: maxAmt,
+        exclude_auto: exclude ? 1 : 0,
+        limit: lim,
+        offset: off,
+        returned: rows.length,
+        total_found: filtered.length, // ✅ útil para “Mostrando X de Y”
+        max_fetch: MAX_FETCH,
+      },
+    });
+  } catch (err) {
+    console.error("ant-expenses-detail error:", err);
+    return res.status(500).json({ error: "Error obteniendo detalle" });
+  }
+});
+
+/* ========= HISTÓRICO DE COMPRA DE UN ÍTEM ========= */
+
+router.get("/item-purchase-history/:item_id", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+  const item_id = req.params.item_id;
+
+  const { date_from, date_to, limit } = req.query;
+
+  const topN = Number(limit) > 0 ? Number(limit) : 200;
+
+  // Default: último año
+  const now = new Date();
+  const defaultFrom = new Date(now.getFullYear() - 1, now.getMonth(), now.getDate())
+    .toISOString()
+    .split("T")[0];
+
+  const from = date_from || defaultFrom;
+  const to = date_to || now.toISOString().split("T")[0];
+
+  try {
+    const { data, error } = await supabase
+      .from("transaction_items")
+      .select(
+        `
+        item_id,
+        quantity,
+        unit_price_net,
+        unit_price_final,
+        line_total_final,
+        items ( name ),
+        transactions!inner (
+          id,
+          date,
+          type,
+          user_id,
+          description
+        )
+      `
+      )
+      .eq("transactions.user_id", user_id)
+      .eq("transactions.type", "expense")
+      .eq("item_id", item_id)
+      .gte("transactions.date", from)
+      .lte("transactions.date", to)
+      // ✅ IMPORTANTE: ordenar por tabla relacionada correctamente
+      .order("date", { foreignTable: "transactions", ascending: false })
+      .limit(topN);
+
+    if (error) {
+      console.error("❌ item-purchase-history supabase error:", error);
+      return res.status(500).json({
+        error: "No se pudo cargar el historial de compras de este artículo.",
+      });
+    }
+
+    const rows = (data || []).map((row) => {
+      const trx = row.transactions || {};
+      const qty = Number(row.quantity || 1);
+
+      // total de la línea
+      let lineTotal = 0;
+      if (row.line_total_final != null) {
+        lineTotal = Number(row.line_total_final) || 0;
+      } else {
+        const unit =
+          row.unit_price_final != null
+            ? Number(row.unit_price_final) || 0
+            : Number(row.unit_price_net) || 0;
+
+        lineTotal = unit * qty;
+      }
+
+      const unitPrice = qty > 0 ? lineTotal / qty : lineTotal;
+
+      return {
+        transaction_id: trx.id,
+        date: trx.date,
+        description: trx.description || "",
+        item_id: row.item_id,
+        item_name: row.items?.name || "Sin nombre",
+        quantity: Number(qty.toFixed(2)),
+        unit_price: Number(unitPrice.toFixed(2)),
+        total_paid: Number(lineTotal.toFixed(2)),
+      };
+    });
+
+    rows.sort((a, b) => {
+      if (a.date === b.date) {
+        return String(b.transaction_id || "").localeCompare(String(a.transaction_id || ""));
+      }
+      return String(b.date).localeCompare(String(a.date)); // desc
+    });
+
+    // summary útil para el modal
+    const totalSpent = rows.reduce((s, r) => s + (Number(r.total_paid) || 0), 0);
+    const totalQty = rows.reduce((s, r) => s + (Number(r.quantity) || 0), 0);
+    const avgUnit = totalQty > 0 ? totalSpent / totalQty : 0;
+
+    const minUnit = rows.length ? Math.min(...rows.map((r) => Number(r.unit_price) || 0)) : 0;
+    const maxUnit = rows.length ? Math.max(...rows.map((r) => Number(r.unit_price) || 0)) : 0;
+
+    return res.json({
+      success: true,
+      meta: {
+        item_id,
+        item_name: rows[0]?.item_name || "Sin nombre",
+        date_from: from,
+        date_to: to,
+        count: rows.length,
+        total_spent: Number(totalSpent.toFixed(2)),
+        total_quantity: Number(totalQty.toFixed(2)),
+        avg_unit_price: Number(avgUnit.toFixed(2)),
+        min_unit_price: Number(minUnit.toFixed(2)),
+        max_unit_price: Number(maxUnit.toFixed(2)),
+      },
+      data: rows,
+    });
+  } catch (err) {
+    console.error("❌ item-purchase-history crash:", err);
+    return res.status(500).json({
+      error: "Error interno consultando el historial de compras.",
+    });
+  }
+});
+
+
 
 module.exports = router;
