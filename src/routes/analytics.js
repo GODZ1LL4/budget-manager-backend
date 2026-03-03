@@ -1310,7 +1310,10 @@ router.get("/top-items", authenticateUser, async (req, res) => {
 router.get("/items-annual-summary", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
   const year = parseInt(req.query.year, 10) || new Date().getFullYear();
-  const limit = parseInt(req.query.limit, 10) || 50; // top 50 por defecto
+
+  // ✅ top opcional: si no viene, NO se limita
+  const topRaw = req.query.top;
+  const top = topRaw != null && topRaw !== "" ? parseInt(topRaw, 10) : null;
 
   const { start, end } = getYearRange(year);
 
@@ -1361,16 +1364,13 @@ router.get("/items-annual-summary", authenticateUser, async (req, res) => {
       if (row.line_total_final != null) {
         lineAmount = Number(row.line_total_final) || 0;
       } else {
-        // Fallback: mismo criterio que usas en otros reportes
         const netPrice = Number(row.unit_price_net || 0);
         const taxRate =
           itemRel.taxes?.rate != null ? Number(itemRel.taxes.rate) : 0;
         const isExempt = !!itemRel.taxes?.is_exempt;
 
         let priceWithTax = netPrice;
-        if (!isExempt && taxRate > 0) {
-          priceWithTax = netPrice * (1 + taxRate / 100);
-        }
+        if (!isExempt && taxRate > 0) priceWithTax = netPrice * (1 + taxRate / 100);
 
         lineAmount = priceWithTax * qty;
       }
@@ -1388,7 +1388,7 @@ router.get("/items-annual-summary", authenticateUser, async (req, res) => {
       aggregated[itemId].total_spent += lineAmount;
     });
 
-    const result = Object.values(aggregated)
+    let result = Object.values(aggregated)
       .map((row) => {
         const totalQty = row.total_quantity || 0;
         const totalSpent = row.total_spent || 0;
@@ -1402,15 +1402,17 @@ router.get("/items-annual-summary", authenticateUser, async (req, res) => {
           avg_price: Number(avgPrice.toFixed(2)),
         };
       })
-      .sort((a, b) => b.total_spent - a.total_spent) // orden por gasto
-      .slice(0, limit);
+      .sort((a, b) => b.total_spent - a.total_spent);
+
+    // ✅ aplica top SOLO si viene y es válido
+    if (Number.isFinite(top) && top > 0) {
+      result = result.slice(0, top);
+    }
 
     return res.json({ success: true, data: result });
   } catch (err) {
     console.error(err);
-    return res
-      .status(500)
-      .json({ error: "Error calculando resumen anual de ítems" });
+    return res.status(500).json({ error: "Error calculando resumen anual de ítems" });
   }
 });
 

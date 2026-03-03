@@ -61,75 +61,60 @@ function expandRuleToRange(rule, from, to) {
   if (rule.type !== "expense") return out;
   if (!rule.category_id) return out;
 
-  // rango efectivo
-  let current = dayjs(rule.start_date);
-  const end = rule.end_date ? dayjs(rule.end_date) : to;
+  const ruleStart = dayjs(rule.start_date);
 
-  // recortar al rango solicitado
-  if (current.isBefore(from)) current = from;
-  const hardEnd = end.isAfter(to) ? to : end;
+  const hasRange =
+    rule.end_date && dayjs(rule.start_date).isBefore(dayjs(rule.end_date));
 
-  // si la regla no tiene recurrence (puntual), se toma una sola vez si cae en el rango
-  if (!rule.recurrence) {
-    // Si hay un rango real (start..end), trátalo como diario
-    if (
-      rule.start_date &&
-      rule.end_date &&
-      dayjs(rule.start_date).isBefore(dayjs(rule.end_date))
-    ) {
-      let cursor = current;
-      while (cursor.isSameOrBefore(hardEnd)) {
-        if (rule.exclude_weekends) {
-          const d = cursor.day();
-          if (d === 0 || d === 6) {
-            cursor = cursor.add(1, "day");
-            continue;
-          }
-        }
-        out.push({
-          date: cursor.format("YYYY-MM-DD"),
-          amount: Number(rule.amount || 0),
-          category_id: rule.category_id,
-          category_name: rule.categories?.name || null,
-        });
-        cursor = cursor.add(1, "day");
-      }
-      return out;
-    }
+  let ruleEnd = null;
 
-    // Si no hay rango (evento puntual), una sola instancia si cae en el rango
-    if (current.isSameOrBefore(hardEnd)) {
-      if (rule.exclude_weekends) {
-        const day = current.day();
-        if (day === 0 || day === 6) return out;
-      }
-      out.push({
-        date: current.format("YYYY-MM-DD"),
-        amount: Number(rule.amount || 0),
-        category_id: rule.category_id,
-        category_name: rule.categories?.name || null,
-      });
-    }
-    return out;
+  if (rule.recurrence) {
+    ruleEnd = rule.end_date ? dayjs(rule.end_date) : to;
+  } else if (hasRange) {
+    ruleEnd = dayjs(rule.end_date);
+  } else {
+    ruleEnd = ruleStart; // puntual
   }
 
-  // recurrente
-  let cursor = current;
-  while (cursor.isSameOrBefore(hardEnd)) {
-    if (rule.exclude_weekends) {
-      const day = cursor.day();
-      if (day === 0 || day === 6) {
-        cursor = cursor.add(1, "day");
-        continue;
-      }
-    }
+  const hardEnd = ruleEnd.isAfter(to) ? to : ruleEnd;
+
+  if (hardEnd.isBefore(from)) return out;
+
+  const isWeekend = (d) => d.day() === 0 || d.day() === 6;
+
+  const pushInstance = (d) => {
     out.push({
-      date: cursor.format("YYYY-MM-DD"),
+      date: d.format("YYYY-MM-DD"),
       amount: Number(rule.amount || 0),
       category_id: rule.category_id,
       category_name: rule.categories?.name || null,
     });
-    cursor = addByRecurrence(cursor, rule.recurrence);
+  };
+
+  // 1) NO recurrence
+  if (!rule.recurrence) {
+    if (hasRange) {
+      let c = ruleStart.isBefore(from) ? from : ruleStart;
+      while (c.isSameOrBefore(hardEnd)) {
+        if (!rule.exclude_weekends || !isWeekend(c)) pushInstance(c);
+        c = c.add(1, "day");
+      }
+      return out;
+    }
+
+    // puntual: SOLO si cae dentro del rango (NO clamp)
+    if (ruleStart.isBefore(from) || ruleStart.isAfter(hardEnd)) return out;
+    if (!rule.exclude_weekends || !isWeekend(ruleStart)) pushInstance(ruleStart);
+    return out;
+  }
+
+  // 2) recurrence: mantener fase
+  let c = advanceToRangeStart(ruleStart, from, rule.recurrence);
+  if (c.isAfter(hardEnd)) return out;
+
+  while (c.isSameOrBefore(hardEnd)) {
+    if (!rule.exclude_weekends || !isWeekend(c)) pushInstance(c);
+    c = addByRecurrence(c, rule.recurrence);
   }
 
   return out;
