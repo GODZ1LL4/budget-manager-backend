@@ -2207,13 +2207,22 @@ router.get("/expense-by-weekday", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
   const rawYear = parseInt(req.query.year, 10);
-  const currentYear = new Date().getFullYear();
+  const now = new Date();
+  const currentYear = now.getFullYear();
+
   const year =
     Number.isFinite(rawYear) && rawYear >= 2000 && rawYear <= currentYear + 1
       ? rawYear
       : currentYear;
 
-  const { start, end } = getYearRange(year);
+  const start = `${year}-01-01`;
+
+  // Si es el año actual, el análisis llega solo hasta hoy.
+  // Si es un año pasado/futuro válido, usa cierre de año.
+  const end =
+    year === currentYear
+      ? now.toISOString().split("T")[0]
+      : `${year}-12-31`;
 
   const { data, error } = await supabase
     .from("transactions")
@@ -2235,8 +2244,6 @@ router.get("/expense-by-weekday", authenticateUser, async (req, res) => {
     { weekday: 6, label: "Sáb", total: 0, count: 0, days_in_period: 0 },
   ];
 
-  // Contar cuántas veces aparece cada día de semana en el rango del año
-  // (promedio por día calendario, no por transacción)
   const toISO = (d) => {
     const yyyy = d.getUTCFullYear();
     const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
@@ -2244,24 +2251,23 @@ router.get("/expense-by-weekday", authenticateUser, async (req, res) => {
     return `${yyyy}-${mm}-${dd}`;
   };
 
-  // start/end vienen como YYYY-MM-DD; iteramos seguro usando UTC
   const startDate = new Date(`${start}T00:00:00Z`);
   const endDate = new Date(`${end}T00:00:00Z`);
 
+  // Cuenta cuántas veces ocurrió cada weekday en el período real analizado
   for (
     let d = new Date(startDate);
     d <= endDate;
     d.setUTCDate(d.getUTCDate() + 1)
   ) {
     const iso = toISO(d);
-    const wd = weekdayFromISODate(iso); // 0..6, estable
+    const wd = weekdayFromISODate(iso);
     if (wd == null) continue;
     totals[wd].days_in_period += 1;
   }
 
-  // Agregar transacciones
   (data || []).forEach((tx) => {
-    const wd = weekdayFromISODate(tx.date); // ✅ estable, sin timezone
+    const wd = weekdayFromISODate(tx.date);
     if (wd == null) return;
 
     const amt = parseFloat(tx.amount);
@@ -2282,12 +2288,21 @@ router.get("/expense-by-weekday", authenticateUser, async (req, res) => {
       count: t.count,
       avg_txn: Number(avgTxn.toFixed(2)),
       avg_day: Number(avgDay.toFixed(2)),
-      days_in_period: t.days_in_period, // por si lo quieres mostrar
+      days_in_period: t.days_in_period,
     };
   });
 
-  return res.json({ success: true, data: result });
+  return res.json({
+    success: true,
+    data: result,
+    meta: {
+      year,
+      range: { start, end },
+      partial_year: year === currentYear,
+    },
+  });
 });
+
 
 // GET /api/analytics/budget-coverage?year=2026
 // Cobertura mensual REAL:
@@ -2630,92 +2645,282 @@ router.get(
 
     try {
       const now = new Date();
+      const year = now.getFullYear();
+      const monthIndex = now.getMonth();
+      const monthKey = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
+      const dateFromObj = new Date(year, monthIndex, 1);
+      const dateToObj = new Date(year, monthIndex + 1, 0);
+      const date_from = toISODate(dateFromObj);
+      const date_to = toISODate(dateToObj);
+      const today = now.toISOString().split("T")[0];
 
-      // 1) Rango de proyección (3 meses completos antes del mes actual)
-      const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-      const startDate = new Date(now.getFullYear(), now.getMonth() - 3, 1)
-        .toISOString()
-        .split("T")[0];
-      const endDate = currentMonthStart.toISOString().split("T")[0];
+      // Mantener defaults alineados con los parámetros del forecast guardados en frontend
+      const months = clampInt(req.query.months, 3, 1, 36);
+      const minOccurrences = clampInt(req.query.min_occurrences, 3, 2, 50);
+      const includeOccasional =
+        String(req.query.include_occasional ?? "false") === "true";
+      const includeNoise =
+        String(req.query.include_noise ?? "true") === "true";
+      const minIntervalDays = clampInt(req.query.min_interval_days, 3, 1, 365);
+      const maxIntervalDays = clampInt(
+        req.query.max_interval_days,
+        70,
+        minIntervalDays,
+        3650
+      );
+      const maxCoefVariation = Number.isFinite(
+        Number(req.query.max_coef_variation)
+      )
+        ? Number(req.query.max_coef_variation)
+        : 0.6;
+
+      const historyToObj = new Date(dateFromObj);
+      historyToObj.setDate(historyToObj.getDate() - 1);
+
+      const historyFromObj = new Date(dateFromObj);
+      historyFromObj.setMonth(historyFromObj.getMonth() - months);
+
+      const history_from = toISODate(historyFromObj);
+      const history_to = toISODate(historyToObj);
 
       const { data: history, error: histErr } = await supabase
         .from("transactions")
         .select(
-          "amount, type, date, category_id, categories(name, stability_type)"
+          `
+          id,
+          amount,
+          date,
+          category_id,
+          description,
+          categories:categories!transactions_category_id_fkey (
+            name,
+            stability_type
+          )
+        `
         )
         .eq("user_id", user_id)
         .eq("type", "expense")
-        .gte("date", startDate)
-        .lt("date", endDate);
+        .gte("date", history_from)
+        .lte("date", history_to);
 
       if (histErr) {
         console.error(histErr);
         return res.status(500).json({ error: histErr.message });
       }
 
-      // 2) Agrupar por categoría + stability + mes
-      const monthlyPerCategory = {};
+      const rawTxs = (history || [])
+        .map((tx) => ({
+          id: tx.id,
+          date: tx.date,
+          amount: Number(tx.amount) || 0,
+          category_id: tx.category_id,
+          category_name: tx.categories?.name || "Sin categoría",
+          category_stability: tx.categories?.stability_type || "variable",
+          description: tx.description || "",
+        }))
+        .filter((tx) => tx.amount > 0 && !!tx.date);
 
-      (history || []).forEach((tx) => {
-        const catName = tx.categories?.name || "Sin categoría";
-        const stability = tx.categories?.stability_type || "variable";
-        const month = tx.date.slice(0, 7);
+      const txs = rawTxs.filter((tx) =>
+        includeOccasional ? true : tx.category_stability !== "occasional"
+      );
 
-        // ignorar ocasionales
-        if (stability === "occasional") return;
+      const txsNorm = txs.map((tx) => ({
+        ...tx,
+        norm: normalizeText(tx.description),
+      }));
 
-        const key = `${catName}__${stability}__${month}`;
-        if (!monthlyPerCategory[key]) {
-          monthlyPerCategory[key] = {
-            category: catName,
-            stability_type: stability,
-            month,
-            total: 0,
-          };
-        }
-        monthlyPerCategory[key].total += parseFloat(tx.amount) || 0;
-      });
-
-      // 3) Agrupar por categoría+stability y guardar lista de totales mensuales
       const byCategory = {};
-      Object.values(monthlyPerCategory).forEach((entry) => {
-        const key = `${entry.category}__${entry.stability_type}`;
-        if (!byCategory[key]) {
-          byCategory[key] = {
-            category: entry.category,
-            stability_type: entry.stability_type,
-            monthlyTotals: [],
+      for (const tx of txsNorm) {
+        const catKey = String(tx.category_id || "sin_cat");
+        if (!byCategory[catKey]) byCategory[catKey] = [];
+        byCategory[catKey].push(tx);
+      }
+
+      const SIM_THRESHOLD = 0.45;
+      const clusters = [];
+
+      for (const catKey of Object.keys(byCategory)) {
+        const list = byCategory[catKey];
+        const catClusters = [];
+
+        for (const tx of list) {
+          const grams = trigrams(tx.norm || "");
+          let bestIdx = -1;
+          let bestScore = 0;
+
+          for (let i = 0; i < catClusters.length; i++) {
+            const score = jaccard(grams, catClusters[i].rep_grams);
+            if (score > bestScore) {
+              bestScore = score;
+              bestIdx = i;
+            }
+          }
+
+          if (bestIdx >= 0 && bestScore >= SIM_THRESHOLD) {
+            catClusters[bestIdx].entries.push(tx);
+            if (
+              (tx.norm || "").length >
+              (catClusters[bestIdx].rep_norm || "").length
+            ) {
+              catClusters[bestIdx].rep_norm = tx.norm;
+              catClusters[bestIdx].rep_grams = grams;
+            }
+          } else {
+            catClusters.push({
+              category_id: tx.category_id,
+              category_name: tx.category_name,
+              category_stability: tx.category_stability,
+              rep_norm: tx.norm,
+              rep_grams: grams,
+              entries: [tx],
+            });
+          }
+        }
+
+        clusters.push(...catClusters);
+      }
+
+      const recurringPatterns = [];
+      const recurringTxIds = new Set();
+
+      for (const c of clusters) {
+        const entries = c.entries;
+        if (!entries || entries.length < minOccurrences) continue;
+
+        entries.sort((a, b) => a.date.localeCompare(b.date));
+
+        const intervals = [];
+        for (let i = 1; i < entries.length; i++) {
+          const d = diffInDays(entries[i - 1].date, entries[i].date);
+          if (d > 0) intervals.push(d);
+        }
+        if (intervals.length < 2) continue;
+
+        const medInterval = median(intervals);
+        const mu = mean(intervals);
+        const sd = stdDev(intervals);
+        const coefVar = mu > 0 ? sd / mu : 999;
+
+        if (medInterval < minIntervalDays || medInterval > maxIntervalDays) {
+          continue;
+        }
+        if (coefVar > maxCoefVariation) continue;
+
+        const amounts = entries
+          .map((e) => e.amount)
+          .filter((a) => Number.isFinite(a) && a > 0);
+
+        const medAmount = median(amounts);
+        if (!Number.isFinite(medAmount) || medAmount <= 0) continue;
+
+        const last = entries[entries.length - 1];
+        const lastDate = last.date;
+
+        for (const e of entries) recurringTxIds.add(e.id);
+
+        recurringPatterns.push({
+          category: c.category_name,
+          stability_type: c.category_stability || "variable",
+          median_interval_days: Number(medInterval.toFixed(1)),
+          median_amount: Number(medAmount.toFixed(2)),
+          last_date: lastDate,
+        });
+      }
+
+      let noisePatterns = [];
+      if (includeNoise) {
+        const historyDays = Math.max(
+          1,
+          diffInDays(history_from, history_to) + 1
+        );
+        const targetDays = Math.max(1, diffInDays(date_from, date_to) + 1);
+
+        const noiseByCat = {};
+        for (const tx of txsNorm) {
+          if (recurringTxIds.has(tx.id)) continue;
+
+          const catKey = String(tx.category_id || "sin_cat");
+          if (!noiseByCat[catKey]) {
+            noiseByCat[catKey] = {
+              category_id: tx.category_id,
+              category_name: tx.category_name,
+              stability_type: tx.category_stability || "variable",
+              amounts: [],
+              total: 0,
+              count: 0,
+            };
+          }
+          noiseByCat[catKey].amounts.push(tx.amount);
+          noiseByCat[catKey].total += tx.amount;
+          noiseByCat[catKey].count += 1;
+        }
+
+        noisePatterns = Object.values(noiseByCat)
+          .map((c) => {
+            if (c.count < 3) return null;
+
+            const medAmount = median(c.amounts);
+            const meanPerDay = c.total / historyDays;
+            const projectedA = meanPerDay * targetDays;
+
+            const expectedCountRaw = (c.count / historyDays) * targetDays;
+            const expectedCount =
+              expectedCountRaw >= 0.75 ? Math.round(expectedCountRaw) : 0;
+
+            const projectedB =
+              expectedCount > 0 ? expectedCount * (Number(medAmount) || 0) : 0;
+
+            const projection = Math.min(projectedB, projectedA);
+            if (!Number.isFinite(projection) || projection <= 0) return null;
+
+            return {
+              category: c.category_name,
+              stability_type: c.stability_type,
+              projection: Number(projection.toFixed(2)),
+            };
+          })
+          .filter(Boolean);
+      }
+
+      const categoryForecastMap = {};
+
+      const ensureCategory = (category, stabilityType = "variable") => {
+        const key = `${category || "Sin categoría"}__${stabilityType}`;
+        if (!categoryForecastMap[key]) {
+          categoryForecastMap[key] = {
+            category: category || "Sin categoría",
+            stability_type: stabilityType,
+            expected_end_of_month: 0,
+            actual_month_to_date: 0,
           };
         }
-        byCategory[key].monthlyTotals.push(entry.total);
-      });
-
-      const median = (arr) => {
-        if (!arr || arr.length === 0) return 0;
-        const sorted = [...arr].sort((a, b) => a - b);
-        const n = sorted.length;
-        const mid = Math.floor(n / 2);
-        if (n % 2 === 1) return sorted[mid];
-        return (sorted[mid - 1] + sorted[mid]) / 2;
+        return categoryForecastMap[key];
       };
 
-      const projectedMap = {};
-      Object.values(byCategory).forEach((entry) => {
-        const projected = median(entry.monthlyTotals);
-        const key = `${entry.category}__${entry.stability_type}`;
-        projectedMap[key] = {
-          category: entry.category,
-          stability_type: entry.stability_type,
-          projected_monthly: projected,
-        };
-      });
+      for (const p of recurringPatterns) {
+        const interval = Math.max(1, Math.round(p.median_interval_days || 0));
+        const amount = Number(p.median_amount) || 0;
+        if (!interval || amount <= 0 || !p.last_date) continue;
 
-      // 4) Gasto real del mes actual
-      const year = now.getFullYear();
-      const monthIndex = now.getMonth();
-      const monthKey = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
-      const monthStart = `${monthKey}-01`;
-      const today = now.toISOString().split("T")[0];
+        const row = ensureCategory(p.category, p.stability_type);
+
+        const gap = diffInDays(p.last_date, date_from);
+        const n = gap > 0 ? Math.ceil(gap / interval) : 1;
+        let next = addDays(p.last_date, n * interval);
+
+        while (new Date(next) <= new Date(date_to)) {
+          row.expected_end_of_month += amount;
+          next = addDays(next, interval);
+        }
+      }
+
+      for (const p of noisePatterns) {
+        const projection = Number(p.projection) || 0;
+        if (projection <= 0) continue;
+
+        const row = ensureCategory(p.category, p.stability_type);
+        row.expected_end_of_month += projection;
+      }
 
       const { data: current, error: currErr } = await supabase
         .from("transactions")
@@ -2724,7 +2929,7 @@ router.get(
         )
         .eq("user_id", user_id)
         .eq("type", "expense")
-        .gte("date", monthStart)
+        .gte("date", date_from)
         .lte("date", today);
 
       if (currErr) {
@@ -2732,54 +2937,29 @@ router.get(
         return res.status(500).json({ error: currErr.message });
       }
 
-      const actualMap = {};
       (current || []).forEach((tx) => {
         const catName = tx.categories?.name || "Sin categoría";
         const stability = tx.categories?.stability_type || "variable";
-        const key = `${catName}__${stability}`;
-
-        if (!actualMap[key]) {
-          actualMap[key] = {
-            category: catName,
-            stability_type: stability,
-            actual_month_to_date: 0,
-          };
-        }
-
-        actualMap[key].actual_month_to_date += parseFloat(tx.amount) || 2;
+        const row = ensureCategory(catName, stability);
+        row.actual_month_to_date += parseFloat(tx.amount) || 0;
       });
 
-      // 5) Combinar proyección + real
-      const allKeys = new Set([
-        ...Object.keys(projectedMap),
-        ...Object.keys(actualMap),
-      ]);
-
-      const rows = [];
-      allKeys.forEach((key) => {
-        const proj = projectedMap[key];
-        const act = actualMap[key];
-
-        const category = proj?.category || act?.category || "Sin categoría";
-        const stability_type =
-          proj?.stability_type || act?.stability_type || "variable";
-
-        const projected_monthly = proj?.projected_monthly || 0;
-        const actual_month_to_date = act?.actual_month_to_date || 0;
-
+      const rows = Object.values(categoryForecastMap).map((row) => {
+        const projected_monthly = Number(row.expected_end_of_month || 0);
+        const actual_month_to_date = Number(row.actual_month_to_date || 0);
         const variance = actual_month_to_date - projected_monthly;
         const variance_pct =
           projected_monthly > 0 ? (variance / projected_monthly) * 100 : null;
 
-        rows.push({
-          category,
-          stability_type,
+        return {
+          category: row.category,
+          stability_type: row.stability_type,
           projected_monthly: Number(projected_monthly.toFixed(2)),
           actual_month_to_date: Number(actual_month_to_date.toFixed(2)),
           variance: Number(variance.toFixed(2)),
           variance_pct:
             variance_pct != null ? Number(variance_pct.toFixed(2)) : null,
-        });
+        };
       });
 
       rows.sort(
@@ -2790,7 +2970,12 @@ router.get(
 
       return res.json({
         success: true,
-        meta: { month: monthKey },
+        meta: {
+          month: monthKey,
+          forecast_logic: "expense-forecast",
+          history_from,
+          history_to,
+        },
         data: result,
       });
     } catch (err) {
@@ -4566,27 +4751,26 @@ router.get(
     const user_id = req.user.id;
 
     try {
-      // =========================
-      // 1) Mes actual (interno)
-      // =========================
       const now = new Date();
       const year = now.getFullYear();
-      const monthIndex = now.getMonth(); // 0-11
+      const monthIndex = now.getMonth();
       const monthKey = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
 
       const dateFromObj = new Date(year, monthIndex, 1);
       const dateToObj = new Date(year, monthIndex + 1, 0);
 
-      const date_from = toISODate(dateFromObj); // YYYY-MM-DD
-      const date_to = toISODate(dateToObj); // YYYY-MM-DD
-
+      const date_from = toISODate(dateFromObj);
+      const date_to = toISODate(dateToObj);
       const today = toISODate(now);
+
       const day_of_month = now.getDate();
       const days_in_month = dateToObj.getDate();
+      const remaining_days = Math.max(days_in_month - day_of_month, 0);
 
-      // =========================
-      // 2) Params (editables) - excepto fechas
-      // =========================
+      const tomorrowObj = new Date(now);
+      tomorrowObj.setDate(tomorrowObj.getDate() + 1);
+      const tomorrow = toISODate(tomorrowObj);
+
       const months = clampInt(req.query.months, 12, 1, 36);
       const minOccurrences = clampInt(req.query.min_occurrences, 3, 2, 50);
 
@@ -4608,12 +4792,8 @@ router.get(
         ? Number(req.query.max_coef_variation)
         : 0.6;
 
-      // =========================
-      // 3) Ventana histórica (N meses atrás) TERMINA antes del mes actual
-      //    Para evitar leakage, cortamos en el día anterior a date_from.
-      // =========================
       const historyToObj = new Date(dateFromObj);
-      historyToObj.setDate(historyToObj.getDate() - 1); // último día mes anterior
+      historyToObj.setDate(historyToObj.getDate() - 1);
 
       const historyFromObj = new Date(dateFromObj);
       historyFromObj.setMonth(historyFromObj.getMonth() - months);
@@ -4621,9 +4801,6 @@ router.get(
       const history_from = toISODate(historyFromObj);
       const history_to = toISODate(historyToObj);
 
-      // =========================
-      // 4) Traer transacciones históricas (expenses)
-      // =========================
       const { data, error } = await supabase
         .from("transactions")
         .select(
@@ -4661,20 +4838,15 @@ router.get(
         }))
         .filter((tx) => tx.amount > 0 && !!tx.date);
 
-      // filtrar ocasionales si no se incluyen
       const txs = rawTxs.filter((tx) =>
         includeOccasional ? true : tx.category_stability !== "occasional"
       );
 
-      // normalizar descripción
       const txsNorm = txs.map((tx) => ({
         ...tx,
         norm: normalizeText(tx.description),
       }));
 
-      // =========================
-      // 5) Clustering por categoría + similitud de descripción
-      // =========================
       const byCategory = {};
       for (const tx of txsNorm) {
         const catKey = String(tx.category_id || "sin_cat");
@@ -4683,7 +4855,7 @@ router.get(
       }
 
       const SIM_THRESHOLD = 0.45;
-      const clusters = []; // { category_id, category_name, rep_norm, rep_grams, entries: [] }
+      const clusters = [];
 
       for (const catKey of Object.keys(byCategory)) {
         const list = byCategory[catKey];
@@ -4704,7 +4876,6 @@ router.get(
 
           if (bestIdx >= 0 && bestScore >= SIM_THRESHOLD) {
             catClusters[bestIdx].entries.push(tx);
-            // Mantener representante más "informativo"
             if (
               (tx.norm || "").length >
               (catClusters[bestIdx].rep_norm || "").length
@@ -4726,9 +4897,6 @@ router.get(
         clusters.push(...catClusters);
       }
 
-      // =========================
-      // 6) Detectar patrones recurrentes
-      // =========================
       const recurringPatterns = [];
       const recurringTxIds = new Set();
 
@@ -4750,8 +4918,9 @@ router.get(
         const sd = stdDev(intervals);
         const coefVar = mu > 0 ? sd / mu : 999;
 
-        if (medInterval < minIntervalDays || medInterval > maxIntervalDays)
+        if (medInterval < minIntervalDays || medInterval > maxIntervalDays) {
           continue;
+        }
         if (coefVar > maxCoefVariation) continue;
 
         const amounts = entries
@@ -4778,9 +4947,6 @@ router.get(
         });
       }
 
-      // =========================
-      // 7) “Eventos / ruido” (no recurrentes) -> total mensual estimado
-      // =========================
       let noisePatterns = [];
       if (includeNoise) {
         const historyDays = Math.max(
@@ -4836,39 +5002,54 @@ router.get(
           .filter(Boolean);
       }
 
-      // =========================
-      // 8) Construir expectedDaily para el mes (YYYY-MM-DD)
-      //    - Recurrentes: seguir secuencia histórica (NO reinicio día 1)
-      //    - Eventos: distribución uniforme (suave)
-      // =========================
       const expectedDaily = {};
       for (let day = 1; day <= days_in_month; day++) {
         const d = `${monthKey}-${String(day).padStart(2, "0")}`;
         expectedDaily[d] = 0;
       }
 
-      // 8.1 Recurrentes -> continuar secuencia
-      //     Primer evento dentro del mes = last_date + n*interval donde sea >= date_from
+      const categoryForecastMap = {};
+
+      const ensureCategory = (category) => {
+        const key = category || "Sin categoría";
+        if (!categoryForecastMap[key]) {
+          categoryForecastMap[key] = {
+            category: key,
+            expected_to_date: 0,
+            expected_end_of_month: 0,
+            forecast_remaining: 0,
+            forecast_end_of_month: 0,
+            actual_to_date: 0,
+          };
+        }
+        return categoryForecastMap[key];
+      };
+
       for (const p of recurringPatterns) {
         const interval = Math.max(1, Math.round(p.median_interval_days || 0));
         const amount = Number(p.median_amount) || 0;
         if (!interval || amount <= 0 || !p.last_date) continue;
 
+        const row = ensureCategory(p.category);
+
         const gap = diffInDays(p.last_date, date_from);
-
-        // Si last_date está antes del mes: alineamos a la secuencia para que el primer "next" caiga dentro del mes.
-        // Si last_date es >= date_from (raro aquí porque histórico se corta antes), empezamos en el siguiente.
         const n = gap > 0 ? Math.ceil(gap / interval) : 1;
-
         let next = addDays(p.last_date, n * interval);
 
         while (new Date(next) <= new Date(date_to)) {
+          row.expected_end_of_month += amount;
           if (expectedDaily[next] != null) expectedDaily[next] += amount;
+
+          if (new Date(next) <= new Date(today)) {
+            row.expected_to_date += amount;
+          } else {
+            row.forecast_remaining += amount;
+          }
+
           next = addDays(next, interval);
         }
       }
 
-      // 8.2 Eventos -> distribución uniforme diaria
       const totalNoise = (noisePatterns || []).reduce(
         (s, r) => s + (Number(r.projection) || 0),
         0
@@ -4882,12 +5063,35 @@ router.get(
         }
       }
 
-      // =========================
-      // 9) Gastos reales del mes hasta HOY
-      // =========================
+      if (noisePatterns.length > 0) {
+        const elapsedRatio =
+          days_in_month > 0 ? day_of_month / days_in_month : 0;
+        const remainingRatio =
+          days_in_month > 0 ? remaining_days / days_in_month : 0;
+
+        noisePatterns.forEach((p) => {
+          const projection = Number(p.projection) || 0;
+          if (projection <= 0) return;
+
+          const row = ensureCategory(p.category);
+          row.expected_end_of_month += projection;
+          row.expected_to_date += projection * elapsedRatio;
+          row.forecast_remaining += projection * remainingRatio;
+        });
+      }
+
       const { data: expenses, error: expenseError } = await supabase
         .from("transactions")
-        .select("amount, date")
+        .select(
+          `
+          amount,
+          date,
+          category_id,
+          categories:categories!transactions_category_id_fkey (
+            name
+          )
+        `
+        )
         .eq("user_id", user_id)
         .eq("type", "expense")
         .gte("date", date_from)
@@ -4899,24 +5103,26 @@ router.get(
       }
 
       const actualDailyMap = {};
+
       (expenses || []).forEach((tx) => {
         const d = tx.date;
         const amt = Number(tx.amount) || 0;
+        const category = tx.categories?.name || "Sin categoría";
+        if (amt <= 0 || !d) return;
+
         if (!actualDailyMap[d]) actualDailyMap[d] = 0;
         actualDailyMap[d] += amt;
+
+        const row = ensureCategory(category);
+        row.actual_to_date += amt;
       });
 
-      // =========================
-      // 10) Series acumuladas (expected vs actual)
-      // =========================
       let cumulativeExpected = 0;
       let cumulativeActual = 0;
-
       const series = [];
 
       for (let day = 1; day <= days_in_month; day++) {
         const dateStr = `${monthKey}-${String(day).padStart(2, "0")}`;
-
         const exp = expectedDaily[dateStr] || 0;
         cumulativeExpected += exp;
 
@@ -4932,17 +5138,92 @@ router.get(
         });
       }
 
-      const expected_total =
-        series[days_in_month - 1]?.expected_cumulative || 0;
-      const expected_to_date =
-        series[day_of_month - 1]?.expected_cumulative || 0;
-      const actual_to_date = series[day_of_month - 1]?.actual_cumulative || 0;
+      const category_breakdown = Object.values(categoryForecastMap)
+        .map((row) => {
+          const expected_to_date = Number(row.expected_to_date || 0);
+          const expected_end_of_month = Number(row.expected_end_of_month || 0);
+          const actual_to_date = Number(row.actual_to_date || 0);
+          const forecast_remaining = Number(row.forecast_remaining || 0);
+          const forecast_end_of_month = actual_to_date + forecast_remaining;
 
-      const projected_end_of_month =
-        day_of_month > 0 ? (actual_to_date / day_of_month) * days_in_month : 0;
+          const variance_to_date = actual_to_date - expected_to_date;
+          const variance_to_date_pct =
+            expected_to_date > 0
+              ? (variance_to_date / expected_to_date) * 100
+              : null;
 
-      const variance_to_expected = actual_to_date - expected_to_date;
-      const variance_to_expected_end = projected_end_of_month - expected_total;
+          const variance_to_end = forecast_end_of_month - expected_end_of_month;
+          const variance_to_end_pct =
+            expected_end_of_month > 0
+              ? (variance_to_end / expected_end_of_month) * 100
+              : null;
+
+          return {
+            category: row.category,
+            expected_to_date: Number(expected_to_date.toFixed(2)),
+            actual_to_date: Number(actual_to_date.toFixed(2)),
+            variance_to_date: Number(variance_to_date.toFixed(2)),
+            variance_to_date_pct:
+              variance_to_date_pct != null
+                ? Number(variance_to_date_pct.toFixed(2))
+                : null,
+            expected_end_of_month: Number(expected_end_of_month.toFixed(2)),
+            forecast_remaining: Number(forecast_remaining.toFixed(2)),
+            forecast_end_of_month: Number(forecast_end_of_month.toFixed(2)),
+            variance_to_end: Number(variance_to_end.toFixed(2)),
+            variance_to_end_pct:
+              variance_to_end_pct != null
+                ? Number(variance_to_end_pct.toFixed(2))
+                : null,
+            status:
+              variance_to_date > 0
+                ? "over"
+                : variance_to_date < 0
+                ? "under"
+                : "on_track",
+          };
+        })
+        .filter(
+          (row) =>
+            row.expected_to_date > 0 ||
+            row.actual_to_date > 0 ||
+            row.expected_end_of_month > 0 ||
+            row.forecast_end_of_month > 0
+        )
+        .sort((a, b) => b.variance_to_date - a.variance_to_date);
+
+      const totals = category_breakdown.reduce(
+        (acc, row) => {
+          acc.expected_to_date += row.expected_to_date || 0;
+          acc.actual_to_date += row.actual_to_date || 0;
+          acc.expected_end_of_month += row.expected_end_of_month || 0;
+          acc.forecast_remaining += row.forecast_remaining || 0;
+          acc.forecast_end_of_month += row.forecast_end_of_month || 0;
+          return acc;
+        },
+        {
+          expected_to_date: 0,
+          actual_to_date: 0,
+          expected_end_of_month: 0,
+          forecast_remaining: 0,
+          forecast_end_of_month: 0,
+        }
+      );
+
+      const totals_variance_to_date =
+        totals.actual_to_date - totals.expected_to_date;
+      const totals_variance_to_end =
+        totals.forecast_end_of_month - totals.expected_end_of_month;
+
+      const summary = {
+        expected_total: Number(totals.expected_end_of_month.toFixed(2)),
+        expected_to_date: Number(totals.expected_to_date.toFixed(2)),
+        actual_to_date: Number(totals.actual_to_date.toFixed(2)),
+        forecast_remaining: Number(totals.forecast_remaining.toFixed(2)),
+        forecast_end_of_month: Number(totals.forecast_end_of_month.toFixed(2)),
+        variance_to_expected: Number(totals_variance_to_date.toFixed(2)),
+        variance_to_expected_end: Number(totals_variance_to_end.toFixed(2)),
+      };
 
       return res.json({
         success: true,
@@ -4951,15 +5232,13 @@ router.get(
           today,
           days_in_month,
           day_of_month,
-
-          expected_total: Number(expected_total.toFixed(2)),
-          expected_to_date: Number(expected_to_date.toFixed(2)),
-          actual_to_date: Number(actual_to_date.toFixed(2)),
-
-          projected_end_of_month: Number(projected_end_of_month.toFixed(2)),
-          variance_to_expected: Number(variance_to_expected.toFixed(2)),
-          variance_to_expected_end: Number(variance_to_expected_end.toFixed(2)),
-
+          remaining_days,
+          expected_total: summary.expected_total,
+          expected_to_date: summary.expected_to_date,
+          actual_to_date: summary.actual_to_date,
+          projected_end_of_month: summary.forecast_end_of_month,
+          variance_to_expected: summary.variance_to_expected,
+          variance_to_expected_end: summary.variance_to_expected_end,
           params_used: {
             months,
             min_occurrences: minOccurrences,
@@ -4969,16 +5248,38 @@ router.get(
             max_interval_days: maxIntervalDays,
             max_coef_variation: maxCoefVariation,
           },
-
           meta: {
             date_from,
             date_to,
+            today,
+            tomorrow: tomorrow <= date_to ? tomorrow : null,
             history_from,
             history_to,
             recurring_patterns_count: recurringPatterns.length,
             noise_month_total: Number(totalNoise.toFixed(2)),
           },
-
+          category_breakdown,
+          category_totals: {
+            expected_to_date: Number(totals.expected_to_date.toFixed(2)),
+            actual_to_date: Number(totals.actual_to_date.toFixed(2)),
+            variance_to_date: Number(totals_variance_to_date.toFixed(2)),
+            variance_to_date_pct:
+              totals.expected_to_date > 0
+                ? Number(
+                    ((totals_variance_to_date / totals.expected_to_date) * 100).toFixed(2)
+                  )
+                : null,
+            expected_end_of_month: Number(totals.expected_end_of_month.toFixed(2)),
+            forecast_remaining: Number(totals.forecast_remaining.toFixed(2)),
+            forecast_end_of_month: Number(totals.forecast_end_of_month.toFixed(2)),
+            variance_to_end: Number(totals_variance_to_end.toFixed(2)),
+            variance_to_end_pct:
+              totals.expected_end_of_month > 0
+                ? Number(
+                    ((totals_variance_to_end / totals.expected_end_of_month) * 100).toFixed(2)
+                  )
+                : null,
+          },
           series,
         },
       });
@@ -4991,6 +5292,8 @@ router.get(
     }
   }
 );
+
+
 
 /**
  * GET /analytics/income-vs-expense-monthly?months=6
@@ -5057,6 +5360,88 @@ router.get("/income-vs-expense-monthly", authenticateUser, async (req, res) => {
     return res.json({ success: true, data: result });
   } catch (err) {
     console.error("Error inesperado income-vs-expense-monthly:", err);
+    return res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
+
+/**
+ * GET /analytics/daily-expense-by-month?year=2026&month=3
+ * Devuelve una serie diaria completa del mes:
+ * [{ day: 1, date: "2026-03-01", expense: 1000 }, ...]
+ */
+router.get("/daily-expense-by-month", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  const now = new Date();
+  const currentYear = now.getFullYear();
+
+  const rawYear = parseInt(req.query.year, 10);
+  const rawMonth = parseInt(req.query.month, 10);
+
+  const year =
+    Number.isFinite(rawYear) && rawYear >= 2000 && rawYear <= currentYear + 1
+      ? rawYear
+      : currentYear;
+
+  const month =
+    Number.isFinite(rawMonth) && rawMonth >= 1 && rawMonth <= 12
+      ? rawMonth
+      : now.getMonth() + 1;
+
+  const monthIndex = month - 1;
+  const { start, end } = getMonthDateRange(year, monthIndex);
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const monthKey = `${year}-${String(month).padStart(2, "0")}`;
+
+  try {
+    const { data, error } = await supabase
+      .from("transactions")
+      .select("amount, date")
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .gte("date", start)
+      .lte("date", end);
+
+    if (error) {
+      console.error("Error daily-expense-by-month:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    const dailyMap = {};
+
+    for (let day = 1; day <= daysInMonth; day++) {
+      const date = `${monthKey}-${String(day).padStart(2, "0")}`;
+      dailyMap[date] = 0;
+    }
+
+    (data || []).forEach((tx) => {
+      const dateKey = tx.date;
+      const amount = Number(tx.amount) || 0;
+      if (!dateKey || !Object.prototype.hasOwnProperty.call(dailyMap, dateKey)) {
+        return;
+      }
+      dailyMap[dateKey] += amount;
+    });
+
+    const result = Object.entries(dailyMap).map(([date, expense]) => ({
+      day: Number(date.slice(8, 10)),
+      date,
+      expense: Number(expense.toFixed(2)),
+    }));
+
+    return res.json({
+      success: true,
+      data: result,
+      meta: {
+        year,
+        month,
+        month_key: monthKey,
+        days_in_month: daysInMonth,
+        range: { start, end },
+      },
+    });
+  } catch (err) {
+    console.error("Error inesperado daily-expense-by-month:", err);
     return res.status(500).json({ error: "Error interno del servidor" });
   }
 });
