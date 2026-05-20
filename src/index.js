@@ -1,3 +1,5 @@
+//backend\src\index.js
+
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
@@ -13,9 +15,6 @@ app.use(express.json());
 app.get("/", (req, res) => {
   res.send("API de Presupuesto Personal 🚀");
 });
-
-// Aquí se cargarán más rutas
-// app.use('/api/transactions', require('./routes/transactions'));
 
 const categoriesRoute = require("./routes/categories");
 app.use("/api/categories", categoriesRoute);
@@ -56,7 +55,13 @@ app.use("/api/items-with-price", itemsWithPriceRoutes);
 const scenariosRoutes = require("./routes/scenarios");
 app.use("/api/scenarios", scenariosRoutes);
 
+// Nuevas rutas premium
 
+const billingRoutes = require("./routes/billing");
+app.use("/api/billing", billingRoutes);
+
+const subscriptionAccessRoutes = require("./routes/subscriptionAccess");
+app.use("/api/me/subscription-access", subscriptionAccessRoutes);
 
 app.listen(PORT, () => {
   console.log(`Servidor corriendo en http://localhost:${PORT}`);

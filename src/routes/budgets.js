@@ -434,7 +434,51 @@ router.post("/", authenticateUser, async (req, res) => {
   res.status(201).json({ success: true, data });
 });
 
-// DELETE /budgets/:id — Eliminar presupuesto
+// PUT /budgets/:id - Actualizar monto del presupuesto
+router.put("/:id", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+  const { id } = req.params;
+  const { limit_amount } = req.body;
+
+  const numericLimit = Number(limit_amount);
+  if (!Number.isFinite(numericLimit) || numericLimit < 0) {
+    return res.status(400).json({ error: "Limite invalido." });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("budgets")
+      .update({ limit_amount: numericLimit })
+      .eq("id", id)
+      .eq("user_id", user_id)
+      .select("id, month, limit_amount, category_id, categories (name)")
+      .maybeSingle();
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    if (!data) {
+      return res.status(404).json({ error: "Presupuesto no encontrado." });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        id: data.id,
+        category_id: data.category_id,
+        category_name: data.categories?.name || "Sin nombre",
+        month: data.month,
+        limit: parseFloat(data.limit_amount),
+      },
+    });
+  } catch (err) {
+    console.log("Error inesperado en PUT /budgets/:id:", err);
+    res.status(500).json({ error: "Error inesperado actualizando presupuesto" });
+  }
+});
+
+// DELETE /budgets/:id - Eliminar presupuesto
 router.delete("/:id", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
   const { id } = req.params;

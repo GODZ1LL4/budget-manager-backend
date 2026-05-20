@@ -49,6 +49,47 @@ function computeHistoryRange({ focusedMonthStart, months }) {
   };
 }
 
+function resolveFocusedMonthRange({ focused = null, month = null, start = null, end = null }) {
+  if (month && /^\d{4}-\d{2}$/.test(month)) {
+    const base = dayjs(`${month}-01`, "YYYY-MM-DD", true);
+    if (base.isValid()) {
+      return {
+        rangeStartObj: base.startOf("month"),
+        rangeEndObj: base.endOf("month"),
+      };
+    }
+  }
+
+  if (focused) {
+    const base = dayjs(focused, "YYYY-MM-DD", true);
+    if (base.isValid()) {
+      return {
+        rangeStartObj: base.startOf("month"),
+        rangeEndObj: base.endOf("month"),
+      };
+    }
+  }
+
+  if (start && end) {
+    const gridStart = dayjs(start, "YYYY-MM-DD", true);
+    const gridEndExclusive = dayjs(end, "YYYY-MM-DD", true);
+
+    if (gridStart.isValid() && gridEndExclusive.isValid()) {
+      const visibleMonth = gridStart.add(
+        Math.max(gridEndExclusive.diff(gridStart, "day") - 1, 0) / 2,
+        "day"
+      );
+
+      return {
+        rangeStartObj: visibleMonth.startOf("month"),
+        rangeEndObj: visibleMonth.endOf("month"),
+      };
+    }
+  }
+
+  return null;
+}
+
 
 
 /**
@@ -977,27 +1018,20 @@ router.get("/:id/advanced-forecast/preview", authenticateUser, async (req, res) 
       const focused = req.query.focused || null;
       const month = req.query.month || null;
 
-      let rangeStartObj = null;
-      let rangeEndObj = null;
+      const resolvedRange = resolveFocusedMonthRange({
+        focused,
+        month,
+        start: req.query.start,
+        end: req.query.end,
+      });
 
-      if (month && /^\d{4}-\d{2}$/.test(month)) {
-        rangeStartObj = dayjs(`${month}-01`).startOf("month");
-        rangeEndObj = dayjs(`${month}-01`).endOf("month");
-      } else if (focused) {
-        rangeStartObj = dayjs(focused).startOf("month");
-        rangeEndObj = dayjs(focused).endOf("month");
-      } else {
-        // fallback al grid si no mandan focused/month
-        const start = req.query.start;
-        const endExcl = req.query.end;
-        if (!start || !endExcl) {
-          return res
-            .status(400)
-            .json({ error: "focused o month o start/end son requeridos" });
-        }
-        rangeStartObj = dayjs(start);
-        rangeEndObj = dayjs(endExcl).subtract(1, "day"); // end exclusivo -> inclusivo
+      if (!resolvedRange) {
+        return res
+          .status(400)
+          .json({ error: "focused o month o start/end válidos son requeridos" });
       }
+
+      const { rangeStartObj, rangeEndObj } = resolvedRange;
 
       const rangeStart = rangeStartObj.format("YYYY-MM-DD");
       const rangeEnd = rangeEndObj.format("YYYY-MM-DD");
@@ -1190,24 +1224,20 @@ router.post(
 
       // Prioridad: month/focused -> mes real.
       // Fallback: start/end (compatibilidad)
-      let rangeStartObj = null;
-      let rangeEndObj = null;
+      const resolvedRange = resolveFocusedMonthRange({
+        focused,
+        month,
+        start,
+        end,
+      });
 
-      if (month && /^\d{4}-\d{2}$/.test(month)) {
-        rangeStartObj = dayjs(`${month}-01`).startOf("month");
-        rangeEndObj = dayjs(`${month}-01`).endOf("month");
-      } else if (focused) {
-        rangeStartObj = dayjs(focused).startOf("month");
-        rangeEndObj = dayjs(focused).endOf("month");
-      } else if (start && end) {
-        // compat (si te mandan mes ya recortado)
-        rangeStartObj = dayjs(start);
-        rangeEndObj = dayjs(end);
-      } else {
+      if (!resolvedRange) {
         return res
           .status(400)
-          .json({ error: "focused o month o start/end son requeridos" });
+          .json({ error: "focused o month o start/end válidos son requeridos" });
       }
+
+      const { rangeStartObj, rangeEndObj } = resolvedRange;
 
       const rangeStart = rangeStartObj.format("YYYY-MM-DD");
       const rangeEnd = rangeEndObj.format("YYYY-MM-DD");
