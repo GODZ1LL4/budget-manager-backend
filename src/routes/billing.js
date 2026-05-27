@@ -152,11 +152,19 @@ router.post("/google-play/confirm", authenticateUser, async (req, res) => {
   const {
     productId,
     purchaseToken,
+    productType = "subs",
   } = req.body;
 
   if (!productId || !purchaseToken) {
     return res.status(400).json({
       error: "productId y purchaseToken son obligatorios",
+    });
+  }
+
+  if (productType !== "subs") {
+    return res.status(400).json({
+      error:
+        "El backend actual valida Premium como suscripcion de Google Play. Configura VITE_GOOGLE_PLAY_BILLING_PRODUCT_TYPE=subs.",
     });
   }
 

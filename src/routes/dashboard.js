@@ -3,6 +3,13 @@ const express = require("express");
 const router = express.Router();
 const supabase = require("../lib/supabase");
 const authenticateUser = require("../middlewares/auth");
+const {
+  addMonthsToMonthKey,
+  getCurrentMonthRange,
+  getMonthRange,
+  getRequestDateKey,
+  getRequestTimeZone,
+} = require("../lib/timeZone");
 
 /* ============================================================
    GET: RESUMEN DASHBOARD
@@ -10,17 +17,15 @@ const authenticateUser = require("../middlewares/auth");
 router.get("/summary", authenticateUser, async (req, res) => {
   const user_id = req.user?.id;
 
-  // ✅ Normalizar "now" a RD (GMT-4) para evitar desfaces de mes/día
-  const userTZOffset = -4;
-  const nowUtc = new Date();
-  const now = new Date(nowUtc.getTime() + userTZOffset * 60 * 60 * 1000);
+  // Resolve "today" and the current month in the caller's IANA time zone.
+  const timeZone = getRequestTimeZone(req);
+  const currentRange = getCurrentMonthRange(new Date(), timeZone);
 
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const year = currentRange.year;
+  const month = String(currentRange.month).padStart(2, "0");
 
-  const start = `${year}-${month}-01`;
-  const lastDay = new Date(year, now.getMonth() + 1, 0).getDate();
-  const end = `${year}-${month}-${String(lastDay).padStart(2, "0")}`;
+  const start = currentRange.start;
+  const end = currentRange.end;
 
   try {
     /* ------------------------------------------------------------
@@ -57,15 +62,14 @@ router.get("/summary", authenticateUser, async (req, res) => {
     const savingRate =
       totalIncome > 0 ? (1 - totalExpense / totalIncome) * 100 : 0;
 
-    const daysPassed = now.getDate();
+    const daysPassed = currentRange.day;
     const averageDailyExpense = daysPassed > 0 ? totalExpense / daysPassed : 0;
 
     /* ------------------------------------------------------------
        2) GASTO MENSUAL PROMEDIO (ÚLTIMOS 3 MESES, FIJOS/VARIABLES)
        ------------------------------------------------------------ */
     const pastMonths = Array.from({ length: 3 }).map((_, i) => {
-      const d = new Date(year, now.getMonth() - (i + 1), 1);
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      return addMonthsToMonthKey(currentRange.currentMonthKey, -(i + 1));
     });
 
     const { data: pastTx, error: pastErr } = await supabase
@@ -95,18 +99,11 @@ router.get("/summary", authenticateUser, async (req, res) => {
        3) MES ANTERIOR (COMPARACIÓN)
        ------------------------------------------------------------ */
     // ✅ Esto maneja el cambio de año automáticamente (Enero -> Diciembre del año anterior)
-    const prevDate = new Date(year, now.getMonth() - 1, 1);
-    const prevMonth = `${prevDate.getFullYear()}-${String(
-      prevDate.getMonth() + 1
-    ).padStart(2, "0")}`;
+    const prevMonth = addMonthsToMonthKey(currentRange.currentMonthKey, -1);
+    const prevRange = getMonthRange(prevMonth);
 
-    const prevStart = `${prevMonth}-01`;
-    const prevLastDay = new Date(
-      prevDate.getFullYear(),
-      prevDate.getMonth() + 1,
-      0
-    ).getDate();
-    const prevEnd = `${prevMonth}-${String(prevLastDay).padStart(2, "0")}`;
+    const prevStart = prevRange.start;
+    const prevEnd = prevRange.end;
 
     const { data: prevTx, error: prevErr } = await supabase
       .from("transactions")
@@ -446,10 +443,7 @@ router.get("/summary", authenticateUser, async (req, res) => {
 router.get("/today-expense", authenticateUser, async (req, res) => {
   const user_id = req.user?.id;
 
-  const userTZOffset = -4; // RD está en GMT-4
-  const now = new Date();
-  const localTime = new Date(now.getTime() + userTZOffset * 60 * 60 * 1000);
-  const today = localTime.toISOString().split("T")[0];
+  const today = getRequestDateKey(req);
 
   try {
     const { data, error } = await supabase
@@ -482,16 +476,13 @@ router.get("/transactions-by-category", authenticateUser, async (req, res) => {
 
   if (!category_id) return res.status(400).json({ error: "Falta category_id" });
 
-  // ✅ Usar mismo "now" en RD para coherencia mensual
-  const userTZOffset = -4;
-  const nowUtc = new Date();
-  const now = new Date(nowUtc.getTime() + userTZOffset * 60 * 60 * 1000);
-
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const start = `${year}-${month}-01`;
-  const lastDay = new Date(year, now.getMonth() + 1, 0).getDate();
-  const end = `${year}-${month}-${String(lastDay).padStart(2, "0")}`;
+  // Use the same caller time zone for the current-month drilldown.
+  const currentRange = getCurrentMonthRange(
+    new Date(),
+    getRequestTimeZone(req)
+  );
+  const start = currentRange.start;
+  const end = currentRange.end;
 
   try {
     const { data, error } = await supabase

@@ -3,6 +3,7 @@ const router = express.Router();
 const supabase = require("../lib/supabase");
 const authenticateUser = require("../middlewares/auth");
 const upload = require("../lib/upload"); 
+const { getRequestDateKey } = require("../lib/timeZone");
 
 router.get("/", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -69,9 +70,7 @@ const csvContent = [header.join(";"), ...rows].join("\n");
 res.setHeader("Content-Type", "text/csv; charset=utf-8");
 res.setHeader(
   "Content-Disposition",
-  `attachment; filename="precios-articulos-${new Date()
-    .toISOString()
-    .split("T")[0]}.csv"`
+  `attachment; filename="precios-articulos-${getRequestDateKey(req)}.csv"`
 );
 
 return res.status(200).send(csvContent);
@@ -165,7 +164,7 @@ router.post("/import-prices",
           continue;
         }
 
-        let date = new Date().toISOString().split("T")[0]; // por defecto hoy
+        let date = getRequestDateKey(req); // por defecto hoy
 
         if (row.fechaStr) {
           // asumimos YYYY-MM-DD

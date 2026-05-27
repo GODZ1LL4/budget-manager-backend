@@ -4,6 +4,7 @@ const router = express.Router();
 const supabase = require("../lib/supabase");
 const authenticateUser = require("../middlewares/auth");
 const dayjs = require("dayjs");
+const { getRequestDateKey } = require("../lib/timeZone");
 
 // ---------------------------
 // Helpers
@@ -143,7 +144,7 @@ function* generateOccurrences({ tx, start, endInclusive, fromDate }) {
 router.post("/run-daily-recurring", authenticateUser, async (req, res) => {
   try {
     const user_id = req.user.id;
-    const today = dayjs().startOf("day");
+    const today = dayjs(getRequestDateKey(req)).startOf("day");
 
     // 1) Fetch recurring templates
     const { data: recTxs, error } = await supabase

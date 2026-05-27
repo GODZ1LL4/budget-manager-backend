@@ -438,7 +438,7 @@ router.post("/", authenticateUser, async (req, res) => {
 router.put("/:id", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
   const { id } = req.params;
-  const { limit_amount } = req.body;
+  const { limit_amount, category_id, month } = req.body;
 
   const numericLimit = Number(limit_amount);
   if (!Number.isFinite(numericLimit) || numericLimit < 0) {
@@ -446,7 +446,7 @@ router.put("/:id", authenticateUser, async (req, res) => {
   }
 
   try {
-    const { data, error } = await supabase
+    let { data, error } = await supabase
       .from("budgets")
       .update({ limit_amount: numericLimit })
       .eq("id", id)
@@ -458,8 +458,44 @@ router.put("/:id", authenticateUser, async (req, res) => {
       return res.status(500).json({ error: error.message });
     }
 
+    if (!data && category_id && month) {
+      const { data: budgetByNaturalKey, error: lookupError } = await supabase
+        .from("budgets")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("category_id", category_id)
+        .eq("month", month)
+        .maybeSingle();
+
+      if (lookupError) {
+        return res.status(500).json({ error: lookupError.message });
+      }
+
+      if (budgetByNaturalKey?.id) {
+        const fallbackUpdate = await supabase
+          .from("budgets")
+          .update({ limit_amount: numericLimit })
+          .eq("id", budgetByNaturalKey.id)
+          .eq("user_id", user_id)
+          .select("id, month, limit_amount, category_id, categories (name)")
+          .maybeSingle();
+
+        if (fallbackUpdate.error) {
+          return res.status(500).json({ error: fallbackUpdate.error.message });
+        }
+
+        data = fallbackUpdate.data;
+      }
+    }
+
     if (!data) {
-      return res.status(404).json({ error: "Presupuesto no encontrado." });
+      return res.status(404).json({
+        error: "Presupuesto no encontrado.",
+        code: "BUDGET_NOT_FOUND",
+        budget_id: id,
+        category_id: category_id || null,
+        month: month || null,
+      });
     }
 
     res.json({
