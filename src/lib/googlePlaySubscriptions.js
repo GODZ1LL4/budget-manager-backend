@@ -19,13 +19,6 @@ function createSubscriptionError(message, { statusCode, stage, details } = {}) {
   return error;
 }
 
-function summarizePurchaseToken(purchaseToken) {
-  if (!purchaseToken) return null;
-  const value = String(purchaseToken);
-
-  return `${value.slice(0, 8)}...${value.slice(-6)}`;
-}
-
 function stripWrappingQuotes(value) {
   const trimmed = String(value || "").trim();
 
@@ -115,21 +108,6 @@ function isGooglePlayConfigured() {
   return Boolean(
     config.clientEmail && config.privateKey && config.packageName
   );
-}
-
-function getGooglePlayConfigSummary() {
-  const config = getGooglePlayConfig();
-
-  return {
-    clientEmail: config.clientEmail || null,
-    packageName: config.packageName || null,
-    privateKeyStartsCorrectly: config.privateKey.startsWith(
-      "-----BEGIN PRIVATE KEY-----"
-    ),
-    privateKeyEndsCorrectly: config.privateKey
-      .trim()
-      .endsWith("-----END PRIVATE KEY-----"),
-  };
 }
 
 async function getGoogleAccessToken() {
@@ -438,9 +416,7 @@ async function refreshStoredSubscriptionAccess(subscriptionRow) {
 module.exports = {
   isGooglePlayConfigured,
   isSubscriptionEntitled,
-  getGooglePlayConfigSummary,
   refreshStoredSubscriptionAccess,
-  summarizePurchaseToken,
   upsertSubscriptionRecord,
   verifyAndStoreGooglePlaySubscription,
 };

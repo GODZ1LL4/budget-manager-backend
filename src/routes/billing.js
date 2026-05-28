@@ -3,59 +3,11 @@ const router = express.Router();
 const supabase = require("../lib/supabase");
 const authenticateUser = require("../middlewares/auth");
 const {
-  getGooglePlayConfigSummary,
   isGooglePlayConfigured,
-  summarizePurchaseToken,
   upsertSubscriptionRecord,
   verifyAndStoreGooglePlaySubscription,
 } = require("../lib/googlePlaySubscriptions");
 const { verifyPubSubPushJwt } = require("../lib/pubsubPushAuth");
-
-function decodeJwtRole(token) {
-  try {
-    const payload = String(token || "").split(".")[1];
-    if (!payload) return null;
-
-    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
-    const decoded = JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
-
-    return decoded?.role || null;
-  } catch {
-    return null;
-  }
-}
-
-function logBillingError(context, error, extra = {}) {
-  console.error(
-    `[billing] ${context} failed`,
-    JSON.stringify({
-      message: error?.message || null,
-      stage: error?.stage || null,
-      statusCode: error?.statusCode || null,
-      details: error?.details || error?.googlePayload || null,
-      ...extra,
-    })
-  );
-}
-
-router.get("/google-play/diagnostics", authenticateUser, (req, res) => {
-  const supabaseWriteKey =
-    process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_API_KEY;
-
-  return res.json({
-    success: true,
-    data: {
-      googlePlayConfigured: isGooglePlayConfigured(),
-      googlePlayConfig: getGooglePlayConfigSummary(),
-      hasGooglePlayPackageName: Boolean(process.env.GOOGLE_PLAY_PACKAGE_NAME),
-      hasGooglePlayClientEmail: Boolean(process.env.GOOGLE_PLAY_CLIENT_EMAIL),
-      hasGooglePlayPrivateKey: Boolean(process.env.GOOGLE_PLAY_PRIVATE_KEY),
-      hasSupabaseServiceRoleKey: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
-      supabaseWriteKeyRole: decodeJwtRole(supabaseWriteKey),
-      nodeVersion: process.version,
-    },
-  });
-});
 
 router.post("/google-play/rtdn", async (req, res) => {
   const expectedRtdnToken = process.env.GOOGLE_PLAY_RTND_TOKEN;
@@ -190,8 +142,6 @@ router.post("/google-play/rtdn", async (req, res) => {
   } catch (rtndError) {
     return res.status(rtndError.statusCode || 500).json({
       error: rtndError.message || "No se pudo procesar la RTDN",
-      stage: rtndError.stage || null,
-      details: rtndError.details || rtndError.googlePayload || null,
     });
   }
 });
@@ -218,20 +168,9 @@ router.post("/google-play/confirm", authenticateUser, async (req, res) => {
   }
 
   if (!isGooglePlayConfigured()) {
-    logBillingError(
-      "google-play-confirm-config",
-      new Error("Google Play no esta configurado en el backend"),
-      {
-        hasGooglePlayPackageName: Boolean(process.env.GOOGLE_PLAY_PACKAGE_NAME),
-        hasGooglePlayClientEmail: Boolean(process.env.GOOGLE_PLAY_CLIENT_EMAIL),
-        hasGooglePlayPrivateKey: Boolean(process.env.GOOGLE_PLAY_PRIVATE_KEY),
-      }
-    );
-
     return res.status(500).json({
       error:
         "Google Play no esta configurado en el backend. Falta client email, private key o package name.",
-      stage: "google_play_config",
     });
   }
 
@@ -251,21 +190,8 @@ router.post("/google-play/confirm", authenticateUser, async (req, res) => {
       },
     });
   } catch (error) {
-    logBillingError("google-play-confirm", error, {
-      userId: user_id,
-      productId,
-      purchaseToken: summarizePurchaseToken(purchaseToken),
-      supabaseWriteKeyRole: decodeJwtRole(
-        process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_API_KEY
-      ),
-      hasSupabaseServiceRoleKey: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
-      googlePlayConfig: getGooglePlayConfigSummary(),
-    });
-
     return res.status(error.statusCode || 500).json({
       error: error.message || "No se pudo validar la suscripcion en Google Play",
-      stage: error.stage || null,
-      details: error.details || error.googlePayload || null,
     });
   }
 });
