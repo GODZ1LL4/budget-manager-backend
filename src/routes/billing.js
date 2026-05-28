@@ -142,7 +142,8 @@ router.post("/google-play/rtdn", async (req, res) => {
   } catch (rtndError) {
     return res.status(rtndError.statusCode || 500).json({
       error: rtndError.message || "No se pudo procesar la RTDN",
-      details: rtndError.googlePayload || null,
+      stage: rtndError.stage || null,
+      details: rtndError.details || rtndError.googlePayload || null,
     });
   }
 });
@@ -193,7 +194,8 @@ router.post("/google-play/confirm", authenticateUser, async (req, res) => {
   } catch (error) {
     return res.status(error.statusCode || 500).json({
       error: error.message || "No se pudo validar la suscripcion en Google Play",
-      details: error.googlePayload || null,
+      stage: error.stage || null,
+      details: error.details || error.googlePayload || null,
     });
   }
 });

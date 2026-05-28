@@ -11,6 +11,14 @@ let googleAccessTokenCache = {
   expiresAt: 0,
 };
 
+function createSubscriptionError(message, { statusCode, stage, details } = {}) {
+  const error = new Error(message);
+  if (statusCode) error.statusCode = statusCode;
+  if (stage) error.stage = stage;
+  if (details) error.details = details;
+  return error;
+}
+
 function getGooglePlayConfig() {
   const clientEmail = process.env.GOOGLE_PLAY_CLIENT_EMAIL;
   const privateKey = (process.env.GOOGLE_PLAY_PRIVATE_KEY || "").replace(
@@ -46,8 +54,9 @@ async function getGoogleAccessToken() {
   const { clientEmail, privateKey } = getGooglePlayConfig();
 
   if (!clientEmail || !privateKey) {
-    throw new Error(
-      "Falta configurar GOOGLE_PLAY_CLIENT_EMAIL o GOOGLE_PLAY_PRIVATE_KEY"
+    throw createSubscriptionError(
+      "Falta configurar GOOGLE_PLAY_CLIENT_EMAIL o GOOGLE_PLAY_PRIVATE_KEY",
+      { stage: "google_oauth_config" }
     );
   }
 
@@ -82,10 +91,15 @@ async function getGoogleAccessToken() {
   const json = await response.json();
 
   if (!response.ok || !json?.access_token) {
-    throw new Error(
+    throw createSubscriptionError(
       json?.error_description ||
         json?.error ||
-        "No se pudo obtener access token de Google Play"
+        "No se pudo obtener access token de Google Play",
+      {
+        statusCode: response.status,
+        stage: "google_oauth_token",
+        details: json,
+      }
     );
   }
 
@@ -101,7 +115,9 @@ async function fetchGooglePlaySubscription({ purchaseToken }) {
   const { packageName } = getGooglePlayConfig();
 
   if (!packageName) {
-    throw new Error("Falta configurar GOOGLE_PLAY_PACKAGE_NAME");
+    throw createSubscriptionError("Falta configurar GOOGLE_PLAY_PACKAGE_NAME", {
+      stage: "google_play_config",
+    });
   }
 
   const accessToken = await getGoogleAccessToken();
@@ -122,10 +138,11 @@ async function fetchGooglePlaySubscription({ purchaseToken }) {
   if (!response.ok) {
     const googleMessage =
       json?.error?.message || json?.error?.status || "Google Play devolvio un error";
-    const error = new Error(googleMessage);
-    error.statusCode = response.status;
-    error.googlePayload = json;
-    throw error;
+    throw createSubscriptionError(googleMessage, {
+      statusCode: response.status,
+      stage: "google_play_subscription_lookup",
+      details: json,
+    });
   }
 
   return json;
@@ -243,7 +260,15 @@ async function upsertSubscriptionRecord({
     .maybeSingle();
 
   if (error) {
-    throw new Error(error.message);
+    throw createSubscriptionError(error.message, {
+      stage: "supabase_subscription_upsert",
+      details: {
+        code: error.code,
+        details: error.details,
+        hint: error.hint,
+        message: error.message,
+      },
+    });
   }
 
   return data;
@@ -261,7 +286,10 @@ async function verifyAndStoreGooglePlaySubscription({
   );
 
   if (!normalized.productId) {
-    throw new Error("Google Play no devolvio productId para la suscripcion");
+    throw createSubscriptionError(
+      "Google Play no devolvio productId para la suscripcion",
+      { stage: "google_play_subscription_normalize" }
+    );
   }
 
   const row = await upsertSubscriptionRecord({
