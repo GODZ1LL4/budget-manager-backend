@@ -117,6 +117,21 @@ function isGooglePlayConfigured() {
   );
 }
 
+function getGooglePlayConfigSummary() {
+  const config = getGooglePlayConfig();
+
+  return {
+    clientEmail: config.clientEmail || null,
+    packageName: config.packageName || null,
+    privateKeyStartsCorrectly: config.privateKey.startsWith(
+      "-----BEGIN PRIVATE KEY-----"
+    ),
+    privateKeyEndsCorrectly: config.privateKey
+      .trim()
+      .endsWith("-----END PRIVATE KEY-----"),
+  };
+}
+
 async function getGoogleAccessToken() {
   const now = Date.now();
   if (
@@ -423,6 +438,7 @@ async function refreshStoredSubscriptionAccess(subscriptionRow) {
 module.exports = {
   isGooglePlayConfigured,
   isSubscriptionEntitled,
+  getGooglePlayConfigSummary,
   refreshStoredSubscriptionAccess,
   summarizePurchaseToken,
   upsertSubscriptionRecord,

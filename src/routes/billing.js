@@ -3,6 +3,7 @@ const router = express.Router();
 const supabase = require("../lib/supabase");
 const authenticateUser = require("../middlewares/auth");
 const {
+  getGooglePlayConfigSummary,
   isGooglePlayConfigured,
   summarizePurchaseToken,
   upsertSubscriptionRecord,
@@ -45,6 +46,7 @@ router.get("/google-play/diagnostics", authenticateUser, (req, res) => {
     success: true,
     data: {
       googlePlayConfigured: isGooglePlayConfigured(),
+      googlePlayConfig: getGooglePlayConfigSummary(),
       hasGooglePlayPackageName: Boolean(process.env.GOOGLE_PLAY_PACKAGE_NAME),
       hasGooglePlayClientEmail: Boolean(process.env.GOOGLE_PLAY_CLIENT_EMAIL),
       hasGooglePlayPrivateKey: Boolean(process.env.GOOGLE_PLAY_PRIVATE_KEY),
@@ -257,6 +259,7 @@ router.post("/google-play/confirm", authenticateUser, async (req, res) => {
         process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_API_KEY
       ),
       hasSupabaseServiceRoleKey: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+      googlePlayConfig: getGooglePlayConfigSummary(),
     });
 
     return res.status(error.statusCode || 500).json({
