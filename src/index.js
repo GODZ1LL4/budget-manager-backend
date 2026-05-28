@@ -65,4 +65,15 @@ app.use("/api/me/subscription-access", subscriptionAccessRoutes);
 
 app.listen(PORT, () => {
   console.log(`Servidor corriendo en http://localhost:${PORT}`);
+  console.log(
+    "[billing] startup diagnostics",
+    JSON.stringify({
+      hasGooglePlayPackageName: Boolean(process.env.GOOGLE_PLAY_PACKAGE_NAME),
+      hasGooglePlayClientEmail: Boolean(process.env.GOOGLE_PLAY_CLIENT_EMAIL),
+      hasGooglePlayPrivateKey: Boolean(process.env.GOOGLE_PLAY_PRIVATE_KEY),
+      hasSupabaseServiceRoleKey: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+      hasSupabaseApiKey: Boolean(process.env.SUPABASE_API_KEY),
+      nodeVersion: process.version,
+    })
+  );
 });

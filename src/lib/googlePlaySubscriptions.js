@@ -19,6 +19,13 @@ function createSubscriptionError(message, { statusCode, stage, details } = {}) {
   return error;
 }
 
+function summarizePurchaseToken(purchaseToken) {
+  if (!purchaseToken) return null;
+  const value = String(purchaseToken);
+
+  return `${value.slice(0, 8)}...${value.slice(-6)}`;
+}
+
 function getGooglePlayConfig() {
   const clientEmail = process.env.GOOGLE_PLAY_CLIENT_EMAIL;
   const privateKey = (process.env.GOOGLE_PLAY_PRIVATE_KEY || "").replace(
@@ -63,19 +70,39 @@ async function getGoogleAccessToken() {
   const iat = Math.floor(now / 1000);
   const exp = iat + 3600;
 
-  const assertion = jwt.sign(
-    {
-      iss: clientEmail,
-      scope: GOOGLE_PLAY_SCOPE,
-      aud: GOOGLE_OAUTH_TOKEN_URL,
-      iat,
-      exp,
-    },
-    privateKey,
-    {
-      algorithm: "RS256",
-    }
-  );
+  let assertion;
+
+  try {
+    assertion = jwt.sign(
+      {
+        iss: clientEmail,
+        scope: GOOGLE_PLAY_SCOPE,
+        aud: GOOGLE_OAUTH_TOKEN_URL,
+        iat,
+        exp,
+      },
+      privateKey,
+      {
+        algorithm: "RS256",
+      }
+    );
+  } catch (error) {
+    throw createSubscriptionError(
+      error?.message || "No se pudo firmar el JWT de Google Play",
+      {
+        stage: "google_oauth_signing",
+        details: {
+          hasClientEmail: Boolean(clientEmail),
+          privateKeyStartsCorrectly: privateKey.startsWith(
+            "-----BEGIN PRIVATE KEY-----"
+          ),
+          privateKeyEndsCorrectly: privateKey
+            .trim()
+            .endsWith("-----END PRIVATE KEY-----"),
+        },
+      }
+    );
+  }
 
   const response = await fetch(GOOGLE_OAUTH_TOKEN_URL, {
     method: "POST",
@@ -329,6 +356,7 @@ module.exports = {
   isGooglePlayConfigured,
   isSubscriptionEntitled,
   refreshStoredSubscriptionAccess,
+  summarizePurchaseToken,
   upsertSubscriptionRecord,
   verifyAndStoreGooglePlaySubscription,
 };
