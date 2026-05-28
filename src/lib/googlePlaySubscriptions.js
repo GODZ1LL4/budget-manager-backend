@@ -26,11 +26,79 @@ function summarizePurchaseToken(purchaseToken) {
   return `${value.slice(0, 8)}...${value.slice(-6)}`;
 }
 
+function stripWrappingQuotes(value) {
+  const trimmed = String(value || "").trim();
+
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+
+  return trimmed;
+}
+
+function tryParseServiceAccountJson(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function tryDecodeBase64(value) {
+  try {
+    const decoded = Buffer.from(value, "base64").toString("utf8");
+
+    if (!decoded.trim().startsWith("{")) {
+      return null;
+    }
+
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function normalizePrivateKey(value) {
+  const raw = stripWrappingQuotes(value);
+
+  if (!raw) {
+    return "";
+  }
+
+  const rawJson = tryParseServiceAccountJson(raw);
+  if (rawJson?.private_key) {
+    return normalizePrivateKey(rawJson.private_key);
+  }
+
+  const decodedJson = tryDecodeBase64(raw);
+  if (decodedJson) {
+    const parsedDecodedJson = tryParseServiceAccountJson(decodedJson);
+    if (parsedDecodedJson?.private_key) {
+      return normalizePrivateKey(parsedDecodedJson.private_key);
+    }
+  }
+
+  return raw.replace(/\\n/g, "\n").trim();
+}
+
 function getGooglePlayConfig() {
-  const clientEmail = process.env.GOOGLE_PLAY_CLIENT_EMAIL;
-  const privateKey = (process.env.GOOGLE_PLAY_PRIVATE_KEY || "").replace(
-    /\\n/g,
-    "\n"
+  const serviceAccountJson = tryParseServiceAccountJson(
+    stripWrappingQuotes(process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON || "")
+  );
+  const decodedServiceAccountJson = tryDecodeBase64(
+    stripWrappingQuotes(process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_BASE64 || "")
+  );
+  const serviceAccountFromBase64 = decodedServiceAccountJson
+    ? tryParseServiceAccountJson(decodedServiceAccountJson)
+    : null;
+  const serviceAccount = serviceAccountJson || serviceAccountFromBase64 || {};
+  const clientEmail =
+    process.env.GOOGLE_PLAY_CLIENT_EMAIL || serviceAccount.client_email;
+  const privateKey = normalizePrivateKey(
+    process.env.GOOGLE_PLAY_PRIVATE_KEY || serviceAccount.private_key
   );
   const packageName = process.env.GOOGLE_PLAY_PACKAGE_NAME;
 
