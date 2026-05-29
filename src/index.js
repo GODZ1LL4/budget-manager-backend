@@ -63,6 +63,9 @@ app.use("/api/billing", billingRoutes);
 const subscriptionAccessRoutes = require("./routes/subscriptionAccess");
 app.use("/api/me/subscription-access", subscriptionAccessRoutes);
 
+const adminSubscriptionsRoutes = require("./routes/adminSubscriptions");
+app.use("/api/admin/subscriptions", adminSubscriptionsRoutes);
+
 app.listen(PORT, () => {
   console.log(`Servidor corriendo en http://localhost:${PORT}`);
 });

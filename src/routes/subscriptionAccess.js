@@ -15,23 +15,28 @@ router.get("/", authenticateUser, async (req, res) => {
     .select("*")
     .eq("user_id", user_id)
     .order("updated_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+    .limit(10);
 
   if (error) {
     return res.status(500).json({ error: error.message });
   }
 
-  let latestSubscription = data;
+  const rows = Array.isArray(data) ? data : [];
+  const refreshedRows = [];
 
-  try {
-    latestSubscription = await refreshStoredSubscriptionAccess(data);
-  } catch {}
+  for (const row of rows) {
+    try {
+      refreshedRows.push(await refreshStoredSubscriptionAccess(row));
+    } catch {
+      refreshedRows.push(row);
+    }
+  }
 
-  const isActive = isSubscriptionEntitled(
-    latestSubscription?.status,
-    latestSubscription?.expires_at
+  const activeSubscription = refreshedRows.find((row) =>
+    isSubscriptionEntitled(row?.status, row?.expires_at)
   );
+  const latestSubscription = activeSubscription || refreshedRows[0] || null;
+  const isActive = Boolean(activeSubscription);
 
   return res.json({
     success: true,
