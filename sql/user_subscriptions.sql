@@ -20,6 +20,13 @@ create index if not exists user_subscriptions_user_updated_idx
 create index if not exists user_subscriptions_purchase_token_idx
   on public.user_subscriptions (purchase_token);
 
+alter table public.user_subscriptions
+  drop constraint if exists user_subscriptions_provider_check;
+
+alter table public.user_subscriptions
+  add constraint user_subscriptions_provider_check
+  check (provider in ('google_play', 'manual_grant'));
+
 create or replace function public.set_user_subscriptions_updated_at()
 returns trigger
 language plpgsql

@@ -154,6 +154,16 @@ router.post("/grant-premium", async (req, res) => {
       .maybeSingle();
 
     if (error) {
+      if (
+        error.code === "23514" &&
+        String(error.message || "").includes("user_subscriptions_provider_check")
+      ) {
+        return res.status(500).json({
+          error:
+            "La base de datos no permite provider=manual_grant. Ejecuta la migracion de user_subscriptions.sql para permitir concesiones manuales.",
+        });
+      }
+
       return res.status(500).json({ error: error.message });
     }
 
