@@ -5,6 +5,10 @@ const authenticateUser = require("../middlewares/auth");
 const upload = require("../lib/upload"); 
 const { getRequestDateKey } = require("../lib/timeZone");
 
+function round2(n) {
+  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+}
+
 router.get("/", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
@@ -16,7 +20,14 @@ router.get("/", authenticateUser, async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
 
-  res.json({ success: true, data });
+  res.json({
+    success: true,
+    data: (data || []).map((item) => ({
+      ...item,
+      latest_price:
+        item.latest_price == null ? null : round2(item.latest_price),
+    })),
+  });
 });
 
 
@@ -55,7 +66,7 @@ const rows = (data || []).map((item) => {
   const nombre = (item.name || "").replace(/"/g, '""');
   const precio =
     item.latest_price !== null && item.latest_price !== undefined
-      ? String(item.latest_price)
+      ? String(round2(item.latest_price))
       : "";
 
   // cantidad vacía (el usuario la llenará en Excel)
@@ -154,9 +165,9 @@ router.post("/import-prices",
           continue;
         }
 
-        const price = parseFloat(
+        const price = round2(parseFloat(
           row.ultimoPrecioStr.replace(",", ".") // por si escriben 123,45
-        );
+        ));
         if (Number.isNaN(price) || price <= 0) {
           errors.push(
             `Precio inválido para id=${row.id}: "${row.ultimoPrecioStr}"`

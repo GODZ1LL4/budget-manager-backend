@@ -258,7 +258,7 @@ router.post("/", authenticateUser, async (req, res) => {
       if (!ref) continue;
 
       const qty = parseFloat(item.quantity) || 1;
-      const unitPriceNet = parseFloat(ref.latest_price || 0); // sin ITBIS
+      const unitPriceNet = round2(ref.latest_price || 0); // sin ITBIS
       const taxRate = ref.is_exempt ? 0 : parseFloat(ref.tax_rate || 0);
 
       const lineSubtotalNet = unitPriceNet * qty;
@@ -268,15 +268,15 @@ router.post("/", authenticateUser, async (req, res) => {
       const lineDiscountAmount =
         discountRate > 0 ? lineTotalGross * (discountRate / 100) : 0;
 
-      const lineTotalFinal = lineTotalGross - lineDiscountAmount; // con ITBIS y desc.
-      const unitPriceFinal = qty > 0 ? lineTotalFinal / qty : lineTotalFinal;
+      const lineTotalFinal = round2(lineTotalGross - lineDiscountAmount); // con ITBIS y desc.
+      const unitPriceFinal = qty > 0 ? round2(lineTotalFinal / qty) : lineTotalFinal;
 
       totalFinal += lineTotalFinal;
 
       transactionItems.push({
         item_id: item.item_id,
         quantity: qty,
-        unit_price_net: unitPriceNet,
+        unit_price_net: round2(unitPriceNet),
         unit_price_final: unitPriceFinal,
         line_total_final: lineTotalFinal,
         tax_rate_used: taxRate,
@@ -285,7 +285,7 @@ router.post("/", authenticateUser, async (req, res) => {
     }
 
     // amount de la transacción = suma de totales finales (ITBIS + descuento)
-    amount = totalFinal;
+    amount = round2(totalFinal);
   }
 
   // ✅ AHORA SÍ, después de construir transactionItems
@@ -469,7 +469,7 @@ router.post("/import-shopping-list",
 
         const existingRow = existingMap.get(itemId);
         const existingPrice = existingRow
-          ? Number(existingRow.price || 0)
+          ? round2(existingRow.price)
           : 0;
 
         let usedPrice;
@@ -479,7 +479,7 @@ router.post("/import-shopping-list",
           usedPrice = existingPrice;
         } else {
           // usamos el precio nuevo del archivo
-          usedPrice = Number(line.unit_price || 0);
+          usedPrice = round2(line.unit_price);
         }
 
         // ✅ Validación: precio > 0 obligatorio
@@ -506,14 +506,14 @@ router.post("/import-shopping-list",
           // no hay precio ese día → insert
           pricesToInsert.push({
             item_id: itemId,
-            price: usedPrice,
+            price: round2(usedPrice),
             date,
           });
-        } else if (priceSource === "new" && usedPrice !== existingPrice) {
+        } else if (priceSource === "new" && !nearlyEqual(usedPrice, existingPrice)) {
           // hay precio y el usuario eligió "nuevo" → actualizar
           pricesToUpdate.push({
             id: existingRow.id,
-            price: usedPrice,
+            price: round2(usedPrice),
           });
         }
         // si elige "existing" y ya había precio → no tocamos item_prices
@@ -522,7 +522,7 @@ router.post("/import-shopping-list",
         transactionItemRows.push({
           item_id: itemId,
           quantity: qty,
-          unit_price_net: usedPrice,
+          unit_price_net: round2(usedPrice),
           tax_rate_used: taxRate,
           is_exempt_used: isExempt,
           lineTotalWithTax,
@@ -537,7 +537,7 @@ router.post("/import-shopping-list",
       }
 
       const totalAfterDiscount =
-        totalBeforeDiscount * discountFactor;
+        round2(totalBeforeDiscount * discountFactor);
 
       // 3) Insertar / actualizar precios
       if (pricesToInsert.length > 0) {
@@ -560,7 +560,7 @@ router.post("/import-shopping-list",
           pricesToUpdate.map((p) =>
             supabase
               .from("item_prices")
-              .update({ price: p.price })
+              .update({ price: round2(p.price) })
               .eq("id", p.id)
           )
         );
@@ -607,16 +607,16 @@ router.post("/import-shopping-list",
       // 5) Insertar transaction_items
       const txItemsToInsert = transactionItemRows.map((row) => {
         const lineTotalFinal =
-          row.lineTotalWithTax * discountFactor;
+          round2(row.lineTotalWithTax * discountFactor);
         const unitPriceFinal =
           row.quantity > 0
-            ? lineTotalFinal / row.quantity
-            : row.lineTotalWithTax;
+            ? round2(lineTotalFinal / row.quantity)
+            : round2(row.lineTotalWithTax);
 
         return {
           transaction_id: tx.id,
           item_id: row.item_id,
-          unit_price_net: row.unit_price_net,
+          unit_price_net: round2(row.unit_price_net),
           quantity: row.quantity,
           unit_price_final: unitPriceFinal,
           line_total_final: lineTotalFinal,
@@ -644,7 +644,7 @@ router.post("/import-shopping-list",
         success: true,
         data: {
           transaction: tx,
-          totalBeforeDiscount,
+          totalBeforeDiscount: round2(totalBeforeDiscount),
           totalAfterDiscount,
           discount: discountPct,
           lines: txItemsToInsert.length,
@@ -795,7 +795,7 @@ router.put("/:id", authenticateUser, async (req, res) => {
 const EPSILON = 0.0001;
 
 function nearlyEqual(a, b, eps = EPSILON) {
-  return Math.abs(Number(a || 0) - Number(b || 0)) <= eps;
+  return Math.abs(round2(a) - round2(b)) <= eps;
 }
 
 function toNumber(x, fallback = 0) {
@@ -862,7 +862,7 @@ async function fetchExistingPricesOnDate({ supabase, user_id, date, itemIds }) {
   const existingMap = new Map(
     filtered.map((row) => [
       row.item_id,
-      { id: row.id, price: toNumber(row.price, 0), date: row.date },
+      { id: row.id, price: round2(row.price), date: row.date },
     ])
   );
 
@@ -1085,7 +1085,7 @@ router.post("/shopping-list/preview", authenticateUser, async (req, res) => {
       });
     }
 
-    const totalAfterDiscount = totalBeforeDiscount * discountFactor;
+    const totalAfterDiscount = round2(totalBeforeDiscount * discountFactor);
 
     return res.json({
       success: true,
@@ -1214,7 +1214,7 @@ router.post("/shopping-list", authenticateUser, async (req, res) => {
             message: `Conflicto de precio detectado para item_id=${item_id} en date=${date}. Debes elegir resolution: use_existing | update_existing.`,
             item_id,
             existing_price_on_date: existing.price,
-            computed_unit_price_net: computed.unit_price_net,
+            computed_unit_price_net: round2(computed.unit_price_net),
           });
         }
       } else {
@@ -1229,18 +1229,18 @@ router.post("/shopping-list", authenticateUser, async (req, res) => {
       if (existing) {
         if (conflict) {
           if (resolution === "use_existing") {
-            usedUnitNet = existing.price;
+            usedUnitNet = round2(existing.price);
           } else if (resolution === "update_existing") {
-            usedUnitNet = computed.unit_price_net;
+            usedUnitNet = round2(computed.unit_price_net);
             pricesToUpdate.push({ id: existing.id, price: usedUnitNet });
           }
         } else {
           // igual al existente
-          usedUnitNet = existing.price;
+          usedUnitNet = round2(existing.price);
         }
       } else {
         // no existe precio ese día
-        usedUnitNet = computed.unit_price_net;
+        usedUnitNet = round2(computed.unit_price_net);
         pricesToInsert.push({
           item_id,
           price: usedUnitNet,
@@ -1256,13 +1256,13 @@ router.post("/shopping-list", authenticateUser, async (req, res) => {
 
       totalBeforeDiscount += lineGross;
 
-      const lineTotalFinal = lineGross * discountFactor;
-      const unitFinal = qty > 0 ? lineTotalFinal / qty : lineTotalFinal;
+      const lineTotalFinal = round2(lineGross * discountFactor);
+      const unitFinal = qty > 0 ? round2(lineTotalFinal / qty) : lineTotalFinal;
 
       txItemsToInsert.push({
         item_id,
         quantity: qty,
-        unit_price_net: usedUnitNet,
+        unit_price_net: round2(usedUnitNet),
         unit_price_final: unitFinal,
         line_total_final: lineTotalFinal,
         tax_rate_used: rate,
@@ -1272,7 +1272,7 @@ router.post("/shopping-list", authenticateUser, async (req, res) => {
         meta: {
           latest_price: latestMap.get(item_id) ?? 0,
           existing_price_on_date: existing ? existing.price : null,
-          computed_unit_price_net: computed.unit_price_net,
+          computed_unit_price_net: round2(computed.unit_price_net),
           conflict,
           resolution: conflict ? resolution : (existing ? "use_existing" : "insert_new"),
         },
@@ -1286,7 +1286,7 @@ router.post("/shopping-list", authenticateUser, async (req, res) => {
       });
     }
 
-    const totalAfterDiscount = totalBeforeDiscount * discountFactor;
+    const totalAfterDiscount = round2(totalBeforeDiscount * discountFactor);
 
     // 1) Insertar precios nuevos (si aplica)
     if (pricesToInsert.length > 0) {
@@ -1295,7 +1295,7 @@ router.post("/shopping-list", authenticateUser, async (req, res) => {
         .insert(
           pricesToInsert.map((p) => ({
             item_id: p.item_id,
-            price: p.price,
+            price: round2(p.price),
             date: p.date,
           }))
         );
@@ -1313,7 +1313,7 @@ router.post("/shopping-list", authenticateUser, async (req, res) => {
     if (pricesToUpdate.length > 0) {
       const updateResults = await Promise.all(
         pricesToUpdate.map((p) =>
-          supabase.from("item_prices").update({ price: p.price }).eq("id", p.id)
+          supabase.from("item_prices").update({ price: round2(p.price) }).eq("id", p.id)
         )
       );
       const someError = updateResults.find((r) => r.error);
@@ -1358,9 +1358,9 @@ router.post("/shopping-list", authenticateUser, async (req, res) => {
       transaction_id: tx.id,
       item_id: row.item_id,
       quantity: row.quantity,
-      unit_price_net: row.unit_price_net,
-      unit_price_final: row.unit_price_final,
-      line_total_final: row.line_total_final,
+      unit_price_net: round2(row.unit_price_net),
+      unit_price_final: round2(row.unit_price_final),
+      line_total_final: round2(row.line_total_final),
       tax_rate_used: row.tax_rate_used,
       is_exempt_used: row.is_exempt_used,
     }));

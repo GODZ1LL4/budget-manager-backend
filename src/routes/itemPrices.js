@@ -3,6 +3,10 @@ const router = express.Router();
 const supabase = require("../lib/supabase");
 const authenticateUser = require("../middlewares/auth");
 
+function round2(n) {
+  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+}
+
 // ✅ 1) Buscar precios por fecha para varios items
 router.get("/by-date", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -45,7 +49,7 @@ router.get("/by-date", authenticateUser, async (req, res) => {
 
     const result = filtered.map((row) => ({
       item_id: row.item_id,
-      price: Number(row.price || 0),
+      price: round2(row.price || 0),
     }));
 
     return res.json({ success: true, data: result });
@@ -69,7 +73,13 @@ router.get("/:item_id", authenticateUser, async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
 
-  res.json({ success: true, data });
+  res.json({
+    success: true,
+    data: (data || []).map((row) => ({
+      ...row,
+      price: round2(row.price || 0),
+    })),
+  });
 });
 
 // Agregar nuevo precio
@@ -82,7 +92,7 @@ router.post("/", authenticateUser, async (req, res) => {
       .json({ error: "VALIDATION_ERROR", message: "Todos los campos son obligatorios" });
   }
 
-  const numericPrice = Number(price);
+  const numericPrice = round2(price);
   if (Number.isNaN(numericPrice) || numericPrice < 0) {
     return res
       .status(400)

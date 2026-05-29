@@ -3,6 +3,10 @@ const router = express.Router();
 const supabase = require("../lib/supabase");
 const authenticateUser = require("../middlewares/auth");
 
+function round2(n) {
+  return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+}
+
 // Listar artículos
 router.get("/", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
@@ -24,7 +28,16 @@ router.get("/", authenticateUser, async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
 
-  res.json({ success: true, data });
+  res.json({
+    success: true,
+    data: (data || []).map((item) => ({
+      ...item,
+      item_prices: (item.item_prices || []).map((priceRow) => ({
+        ...priceRow,
+        price: round2(priceRow.price || 0),
+      })),
+    })),
+  });
 });
 
 // Crear o editar artículo
