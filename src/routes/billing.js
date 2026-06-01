@@ -9,6 +9,14 @@ const {
 } = require("../lib/googlePlaySubscriptions");
 const { verifyPubSubPushJwt } = require("../lib/pubsubPushAuth");
 
+function buildBillingErrorResponse(error, fallbackMessage) {
+  return {
+    error: error.message || fallbackMessage,
+    stage: error.stage || null,
+    details: error.details || null,
+  };
+}
+
 router.post("/google-play/rtdn", async (req, res) => {
   const expectedRtdnToken = process.env.GOOGLE_PLAY_RTND_TOKEN;
   const packageName = process.env.GOOGLE_PLAY_PACKAGE_NAME;
@@ -140,9 +148,9 @@ router.post("/google-play/rtdn", async (req, res) => {
       reason: "Tipo de RTDN no manejado",
     });
   } catch (rtndError) {
-    return res.status(rtndError.statusCode || 500).json({
-      error: rtndError.message || "No se pudo procesar la RTDN",
-    });
+    return res
+      .status(rtndError.statusCode || 500)
+      .json(buildBillingErrorResponse(rtndError, "No se pudo procesar la RTDN"));
   }
 });
 
@@ -190,9 +198,14 @@ router.post("/google-play/confirm", authenticateUser, async (req, res) => {
       },
     });
   } catch (error) {
-    return res.status(error.statusCode || 500).json({
-      error: error.message || "No se pudo validar la suscripcion en Google Play",
-    });
+    return res
+      .status(error.statusCode || 500)
+      .json(
+        buildBillingErrorResponse(
+          error,
+          "No se pudo validar la suscripcion en Google Play"
+        )
+      );
   }
 });
 

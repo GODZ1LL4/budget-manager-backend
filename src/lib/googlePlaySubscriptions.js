@@ -348,15 +348,24 @@ async function upsertSubscriptionRecord({
     .maybeSingle();
 
   if (error) {
-    throw createSubscriptionError(error.message, {
-      stage: "supabase_subscription_upsert",
-      details: {
-        code: error.code,
-        details: error.details,
-        hint: error.hint,
-        message: error.message,
-      },
-    });
+    const isPermissionError =
+      error.code === "42501" ||
+      /row-level security|permission denied/i.test(error.message || "");
+
+    throw createSubscriptionError(
+      isPermissionError
+        ? "Supabase bloqueo la escritura de Premium. Configura SUPABASE_SERVICE_ROLE_KEY en el backend para que el servidor pueda actualizar user_subscriptions."
+        : error.message,
+      {
+        stage: "supabase_subscription_upsert",
+        details: {
+          code: error.code,
+          details: error.details,
+          hint: error.hint,
+          message: error.message,
+        },
+      }
+    );
   }
 
   return data;
