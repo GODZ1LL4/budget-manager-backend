@@ -11,6 +11,47 @@ const {
   getRequestTimeZone,
 } = require("../lib/timeZone");
 
+function parseQueryInt(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const text = String(raw ?? "").trim();
+  if (!text) return null;
+  if (!/^\d+$/.test(text)) return NaN;
+  return Number(text);
+}
+
+function resolveMonthPeriod(req) {
+  const currentRange = getCurrentMonthRange(new Date(), getRequestTimeZone(req));
+  const rawYear = parseQueryInt(req.query.year);
+  const rawMonth = parseQueryInt(req.query.month);
+
+  if (
+    rawYear !== null &&
+    (!Number.isInteger(rawYear) || rawYear < 2000 || rawYear > 2100)
+  ) {
+    return { error: "Parámetro year inválido." };
+  }
+
+  if (
+    rawMonth !== null &&
+    (!Number.isInteger(rawMonth) || rawMonth < 1 || rawMonth > 12)
+  ) {
+    return { error: "Parámetro month inválido." };
+  }
+
+  const year = rawYear ?? currentRange.year;
+  const month = rawMonth ?? currentRange.month;
+  const monthKey = `${year}-${String(month).padStart(2, "0")}`;
+  const range = getMonthRange(monthKey);
+
+  return {
+    year,
+    month,
+    monthKey,
+    start: range.start,
+    end: range.end,
+  };
+}
+
 /* ============================================================
    GET: RESUMEN DASHBOARD
    ============================================================ */
@@ -468,7 +509,69 @@ router.get("/today-expense", authenticateUser, async (req, res) => {
 });
 
 /* ============================================================
-   GET: TRANSACCIONES POR CATEGORÍA (MES ACTUAL)
+   GET: GASTOS POR CATEGORIA (ANO/MES)
+   ============================================================ */
+router.get("/expenses-by-category", authenticateUser, async (req, res) => {
+  const user_id = req.user?.id;
+  const period = resolveMonthPeriod(req);
+
+  if (period.error) {
+    return res.status(400).json({ error: period.error });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("transactions")
+      .select("amount, category_id, categories(name)")
+      .eq("user_id", user_id)
+      .eq("type", "expense")
+      .gte("date", period.start)
+      .lte("date", period.end);
+
+    if (error) throw error;
+
+    const expensesByCategory = {};
+    const categoryNameMap = {};
+
+    (data || []).forEach((tx) => {
+      const amount = Number(tx.amount) || 0;
+      if (amount <= 0) return;
+
+      const categoryId = tx.category_id || "__uncategorized__";
+      expensesByCategory[categoryId] =
+        (expensesByCategory[categoryId] || 0) + amount;
+
+      if (!categoryNameMap[categoryId]) {
+        categoryNameMap[categoryId] = tx.category_id
+          ? tx.categories?.name || "Sin nombre"
+          : "Sin categoria";
+      }
+    });
+
+    res.json({
+      success: true,
+      data: {
+        expensesByCategory,
+        categoryNameMap,
+      },
+      meta: {
+        year: period.year,
+        month: period.month,
+        month_key: period.monthKey,
+        range: {
+          start: period.start,
+          end: period.end,
+        },
+      },
+    });
+  } catch (err) {
+    console.error("Error en /dashboard/expenses-by-category:", err);
+    res.status(500).json({ error: "Error al calcular gastos por categoria." });
+  }
+});
+
+/* ============================================================
+   GET: TRANSACCIONES POR CATEGORIA (ANO/MES)
    ============================================================ */
 router.get("/transactions-by-category", authenticateUser, async (req, res) => {
   const user_id = req.user?.id;
@@ -476,28 +579,45 @@ router.get("/transactions-by-category", authenticateUser, async (req, res) => {
 
   if (!category_id) return res.status(400).json({ error: "Falta category_id" });
 
-  // Use the same caller time zone for the current-month drilldown.
-  const currentRange = getCurrentMonthRange(
-    new Date(),
-    getRequestTimeZone(req)
-  );
-  const start = currentRange.start;
-  const end = currentRange.end;
+  const period = resolveMonthPeriod(req);
+
+  if (period.error) {
+    return res.status(400).json({ error: period.error });
+  }
 
   try {
-    const { data, error } = await supabase
+    let query = supabase
       .from("transactions")
       .select("id, amount, description, date")
       .eq("user_id", user_id)
       .eq("type", "expense")
-      .eq("category_id", category_id)
-      .gte("date", start)
-      .lte("date", end)
+      .gte("date", period.start)
+      .lte("date", period.end)
       .order("date", { ascending: true });
+
+    if (category_id === "__uncategorized__") {
+      query = query.is("category_id", null);
+    } else {
+      query = query.eq("category_id", category_id);
+    }
+
+    const { data, error } = await query;
 
     if (error) throw error;
 
-    res.json({ success: true, data });
+    res.json({
+      success: true,
+      data,
+      meta: {
+        year: period.year,
+        month: period.month,
+        month_key: period.monthKey,
+        range: {
+          start: period.start,
+          end: period.end,
+        },
+      },
+    });
   } catch (err) {
     console.error("🔥 Error en /transactions-by-category:", err);
     res.status(500).json({ error: "Error al obtener transacciones." });
