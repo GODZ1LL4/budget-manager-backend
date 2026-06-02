@@ -1072,12 +1072,12 @@ router.get("/:id/advanced-forecast/preview", authenticateUser, async (req, res) 
         .from("transactions")
         .select(
           `
-        id, amount, date, category_id, description,
+        id, amount, type, date, category_id, description,
         categories:categories!transactions_category_id_fkey ( name, stability_type )
       `
         )
         .eq("user_id", user_id)
-        .eq("type", "expense")
+        .in("type", ["expense", "income"])
         .gte("date", historyFrom)
         .lte("date", historyTo);
 
@@ -1086,6 +1086,7 @@ router.get("/:id/advanced-forecast/preview", authenticateUser, async (req, res) 
       const rows = (txData || [])
         .map((tx) => ({
           id: tx.id,
+          tx_type: tx.type,
           date: tx.date,
           amount: Number(tx.amount) || 0,
           category_id: tx.category_id,
@@ -1129,16 +1130,20 @@ router.get("/:id/advanced-forecast/preview", authenticateUser, async (req, res) 
 
         while (new Date(next) <= new Date(rangeEnd)) {
           projected.push({
-            instance_key: `adv::${scenario_id}::${p.pattern_key}::${next}`,
+            instance_key: `adv::${scenario_id}::${p.tx_type}::${p.pattern_key}::${next}`,
             name: p.display_name,
             amount: Number(amount.toFixed(2)),
-            type: "expense",
+            type: p.tx_type,
             date: next,
             category_id: p.category_id,
             category_name: p.category_name,
+            category_stability: p.category_stability,
             account_id,
             isProjected: true,
             source: "advanced_forecast",
+            forecast_bucket: "recurring",
+            recurrence_weight: p.occurrence_count || 1,
+            recurrence_score: p.recurrence_score || 1,
           });
 
           next = addDays(next, interval);
@@ -1158,24 +1163,31 @@ router.get("/:id/advanced-forecast/preview", authenticateUser, async (req, res) 
           const dates = spreadDates(rangeStart, rangeEnd, count);
           dates.forEach((d, idx) => {
             projected.push({
-              instance_key: `adv::${scenario_id}::noise::${n.category_id}::${d}::${idx}`,
+              instance_key: `adv::${scenario_id}::noise::${n.tx_type}::${n.category_id}::${d}::${idx}`,
               name: `${n.category_name} (eventual)`,
               amount: Number(amt.toFixed(2)),
-              type: "expense",
+              type: n.tx_type,
               date: d,
               category_id: n.category_id,
               category_name: n.category_name,
+              category_stability: n.category_stability,
               account_id,
               isProjected: true,
               source: "advanced_forecast",
+              forecast_bucket: "eventual",
             });
           });
         }
       }
 
+      const adjusted = applyCategoryAdjustments(
+        projected,
+        parseCategoryAdjustments(req.query.category_adjustments)
+      );
+
       return res.json({
         success: true,
-        data: projected,
+        data: adjusted.instances,
         meta: {
           range_from: rangeStart,
           range_to: rangeEnd,
@@ -1183,6 +1195,7 @@ router.get("/:id/advanced-forecast/preview", authenticateUser, async (req, res) 
           history_to: historyTo,
           recurring_patterns_count: recurringPatterns.length,
           noise_categories_count: noiseByCategory.length,
+          category_adjustments: adjusted.results,
         },
       });
     } catch (err) {
@@ -1248,7 +1261,6 @@ router.post(
           .from("scenario_transactions")
           .delete()
           .eq("scenario_id", scenario_id)
-          .eq("type", "expense")
           .gte("start_date", rangeStart)
           .lte("start_date", rangeEnd)
           .ilike("description", "%[ADV_FORECAST]%");
@@ -1286,7 +1298,7 @@ router.post(
         scenario_id,
         name: ev.name,
         amount: ev.amount,
-        type: "expense",
+        type: ev.type || "expense",
         start_date: ev.date,
         end_date: null,
         recurrence: null,
@@ -1338,8 +1350,11 @@ async function computeAdvancedForecastInstances({
   const months = clampInt(params.months, 12, 1, 36);
   const minOccurrences = clampInt(params.min_occurrences, 3, 2, 50);
 
-  const includeOccasional = Boolean(params.include_occasional);
-  const includeNoise = params.include_noise !== false; // default true
+  const includeOccasional = toBoolean(params.include_occasional, false);
+  const includeNoise = toBoolean(params.include_noise, true);
+  const categoryAdjustments = parseCategoryAdjustments(
+    params.category_adjustments
+  );
 
   const minIntervalDays = clampInt(params.min_interval_days, 3, 1, 365);
   const maxIntervalDays = clampInt(
@@ -1363,12 +1378,12 @@ async function computeAdvancedForecastInstances({
     .from("transactions")
     .select(
       `
-      id, amount, date, category_id, description,
+      id, amount, type, date, category_id, description,
       categories:categories!transactions_category_id_fkey ( name, stability_type )
     `
     )
     .eq("user_id", user_id)
-    .eq("type", "expense")
+    .in("type", ["expense", "income"])
     .gte("date", historyFrom)
     .lte("date", historyTo);
 
@@ -1377,6 +1392,7 @@ async function computeAdvancedForecastInstances({
   const rows = (txData || [])
     .map((tx) => ({
       id: tx.id,
+      tx_type: tx.type,
       date: tx.date,
       amount: Number(tx.amount) || 0,
       category_id: tx.category_id,
@@ -1417,12 +1433,20 @@ async function computeAdvancedForecastInstances({
 
     while (new Date(next) <= new Date(rangeEnd)) {
       instances.push({
+        instance_key: `adv::${scenario_id}::${p.tx_type}::${p.pattern_key}::${next}`,
         name: p.display_name,
         amount: Number(amount.toFixed(2)),
+        type: p.tx_type,
         date: next,
         category_id: p.category_id,
         category_name: p.category_name,
+        category_stability: p.category_stability,
         account_id,
+        isProjected: true,
+        source: "advanced_forecast",
+        forecast_bucket: "recurring",
+        recurrence_weight: p.occurrence_count || 1,
+        recurrence_score: p.recurrence_score || 1,
       });
       next = addDays(next, interval);
     }
@@ -1435,21 +1459,29 @@ async function computeAdvancedForecastInstances({
       if (count <= 0 || amt <= 0) continue;
 
       const dates = spreadDates(rangeStart, rangeEnd, count);
-      dates.forEach((d) => {
+      dates.forEach((d, idx) => {
         instances.push({
+          instance_key: `adv::${scenario_id}::noise::${n.tx_type}::${n.category_id}::${d}::${idx}`,
           name: `${n.category_name} (eventual)`,
           amount: Number(amt.toFixed(2)),
+          type: n.tx_type,
           date: d,
           category_id: n.category_id,
           category_name: n.category_name,
+          category_stability: n.category_stability,
           account_id,
+          isProjected: true,
+          source: "advanced_forecast",
+          forecast_bucket: "eventual",
         });
       });
     }
   }
 
+  const adjusted = applyCategoryAdjustments(instances, categoryAdjustments);
+
   return {
-    instances,
+    instances: adjusted.instances,
     meta: {
       range_from: rangeStart,
       range_to: rangeEnd,
@@ -1457,6 +1489,7 @@ async function computeAdvancedForecastInstances({
       history_to: historyTo,
       recurring_patterns_count: recurringPatterns.length,
       noise_categories_count: noiseByCategory.length,
+      category_adjustments: adjusted.results,
     },
   };
 }
@@ -1485,7 +1518,7 @@ function buildAdvancedPatterns({
   // group by category
   const byCategory = {};
   for (const r of rows) {
-    const k = String(r.category_id);
+    const k = `${r.tx_type}::${r.category_id}`;
     if (!byCategory[k]) byCategory[k] = [];
     byCategory[k].push(r);
   }
@@ -1521,6 +1554,8 @@ function buildAdvancedPatterns({
         catClusters.push({
           category_id: tx.category_id,
           category_name: tx.category_name,
+          tx_type: tx.tx_type,
+          category_stability: tx.category_stability,
           rep_norm: tx.norm,
           rep_grams: grams,
           entries: [tx],
@@ -1570,13 +1605,17 @@ function buildAdvancedPatterns({
     const display_name = rep ? `${c.category_name} · ${rep}` : c.category_name;
 
     recurringPatterns.push({
+      tx_type: c.tx_type,
       category_id: c.category_id,
       category_name: c.category_name,
+      category_stability: c.category_stability,
       pattern_key,
       display_name,
       median_interval_days: Number(medInterval.toFixed(1)),
       median_amount: Number(medAmount.toFixed(2)),
       last_date: lastDate,
+      occurrence_count: entries.length,
+      recurrence_score: Number((entries.length / Math.max(1, medInterval)).toFixed(4)),
     });
   }
 
@@ -1588,11 +1627,13 @@ function buildAdvancedPatterns({
     const byCat = {};
     for (const tx of rows) {
       if (recurringTxIds.has(tx.id)) continue;
-      const k = String(tx.category_id);
+      const k = `${tx.tx_type}::${tx.category_id}`;
       if (!byCat[k]) {
         byCat[k] = {
+          tx_type: tx.tx_type,
           category_id: tx.category_id,
           category_name: tx.category_name,
+          category_stability: tx.category_stability,
           total: 0,
           count: 0,
           amounts: [],
@@ -1615,8 +1656,10 @@ function buildAdvancedPatterns({
       if (!Number.isFinite(medAmount) || medAmount <= 0) continue;
 
       noiseByCategory.push({
+        tx_type: c.tx_type,
         category_id: c.category_id,
         category_name: c.category_name,
+        category_stability: c.category_stability,
         expected_count,
         median_amount: Number(medAmount.toFixed(2)),
       });
@@ -1634,6 +1677,192 @@ function clampInt(v, def, min, max) {
   const n = parseInt(v ?? "", 10);
   const x = Number.isFinite(n) ? n : def;
   return Math.max(min, Math.min(max, x));
+}
+
+function clampNumber(v, def, min, max) {
+  const n = Number(v);
+  const x = Number.isFinite(n) ? n : def;
+  return Math.max(min, Math.min(max, x));
+}
+
+function toBoolean(v, def = false) {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "string") {
+    const normalized = v.trim().toLowerCase();
+    if (["true", "1", "yes", "si"].includes(normalized)) return true;
+    if (["false", "0", "no"].includes(normalized)) return false;
+  }
+  if (typeof v === "number") return v !== 0;
+  return def;
+}
+
+function roundMoney(v) {
+  return Number((Number(v) || 0).toFixed(2));
+}
+
+function parseCategoryAdjustments(raw) {
+  if (!raw) return [];
+
+  let value = raw;
+  if (typeof raw === "string") {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+  }
+
+  if (!Array.isArray(value)) return [];
+
+  const byCategory = new Map();
+  for (const item of value) {
+    const category_id = item?.category_id || item?.categoryId || item?.id;
+    if (!category_id) continue;
+
+    const percent = clampNumber(
+      item?.percent ?? item?.adjustment_percent ?? item?.value,
+      0,
+      -100,
+      500
+    );
+
+    if (!Number.isFinite(percent) || percent === 0) continue;
+    byCategory.set(String(category_id), {
+      category_id,
+      percent: Number(percent.toFixed(2)),
+    });
+  }
+
+  return Array.from(byCategory.values());
+}
+
+function applyCategoryAdjustments(instances, adjustments) {
+  const rows = (instances || []).map((ev) => ({
+    ...ev,
+    amount: roundMoney(ev.amount),
+  }));
+
+  const results = [];
+  if (!Array.isArray(adjustments) || adjustments.length === 0) {
+    return { instances: rows.filter((ev) => ev.amount > 0), results };
+  }
+
+  for (const adj of adjustments) {
+    const percent = Number(adj.percent);
+    const categoryRows = rows.filter(
+      (ev) =>
+        ev.type === "expense" &&
+        String(ev.category_id) === String(adj.category_id) &&
+        ev.amount > 0
+    );
+
+    const baseTotal = roundMoney(
+      categoryRows.reduce((sum, ev) => sum + ev.amount, 0)
+    );
+
+    if (!Number.isFinite(percent) || percent === 0 || baseTotal <= 0) {
+      results.push({
+        category_id: adj.category_id,
+        percent,
+        status: "skipped",
+        reason: "no_expense_projection",
+      });
+      continue;
+    }
+
+    if (percent > 0) {
+      const candidates = categoryRows.filter(
+        (ev) => ev.forecast_bucket === "recurring"
+      );
+
+      if (candidates.length === 0) {
+        results.push({
+          category_id: adj.category_id,
+          percent,
+          status: "skipped",
+          reason: "no_recurring_transactions",
+          base_total: baseTotal,
+        });
+        continue;
+      }
+
+      const delta = roundMoney(baseTotal * (percent / 100));
+      distributeIncrease(candidates, delta);
+
+      results.push({
+        category_id: adj.category_id,
+        percent,
+        status: "applied",
+        strategy: "increase_recurring",
+        base_total: baseTotal,
+        applied_delta: delta,
+        affected_count: candidates.length,
+      });
+      continue;
+    }
+
+    const targetCut = roundMoney(baseTotal * (Math.abs(percent) / 100));
+    let remaining = targetCut;
+    const ordered = [...categoryRows].sort((a, b) => {
+      const rank = reductionRank(a) - reductionRank(b);
+      if (rank !== 0) return rank;
+      return (b.amount || 0) - (a.amount || 0);
+    });
+
+    let affectedCount = 0;
+    for (const ev of ordered) {
+      if (remaining <= 0) break;
+      const cut = Math.min(ev.amount, remaining);
+      if (cut <= 0) continue;
+      ev.amount = roundMoney(ev.amount - cut);
+      remaining = roundMoney(remaining - cut);
+      affectedCount++;
+    }
+
+    results.push({
+      category_id: adj.category_id,
+      percent,
+      status: "applied",
+      strategy: "decrease_occasional_eventual_recurring",
+      base_total: baseTotal,
+      applied_delta: roundMoney(-(targetCut - remaining)),
+      affected_count: affectedCount,
+    });
+  }
+
+  return {
+    instances: rows.filter((ev) => ev.amount > 0).map((ev) => ({
+      ...ev,
+      amount: roundMoney(ev.amount),
+    })),
+    results,
+  };
+}
+
+function distributeIncrease(candidates, delta) {
+  if (!candidates.length || delta <= 0) return;
+
+  const weights = candidates.map((ev) => {
+    const score = Number(ev.recurrence_score || ev.recurrence_weight || 1);
+    return Math.max(0.01, ev.amount) * Math.max(0.01, score);
+  });
+  const totalWeight = weights.reduce((sum, w) => sum + w, 0) || 1;
+
+  let remaining = roundMoney(delta);
+  candidates.forEach((ev, idx) => {
+    const add =
+      idx === candidates.length - 1
+        ? remaining
+        : roundMoney(delta * (weights[idx] / totalWeight));
+    ev.amount = roundMoney(ev.amount + add);
+    remaining = roundMoney(remaining - add);
+  });
+}
+
+function reductionRank(ev) {
+  if (ev.category_stability === "occasional") return 0;
+  if (ev.forecast_bucket === "eventual") return 1;
+  return 2;
 }
 
 function toISODate(d) {
