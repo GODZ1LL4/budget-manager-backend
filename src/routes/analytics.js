@@ -6319,6 +6319,198 @@ router.get("/mobile-monthly-report", authenticateUser, async (req, res) => {
   }
 });
 
+// GET /api/analytics/mobile-yearly-overview?year=2026
+// Overview anual agregado para la pantalla mobile Premium.
+router.get("/mobile-yearly-overview", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  try {
+    const hasPremium = await hasActivePremiumAccess(user_id);
+
+    if (!hasPremium) {
+      return res.status(403).json({
+        success: false,
+        error: "Este resumen anual esta disponible solo para Premium.",
+      });
+    }
+
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const rawYear = parseInt(req.query.year, 10);
+    const year =
+      Number.isFinite(rawYear) && rawYear >= 2000 && rawYear <= currentYear + 1
+        ? rawYear
+        : currentYear;
+    const limit = clampInt(req.query.limit, 10, 3, 25);
+
+    const start = `${year}-01-01`;
+    const end =
+      year === currentYear
+        ? toISODate(now)
+        : `${year}-12-31`;
+
+    const { data, error } = await supabase
+      .from("transactions")
+      .select(
+        `
+        id,
+        amount,
+        type,
+        date,
+        description,
+        category_id,
+        categories:categories!transactions_category_id_fkey (
+          name,
+          type
+        )
+      `
+      )
+      .eq("user_id", user_id)
+      .in("type", ["income", "expense"])
+      .gte("date", start)
+      .lte("date", end);
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    const rows = data || [];
+    const incomeRows = rows.filter((tx) => tx.type === "income");
+    const expenseRows = rows.filter((tx) => tx.type === "expense");
+
+    const totalIncome = sumNumeric(incomeRows, (tx) => tx.amount);
+    const totalExpense = sumNumeric(expenseRows, (tx) => tx.amount);
+    const net = totalIncome - totalExpense;
+    const savingsRate =
+      totalIncome > 0 ? ((totalIncome - totalExpense) / totalIncome) * 100 : null;
+
+    const months = {};
+    for (let i = 1; i <= 12; i++) {
+      const key = `${year}-${String(i).padStart(2, "0")}`;
+      months[key] = {
+        month: key,
+        income: 0,
+        expense: 0,
+        net: 0,
+        movements: 0,
+      };
+    }
+
+    const expenseCategories = {};
+    const incomeCategories = {};
+
+    rows.forEach((tx) => {
+      const amount = Number(tx.amount) || 0;
+      if (amount <= 0) return;
+
+      const month = String(tx.date || "").slice(0, 7);
+      if (months[month]) {
+        if (tx.type === "income") months[month].income += amount;
+        if (tx.type === "expense") months[month].expense += amount;
+        months[month].movements += 1;
+      }
+
+      const categoryKey = tx.category_id || "sin_categoria";
+      const categoryName = tx.categories?.name || "Sin categoria";
+      const target =
+        tx.type === "income" ? incomeCategories : expenseCategories;
+
+      if (!target[categoryKey]) {
+        target[categoryKey] = {
+          category_id: tx.category_id || null,
+          category_name: categoryName,
+          amount: 0,
+          count: 0,
+        };
+      }
+
+      target[categoryKey].amount += amount;
+      target[categoryKey].count += 1;
+    });
+
+    const monthlySummary = Object.values(months).map((month) => ({
+      ...month,
+      income: toRoundedNumber(month.income),
+      expense: toRoundedNumber(month.expense),
+      net: toRoundedNumber(month.income - month.expense),
+    }));
+
+    const activeMonths = monthlySummary.filter(
+      (month) => month.income > 0 || month.expense > 0
+    );
+    const activeMonthCount = Math.max(activeMonths.length, 1);
+
+    const mapCategories = (categoryMap, total) =>
+      Object.values(categoryMap)
+        .map((row) => ({
+          category_id: row.category_id,
+          category_name: row.category_name,
+          amount: toRoundedNumber(row.amount),
+          count: row.count,
+          share_pct: total > 0 ? toRoundedNumber((row.amount / total) * 100) : 0,
+        }))
+        .sort((a, b) => b.amount - a.amount)
+        .slice(0, limit);
+
+    const mapTransactions = (txRows) =>
+      txRows
+        .map((tx) => ({
+          id: tx.id,
+          date: tx.date,
+          type: tx.type,
+          description: tx.description || "Sin descripcion",
+          category_id: tx.category_id || null,
+          category_name: tx.categories?.name || "Sin categoria",
+          amount: toRoundedNumber(tx.amount),
+        }))
+        .sort((a, b) => b.amount - a.amount || b.date.localeCompare(a.date))
+        .slice(0, limit);
+
+    const bestNetMonth = [...activeMonths].sort((a, b) => b.net - a.net)[0] || null;
+    const highestExpenseMonth =
+      [...activeMonths].sort((a, b) => b.expense - a.expense)[0] || null;
+    const highestIncomeMonth =
+      [...activeMonths].sort((a, b) => b.income - a.income)[0] || null;
+
+    return res.json({
+      success: true,
+      data: {
+        year,
+        range: { start, end },
+        totals: {
+          income: toRoundedNumber(totalIncome),
+          expense: toRoundedNumber(totalExpense),
+          net: toRoundedNumber(net),
+          savings_rate_pct:
+            savingsRate == null ? null : toRoundedNumber(savingsRate),
+          movements: rows.length,
+          income_movements: incomeRows.length,
+          expense_movements: expenseRows.length,
+          average_monthly_income: toRoundedNumber(totalIncome / activeMonthCount),
+          average_monthly_expense: toRoundedNumber(
+            totalExpense / activeMonthCount
+          ),
+          average_monthly_net: toRoundedNumber(net / activeMonthCount),
+        },
+        highlights: {
+          best_net_month: bestNetMonth,
+          highest_expense_month: highestExpenseMonth,
+          highest_income_month: highestIncomeMonth,
+        },
+        top_transactions: mapTransactions(rows),
+        top_expense_transactions: mapTransactions(expenseRows),
+        top_income_transactions: mapTransactions(incomeRows),
+        top_expense_categories: mapCategories(expenseCategories, totalExpense),
+        top_income_categories: mapCategories(incomeCategories, totalIncome),
+        monthly_summary: monthlySummary,
+      },
+    });
+  } catch (err) {
+    console.error("Error en /analytics/mobile-yearly-overview:", err);
+    return res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
+
 
 /* ========= GASTOS HORMIGA (CORREGIDO) ========= */
 
