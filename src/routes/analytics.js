@@ -3,6 +3,7 @@ const express = require("express");
 const router = express.Router();
 const supabase = require("../lib/supabase");
 const authenticateUser = require("../middlewares/auth");
+const { isSubscriptionEntitled } = require("../lib/googlePlaySubscriptions");
 
 /* ========= Helpers comunes ========= */
 
@@ -34,6 +35,15 @@ const getMonthDateRange = (year, monthIndex0) => {
   const end = new Date(year, monthIndex0 + 1, 0).toISOString().split("T")[0];
   return { start, end };
 };
+
+const toRoundedNumber = (value, decimals = 2) => {
+  const number = Number(value);
+  const safeNumber = Number.isFinite(number) ? number : 0;
+  return Number(safeNumber.toFixed(decimals));
+};
+
+const sumNumeric = (rows, pickValue) =>
+  (rows || []).reduce((sum, row) => sum + (Number(pickValue(row)) || 0), 0);
 
 /* ========= ITEM PRICES ========= */
 
@@ -5759,6 +5769,539 @@ router.get("/budget-coverage-robust", authenticateUser, async (req, res) => {
     return res
       .status(500)
       .json({ error: "Error interno calculando cobertura robusta" });
+  }
+});
+
+
+async function hasActivePremiumAccess(userId) {
+  const { data, error } = await supabase
+    .from("user_subscriptions")
+    .select("status, expires_at, updated_at")
+    .eq("user_id", userId)
+    .order("updated_at", { ascending: false })
+    .limit(10);
+
+  if (error) {
+    throw error;
+  }
+
+  return (data || []).some((row) =>
+    isSubscriptionEntitled(row?.status, row?.expires_at)
+  );
+}
+
+// GET /api/analytics/mobile-monthly-report
+// Reporte agregado para la pantalla mobile Premium.
+router.get("/mobile-monthly-report", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  try {
+    const hasPremium = await hasActivePremiumAccess(user_id);
+
+    if (!hasPremium) {
+      return res.status(403).json({
+        success: false,
+        error: "Este reporte esta disponible solo para Premium.",
+      });
+    }
+
+    const now = new Date();
+    const year = now.getFullYear();
+    const monthIndex = now.getMonth();
+    const monthNumber = monthIndex + 1;
+    const monthKey = `${year}-${String(monthNumber).padStart(2, "0")}`;
+
+    const monthStartObj = new Date(year, monthIndex, 1);
+    const monthEndObj = new Date(year, monthIndex + 1, 0);
+    const todayObj = new Date(
+      year,
+      monthIndex,
+      Math.min(now.getDate(), monthEndObj.getDate())
+    );
+
+    const monthStart = toISODate(monthStartObj);
+    const monthEnd = toISODate(monthEndObj);
+    const today = toISODate(todayObj);
+    const daysInMonth = monthEndObj.getDate();
+    const dayOfMonth = todayObj.getDate();
+    const remainingDays = Math.max(daysInMonth - dayOfMonth, 0);
+    const elapsedRatio = daysInMonth > 0 ? dayOfMonth / daysInMonth : 0;
+
+    const previousMonthStartObj = new Date(year, monthIndex - 1, 1);
+    const previousMonthEndObj = new Date(year, monthIndex, 0);
+    const previousComparableEndObj = new Date(
+      previousMonthStartObj.getFullYear(),
+      previousMonthStartObj.getMonth(),
+      Math.min(dayOfMonth, previousMonthEndObj.getDate())
+    );
+
+    const previousMonthStart = toISODate(previousMonthStartObj);
+    const previousComparableEnd = toISODate(previousComparableEndObj);
+
+    const historyStartObj = new Date(year, monthIndex - 6, 1);
+    const historyEndObj = new Date(year, monthIndex, 0);
+    const historyStart = toISODate(historyStartObj);
+    const historyEnd = toISODate(historyEndObj);
+
+    const [
+      currentTxResult,
+      previousTxResult,
+      historyTxResult,
+      budgetsResult,
+      accountsResult,
+      goalsResult,
+    ] = await Promise.all([
+      supabase
+        .from("transactions")
+        .select(
+          `
+          id,
+          amount,
+          type,
+          date,
+          description,
+          category_id,
+          categories:categories!transactions_category_id_fkey (
+            name,
+            stability_type,
+            type
+          )
+        `
+        )
+        .eq("user_id", user_id)
+        .in("type", ["income", "expense"])
+        .gte("date", monthStart)
+        .lte("date", today),
+      supabase
+        .from("transactions")
+        .select("amount, type, date")
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", previousMonthStart)
+        .lte("date", previousComparableEnd),
+      supabase
+        .from("transactions")
+        .select(
+          `
+          id,
+          amount,
+          type,
+          date,
+          description,
+          category_id,
+          categories:categories!transactions_category_id_fkey (
+            name,
+            stability_type
+          )
+        `
+        )
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", historyStart)
+        .lte("date", historyEnd),
+      supabase
+        .from("budgets")
+        .select("id, month, category_id, limit_amount, categories(name, type)")
+        .eq("user_id", user_id)
+        .eq("month", monthKey),
+      supabase
+        .from("account_balances_extended")
+        .select("id, name, current_balance, reserved_total, available_balance")
+        .eq("user_id", user_id)
+        .order("name", { ascending: true }),
+      supabase
+        .from("goals")
+        .select(
+          "id, name, target_amount, due_date, status, is_priority, account_id"
+        )
+        .eq("user_id", user_id)
+        .in("status", ["active", "paused"]),
+    ]);
+
+    const requiredErrors = [
+      currentTxResult.error,
+      previousTxResult.error,
+      historyTxResult.error,
+      budgetsResult.error,
+      goalsResult.error,
+    ].filter(Boolean);
+
+    if (requiredErrors.length > 0) {
+      return res.status(500).json({ error: requiredErrors[0].message });
+    }
+
+    const currentTransactions = currentTxResult.data || [];
+    const currentExpenses = currentTransactions.filter(
+      (tx) => tx.type === "expense"
+    );
+    const currentIncome = currentTransactions.filter(
+      (tx) => tx.type === "income"
+    );
+
+    const expenseTotal = sumNumeric(currentExpenses, (tx) => tx.amount);
+    const incomeTotal = sumNumeric(currentIncome, (tx) => tx.amount);
+    const previousExpenseTotal = sumNumeric(
+      previousTxResult.data || [],
+      (tx) => tx.amount
+    );
+
+    const dailyAverage = dayOfMonth > 0 ? expenseTotal / dayOfMonth : 0;
+    const projectedExpense = dailyAverage * daysInMonth;
+    const netToDate = incomeTotal - expenseTotal;
+    const projectedNet = incomeTotal - projectedExpense;
+    const expenseDelta = expenseTotal - previousExpenseTotal;
+    const expenseDeltaPct =
+      previousExpenseTotal > 0
+        ? (expenseDelta / previousExpenseTotal) * 100
+        : null;
+
+    const categoryMap = {};
+    const ensureCategory = (categoryId, categoryName) => {
+      const key = categoryId || "sin_categoria";
+      if (!categoryMap[key]) {
+        categoryMap[key] = {
+          category_id: categoryId || null,
+          category_name: categoryName || "Sin categoria",
+          amount: 0,
+          count: 0,
+        };
+      }
+      return categoryMap[key];
+    };
+
+    currentExpenses.forEach((tx) => {
+      const row = ensureCategory(
+        tx.category_id,
+        tx.categories?.name || "Sin categoria"
+      );
+      row.amount += Number(tx.amount) || 0;
+      row.count += 1;
+    });
+
+    const topCategories = Object.values(categoryMap)
+      .map((row) => ({
+        ...row,
+        amount: toRoundedNumber(row.amount),
+        share_pct:
+          expenseTotal > 0 ? toRoundedNumber((row.amount / expenseTotal) * 100) : 0,
+      }))
+      .sort((a, b) => b.amount - a.amount)
+      .slice(0, 8);
+
+    const budgetByCategory = {};
+    (budgetsResult.data || []).forEach((budget) => {
+      if (!budget?.category_id) return;
+      if (budget.categories?.type && budget.categories.type !== "expense") return;
+
+      const key = budget.category_id;
+      if (!budgetByCategory[key]) {
+        budgetByCategory[key] = {
+          category_id: key,
+          category_name: budget.categories?.name || "Sin categoria",
+          limit: 0,
+          spent: 0,
+        };
+      }
+
+      budgetByCategory[key].limit += Number(budget.limit_amount) || 0;
+    });
+
+    currentExpenses.forEach((tx) => {
+      const key = tx.category_id;
+      if (!key || !budgetByCategory[key]) return;
+      budgetByCategory[key].spent += Number(tx.amount) || 0;
+    });
+
+    const budgetCategories = Object.values(budgetByCategory)
+      .map((row) => {
+        const over = Math.max(row.spent - row.limit, 0);
+        const remaining = row.limit - row.spent;
+        const usedPct = row.limit > 0 ? (row.spent / row.limit) * 100 : 0;
+
+        return {
+          category_id: row.category_id,
+          category_name: row.category_name,
+          limit: toRoundedNumber(row.limit),
+          spent: toRoundedNumber(row.spent),
+          remaining: toRoundedNumber(remaining),
+          over: toRoundedNumber(over),
+          used_pct: toRoundedNumber(usedPct),
+          status: over > 0 ? "over" : usedPct >= 85 ? "risk" : "ok",
+        };
+      })
+      .sort((a, b) => b.used_pct - a.used_pct);
+
+    const budgetedTotal = sumNumeric(budgetCategories, (row) => row.limit);
+    const spentWithBudget = sumNumeric(budgetCategories, (row) => row.spent);
+    const coveredTotal = sumNumeric(budgetCategories, (row) =>
+      Math.min(row.spent, row.limit)
+    );
+    const overBudgetTotal = sumNumeric(budgetCategories, (row) => row.over);
+
+    const withoutBudgetCategories = Object.values(categoryMap)
+      .filter((row) => !row.category_id || !budgetByCategory[row.category_id])
+      .map((row) => ({
+        category_id: row.category_id,
+        category_name: row.category_name,
+        amount: toRoundedNumber(row.amount),
+        count: row.count,
+      }))
+      .sort((a, b) => b.amount - a.amount);
+
+    const withoutBudgetTotal = sumNumeric(
+      withoutBudgetCategories,
+      (row) => row.amount
+    );
+    const coveragePct =
+      expenseTotal > 0 ? (coveredTotal / expenseTotal) * 100 : 0;
+    const budgetUsedPct =
+      budgetedTotal > 0 ? (expenseTotal / budgetedTotal) * 100 : 0;
+    const expectedBudgetToDate = budgetedTotal * elapsedRatio;
+    const paceVariance = expenseTotal - expectedBudgetToDate;
+    const paceRatioPct =
+      expectedBudgetToDate > 0
+        ? (expenseTotal / expectedBudgetToDate) * 100
+        : null;
+    const remainingAgainstBudget = budgetedTotal - expenseTotal;
+    const remainingDailyAllowance =
+      Math.max(remainingAgainstBudget, 0) / Math.max(remainingDays, 1);
+
+    const historyByCategory = {};
+    (historyTxResult.data || []).forEach((tx) => {
+      const key = tx.category_id || "sin_categoria";
+      const amount = Number(tx.amount) || 0;
+      if (amount <= 0) return;
+      if (!historyByCategory[key]) historyByCategory[key] = [];
+      historyByCategory[key].push(amount);
+    });
+
+    const unusualExpenses = currentExpenses
+      .map((tx) => {
+        const key = tx.category_id || "sin_categoria";
+        const values = historyByCategory[key] || [];
+        if (values.length < 4) return null;
+
+        const baselineMedian = median(values);
+        const baselineMean = mean(values);
+        const baselineStd = stdDev(values);
+        const threshold = Math.max(
+          baselineMedian * 1.8,
+          baselineMean + baselineStd * 1.35
+        );
+        const amount = Number(tx.amount) || 0;
+
+        if (!Number.isFinite(threshold) || threshold <= 0) return null;
+        if (amount <= threshold) return null;
+
+        return {
+          id: tx.id,
+          date: tx.date,
+          description: tx.description || "Sin descripcion",
+          category_id: tx.category_id || null,
+          category_name: tx.categories?.name || "Sin categoria",
+          amount: toRoundedNumber(amount),
+          baseline: toRoundedNumber(threshold),
+          above_baseline: toRoundedNumber(amount - threshold),
+          above_baseline_pct: toRoundedNumber(
+            ((amount - threshold) / threshold) * 100
+          ),
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.above_baseline - a.above_baseline)
+      .slice(0, 6);
+
+    const dailyMap = {};
+    for (let day = 1; day <= daysInMonth; day++) {
+      const date = `${monthKey}-${String(day).padStart(2, "0")}`;
+      dailyMap[date] = 0;
+    }
+
+    currentExpenses.forEach((tx) => {
+      if (!dailyMap[tx.date]) dailyMap[tx.date] = 0;
+      dailyMap[tx.date] += Number(tx.amount) || 0;
+    });
+
+    const dailySeries = Object.entries(dailyMap).map(([date, amount]) => {
+      const day = Number(date.slice(8, 10));
+      return {
+        date,
+        day,
+        amount: day <= dayOfMonth ? toRoundedNumber(amount) : null,
+        expected_budget: budgetedTotal > 0
+          ? toRoundedNumber(budgetedTotal / daysInMonth)
+          : 0,
+      };
+    });
+
+    const accounts = !accountsResult.error
+      ? (accountsResult.data || []).map((account) => ({
+          id: account.id,
+          name: account.name || "Cuenta",
+          current_balance: toRoundedNumber(account.current_balance),
+          reserved_total: toRoundedNumber(account.reserved_total),
+          available_balance: toRoundedNumber(account.available_balance),
+        }))
+      : [];
+
+    const accountSummary = {
+      count: accounts.length,
+      current_balance: toRoundedNumber(
+        sumNumeric(accounts, (account) => account.current_balance)
+      ),
+      reserved_total: toRoundedNumber(
+        sumNumeric(accounts, (account) => account.reserved_total)
+      ),
+      available_balance: toRoundedNumber(
+        sumNumeric(accounts, (account) => account.available_balance)
+      ),
+      top_accounts: accounts
+        .sort((a, b) => b.available_balance - a.available_balance)
+        .slice(0, 3),
+    };
+
+    const goals = goalsResult.data || [];
+    const goalIds = goals.map((goal) => goal.id).filter(Boolean);
+    let goalMovements = [];
+
+    if (goalIds.length > 0) {
+      const goalMovementsResult = await supabase
+        .from("goal_movements")
+        .select("goal_id, type, amount")
+        .eq("user_id", user_id)
+        .in("goal_id", goalIds);
+
+      if (goalMovementsResult.error) {
+        return res.status(500).json({ error: goalMovementsResult.error.message });
+      }
+
+      goalMovements = goalMovementsResult.data || [];
+    }
+
+    const reservedByGoal = {};
+    goalMovements.forEach((movement) => {
+      const amount = Number(movement.amount) || 0;
+      const sign =
+        movement.type === "deposit" || movement.type === "adjust" ? 1 : -1;
+      reservedByGoal[movement.goal_id] =
+        (reservedByGoal[movement.goal_id] || 0) + sign * amount;
+    });
+
+    const enrichedGoals = goals
+      .map((goal) => {
+        const target = Number(goal.target_amount) || 0;
+        const reserved = Number(reservedByGoal[goal.id]) || 0;
+        const progressPct = target > 0 ? (reserved / target) * 100 : 0;
+
+        return {
+          id: goal.id,
+          name: goal.name || "Meta",
+          target_amount: toRoundedNumber(target),
+          reserved_amount: toRoundedNumber(reserved),
+          remaining_amount: toRoundedNumber(Math.max(target - reserved, 0)),
+          progress_pct: toRoundedNumber(progressPct),
+          due_date: goal.due_date || null,
+          is_priority: goal.is_priority === true,
+          status: goal.status || "active",
+        };
+      })
+      .sort((a, b) => {
+        if (a.is_priority !== b.is_priority) return a.is_priority ? -1 : 1;
+        if (a.due_date && b.due_date) return a.due_date.localeCompare(b.due_date);
+        if (a.due_date) return -1;
+        if (b.due_date) return 1;
+        return b.progress_pct - a.progress_pct;
+      });
+
+    const projectedOverBudget = projectedExpense - budgetedTotal;
+
+    return res.json({
+      success: true,
+      data: {
+        premium: true,
+        month: {
+          key: monthKey,
+          start: monthStart,
+          end: monthEnd,
+          today,
+          day_of_month: dayOfMonth,
+          days_in_month: daysInMonth,
+          remaining_days: remainingDays,
+          elapsed_pct: toRoundedNumber(elapsedRatio * 100),
+        },
+        summary: {
+          income: toRoundedNumber(incomeTotal),
+          expense: toRoundedNumber(expenseTotal),
+          net: toRoundedNumber(netToDate),
+          previous_expense: toRoundedNumber(previousExpenseTotal),
+          expense_delta: toRoundedNumber(expenseDelta),
+          expense_delta_pct:
+            expenseDeltaPct == null ? null : toRoundedNumber(expenseDeltaPct),
+          daily_average: toRoundedNumber(dailyAverage),
+          projected_expense: toRoundedNumber(projectedExpense),
+          projected_net: toRoundedNumber(projectedNet),
+          remaining_daily_allowance: toRoundedNumber(remainingDailyAllowance),
+          movements: currentTransactions.length,
+        },
+        budgets: {
+          budgeted: toRoundedNumber(budgetedTotal),
+          spent: toRoundedNumber(expenseTotal),
+          spent_with_budget: toRoundedNumber(spentWithBudget),
+          covered: toRoundedNumber(coveredTotal),
+          over_budget: toRoundedNumber(overBudgetTotal),
+          without_budget: toRoundedNumber(withoutBudgetTotal),
+          remaining_against_budget: toRoundedNumber(remainingAgainstBudget),
+          used_pct: toRoundedNumber(budgetUsedPct),
+          coverage_pct: toRoundedNumber(coveragePct),
+          risk_count: budgetCategories.filter((row) => row.status === "risk")
+            .length,
+          over_count: budgetCategories.filter((row) => row.status === "over")
+            .length,
+          categories: budgetCategories.slice(0, 8),
+          without_budget_categories: withoutBudgetCategories.slice(0, 5),
+        },
+        categories: {
+          top: topCategories,
+        },
+        alerts: {
+          unusual_expenses: unusualExpenses,
+        },
+        accounts: accountSummary,
+        goals: {
+          count: enrichedGoals.length,
+          reserved_total: toRoundedNumber(
+            sumNumeric(enrichedGoals, (goal) => goal.reserved_amount)
+          ),
+          target_total: toRoundedNumber(
+            sumNumeric(enrichedGoals, (goal) => goal.target_amount)
+          ),
+          top_goals: enrichedGoals.slice(0, 3),
+        },
+        daily_series: dailySeries,
+        signals: {
+          projected_over_budget: toRoundedNumber(projectedOverBudget),
+          pace_variance: toRoundedNumber(paceVariance),
+          pace_ratio_pct:
+            paceRatioPct == null ? null : toRoundedNumber(paceRatioPct),
+          has_unusual_expenses: unusualExpenses.length > 0,
+          has_without_budget: withoutBudgetTotal > 0,
+          is_projected_over_budget: projectedOverBudget > 0,
+        },
+        meta: {
+          previous_period: {
+            start: previousMonthStart,
+            end: previousComparableEnd,
+          },
+          history_period: {
+            start: historyStart,
+            end: historyEnd,
+          },
+        },
+      },
+    });
+  } catch (err) {
+    console.error("Error en /analytics/mobile-monthly-report:", err);
+    return res.status(500).json({ error: "Error interno del servidor" });
   }
 });
 
