@@ -3770,6 +3770,13 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       2,
       parseInt(req.query.min_occurrences ?? "3", 10) || 3
     );
+    const rawForecast =
+      String(req.query.raw || req.query.no_limit || "").trim() === "1" ||
+      String(req.query.raw || req.query.no_limit || "")
+        .trim()
+        .toLowerCase() === "true" ||
+      String(req.query.limit || "").trim().toLowerCase() === "all";
+
     const limit = Math.max(
       1,
       Math.min(50, parseInt(req.query.limit ?? "15", 10) || 15)
@@ -4136,28 +4143,31 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
     }
 
     // =========================
-    // Mezclar + ordenar + limitar
+    // Mezclar + ordenar. raw=1 devuelve todo, sin recorte por top.
     // =========================
     const combined = [...recurringPatterns, ...noisePatterns];
     combined.sort((a, b) => (b.projection || 0) - (a.projection || 0));
-    const top = combined.slice(0, limit);
+    const responseRows = rawForecast ? combined : combined.slice(0, limit);
 
     // =========================
     // Summary ampliado
     // =========================
-    const total_projected = top.reduce((s, r) => s + (r.projection || 0), 0);
+    const total_projected = responseRows.reduce(
+      (s, r) => s + (r.projection || 0),
+      0
+    );
 
-    const total_expense = top
+    const total_expense = responseRows
       .filter((r) => r.tx_type === "expense")
       .reduce((s, r) => s + (r.projection || 0), 0);
 
-    const total_income = top
+    const total_income = responseRows
       .filter((r) => r.tx_type === "income")
       .reduce((s, r) => s + (r.projection || 0), 0);
 
     const net_projected = total_income - total_expense;
 
-    const transactions_expected = top.reduce(
+    const transactions_expected = responseRows.reduce(
       (s, r) => s + (r.expected_count || 0),
       0
     );
@@ -4206,6 +4216,10 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
         include_noise: includeNoise,
         types: safeTypes,
         include_balance: includeBalance,
+        raw: rawForecast,
+        limit: rawForecast ? null : limit,
+        total_patterns: combined.length,
+        returned_patterns: responseRows.length,
       },
       summary: {
         total_projected: Number(total_projected.toFixed(2)),
@@ -4215,7 +4229,7 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
         transactions_expected,
         ...(balance ? { balance } : {}),
       },
-      data: top,
+      data: responseRows,
     });
   } catch (err) {
     console.error("Error en /analytics/expense-forecast:", {
