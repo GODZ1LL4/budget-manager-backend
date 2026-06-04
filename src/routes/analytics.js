@@ -4,6 +4,12 @@ const router = express.Router();
 const supabase = require("../lib/supabase");
 const authenticateUser = require("../middlewares/auth");
 const { isSubscriptionEntitled } = require("../lib/googlePlaySubscriptions");
+const {
+  addMonthsToMonthKey,
+  getCurrentMonthRange,
+  getMonthRange,
+  getRequestTimeZone,
+} = require("../lib/timeZone");
 
 /* ========= Helpers comunes ========= */
 
@@ -44,6 +50,9 @@ const toRoundedNumber = (value, decimals = 2) => {
 
 const sumNumeric = (rows, pickValue) =>
   (rows || []).reduce((sum, row) => sum + (Number(pickValue(row)) || 0), 0);
+
+const getRequestCurrentMonthRange = (req) =>
+  getCurrentMonthRange(new Date(), getRequestTimeZone(req));
 
 /* ========= ITEM PRICES ========= */
 
@@ -3755,6 +3764,18 @@ function parseISODateOnly(iso) {
   return new Date(Date.UTC(y, m - 1, d)); // ✅ date-only en UTC
 }
 
+function firstDayOfMonth(date) {
+  const base = date instanceof Date ? date : parseISODateOnly(date);
+  if (!base || Number.isNaN(base.getTime())) return null;
+  return new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), 1));
+}
+
+function lastDayOfMonth(date) {
+  const base = date instanceof Date ? date : parseISODateOnly(date);
+  if (!base || Number.isNaN(base.getTime())) return null;
+  return new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() + 1, 0));
+}
+
 router.get("/expense-forecast", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
 
@@ -3828,9 +3849,10 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
     let dateToObj;
 
     if (!rawFrom && !rawTo) {
-      // Mes actual completo
-      dateFromObj = firstDayOfMonth(new Date());
-      dateToObj = lastDayOfMonth(new Date());
+      // Mes financiero actual, respetando zona horaria y corte de reporte.
+      const reportRange = getRequestCurrentMonthRange(req);
+      dateFromObj = parseISODateOnly(reportRange.start);
+      dateToObj = parseISODateOnly(reportRange.end);
     } else if (rawFrom && !rawTo) {
       // Si solo viene from: DESDE ese día hasta fin de ese mes
       const base = parseISODateOnly(rawFrom);
@@ -3853,7 +3875,7 @@ router.get("/expense-forecast", authenticateUser, async (req, res) => {
       // ambos vienen
       const f = parseISODateOnly(rawFrom);
       const t = parseISODateOnly(rawTo);
-      if (Number.isNaN(f.getTime()) || Number.isNaN(t.getTime())) {
+      if (!f || !t || Number.isNaN(f.getTime()) || Number.isNaN(t.getTime())) {
         return res
           .status(400)
           .json({ error: "date_from/date_to inválidas (YYYY-MM-DD)" });
@@ -4411,8 +4433,9 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
     let dateToObj;
 
     if (!rawFrom && !rawTo) {
-      dateFromObj = firstDayOfMonth(new Date());
-      dateToObj = lastDayOfMonth(new Date());
+      const reportRange = getRequestCurrentMonthRange(req);
+      dateFromObj = parseISODateOnly(reportRange.start);
+      dateToObj = parseISODateOnly(reportRange.end);
     } else if (rawFrom && !rawTo) {
       const base = parseISODateOnly(rawFrom);
       if (!base || Number.isNaN(base.getTime())) {
@@ -4775,25 +4798,17 @@ router.get(
     const user_id = req.user.id;
 
     try {
-      const now = new Date();
-      const year = now.getFullYear();
-      const monthIndex = now.getMonth();
-      const monthKey = `${year}-${String(monthIndex + 1).padStart(2, "0")}`;
+      const reportRange = getRequestCurrentMonthRange(req);
+      const monthKey = reportRange.currentMonthKey;
+      const date_from = reportRange.start;
+      const date_to = reportRange.end;
+      const today = reportRange.today;
+      const dateFromObj = parseISODateOnly(date_from);
 
-      const dateFromObj = new Date(year, monthIndex, 1);
-      const dateToObj = new Date(year, monthIndex + 1, 0);
-
-      const date_from = toISODate(dateFromObj);
-      const date_to = toISODate(dateToObj);
-      const today = toISODate(now);
-
-      const day_of_month = now.getDate();
-      const days_in_month = dateToObj.getDate();
+      const day_of_month = reportRange.day;
+      const days_in_month = Number(date_to.slice(8, 10));
       const remaining_days = Math.max(days_in_month - day_of_month, 0);
-
-      const tomorrowObj = new Date(now);
-      tomorrowObj.setDate(tomorrowObj.getDate() + 1);
-      const tomorrow = toISODate(tomorrowObj);
+      const tomorrow = addDays(today, 1);
 
       const months = clampInt(req.query.months, 12, 1, 36);
       const minOccurrences = clampInt(req.query.min_occurrences, 3, 2, 50);
@@ -4817,10 +4832,10 @@ router.get(
         : 0.6;
 
       const historyToObj = new Date(dateFromObj);
-      historyToObj.setDate(historyToObj.getDate() - 1);
+      historyToObj.setUTCDate(historyToObj.getUTCDate() - 1);
 
       const historyFromObj = new Date(dateFromObj);
-      historyFromObj.setMonth(historyFromObj.getMonth() - months);
+      historyFromObj.setUTCMonth(historyFromObj.getUTCMonth() - months);
 
       const history_from = toISODate(historyFromObj);
       const history_to = toISODate(historyToObj);
@@ -5819,43 +5834,27 @@ router.get("/mobile-monthly-report", authenticateUser, async (req, res) => {
       });
     }
 
-    const now = new Date();
-    const year = now.getFullYear();
-    const monthIndex = now.getMonth();
-    const monthNumber = monthIndex + 1;
-    const monthKey = `${year}-${String(monthNumber).padStart(2, "0")}`;
-
-    const monthStartObj = new Date(year, monthIndex, 1);
-    const monthEndObj = new Date(year, monthIndex + 1, 0);
-    const todayObj = new Date(
-      year,
-      monthIndex,
-      Math.min(now.getDate(), monthEndObj.getDate())
-    );
-
-    const monthStart = toISODate(monthStartObj);
-    const monthEnd = toISODate(monthEndObj);
-    const today = toISODate(todayObj);
-    const daysInMonth = monthEndObj.getDate();
-    const dayOfMonth = todayObj.getDate();
+    const reportRange = getRequestCurrentMonthRange(req);
+    const monthKey = reportRange.currentMonthKey;
+    const monthStart = reportRange.start;
+    const monthEnd = reportRange.end;
+    const today = reportRange.today;
+    const daysInMonth = Number(monthEnd.slice(8, 10));
+    const dayOfMonth = reportRange.day;
     const remainingDays = Math.max(daysInMonth - dayOfMonth, 0);
     const elapsedRatio = daysInMonth > 0 ? dayOfMonth / daysInMonth : 0;
 
-    const previousMonthStartObj = new Date(year, monthIndex - 1, 1);
-    const previousMonthEndObj = new Date(year, monthIndex, 0);
-    const previousComparableEndObj = new Date(
-      previousMonthStartObj.getFullYear(),
-      previousMonthStartObj.getMonth(),
-      Math.min(dayOfMonth, previousMonthEndObj.getDate())
-    );
+    const previousMonthKey = addMonthsToMonthKey(monthKey, -1);
+    const previousMonthRange = getMonthRange(previousMonthKey);
+    const previousMonthStart = previousMonthRange.start;
+    const previousMonthDays = Number(previousMonthRange.end.slice(8, 10));
+    const previousComparableDay = Math.min(dayOfMonth, previousMonthDays);
+    const previousComparableEnd = `${previousMonthKey}-${String(
+      previousComparableDay
+    ).padStart(2, "0")}`;
 
-    const previousMonthStart = toISODate(previousMonthStartObj);
-    const previousComparableEnd = toISODate(previousComparableEndObj);
-
-    const historyStartObj = new Date(year, monthIndex - 6, 1);
-    const historyEndObj = new Date(year, monthIndex, 0);
-    const historyStart = toISODate(historyStartObj);
-    const historyEnd = toISODate(historyEndObj);
+    const historyStart = `${addMonthsToMonthKey(monthKey, -6)}-01`;
+    const historyEnd = previousMonthRange.end;
 
     const [
       currentTxResult,
@@ -6334,8 +6333,8 @@ router.get("/mobile-yearly-overview", authenticateUser, async (req, res) => {
       });
     }
 
-    const now = new Date();
-    const currentYear = now.getFullYear();
+    const reportRange = getRequestCurrentMonthRange(req);
+    const currentYear = reportRange.year;
     const rawYear = parseInt(req.query.year, 10);
     const year =
       Number.isFinite(rawYear) && rawYear >= 2000 && rawYear <= currentYear + 1
@@ -6346,7 +6345,7 @@ router.get("/mobile-yearly-overview", authenticateUser, async (req, res) => {
     const start = `${year}-01-01`;
     const end =
       year === currentYear
-        ? toISODate(now)
+        ? reportRange.today
         : `${year}-12-31`;
 
     const { data, error } = await supabase
