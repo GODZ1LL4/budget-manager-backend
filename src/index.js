@@ -16,6 +16,10 @@ app.get("/", (req, res) => {
   res.send("API de Presupuesto Personal 🚀");
 });
 
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true });
+});
+
 const categoriesRoute = require("./routes/categories");
 app.use("/api/categories", categoriesRoute);
 
