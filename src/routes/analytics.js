@@ -1949,6 +1949,395 @@ router.get("/item-monthly-comparison", authenticateUser, async (req, res) => {
   }
 });
 
+/* ========= CENTRO DE COMANDO DE PRECIOS POR ITEM ========= */
+
+function isDateKey(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
+}
+
+function readPositiveNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : fallback;
+}
+
+function percentChange(current, previous) {
+  const curr = Number(current);
+  const prev = Number(previous);
+  if (!Number.isFinite(curr) || !Number.isFinite(prev) || prev <= 0) {
+    return null;
+  }
+  return ((curr - prev) / prev) * 100;
+}
+
+function getTransactionItemFinalNumbers(row) {
+  const quantity = Number(row.quantity || 0);
+  if (!Number.isFinite(quantity) || quantity <= 0) return null;
+
+  const lineTotal =
+    row.line_total_final != null ? Number(row.line_total_final) : null;
+  const unitFinal =
+    row.unit_price_final != null ? Number(row.unit_price_final) : null;
+
+  let unitPrice = null;
+
+  if (Number.isFinite(unitFinal) && unitFinal > 0) {
+    unitPrice = unitFinal;
+  } else if (Number.isFinite(lineTotal) && lineTotal > 0) {
+    unitPrice = lineTotal / quantity;
+  } else {
+    const unitNet = Number(row.unit_price_net || 0);
+    const rate = row.is_exempt_used ? 0 : Number(row.tax_rate_used || 0);
+    if (!Number.isFinite(unitNet) || unitNet <= 0) return null;
+    unitPrice = unitNet * (1 + (Number.isFinite(rate) ? rate : 0) / 100);
+  }
+
+  if (!Number.isFinite(unitPrice) || unitPrice <= 0) return null;
+
+  const amount =
+    Number.isFinite(lineTotal) && lineTotal > 0 ? lineTotal : unitPrice * quantity;
+
+  return {
+    quantity,
+    unit_price: unitPrice,
+    amount,
+  };
+}
+
+function classifyPriceMove(currentPrice, previousPrice, minIncreasePct) {
+  const pct = percentChange(currentPrice, previousPrice);
+  if (pct == null) return "flat";
+  if (pct > minIncreasePct) return "up";
+  if (pct < -minIncreasePct) return "down";
+  return "flat";
+}
+
+function buildItemPriceSignal(group, minIncreasePct) {
+  const entries = Object.values(group.dailyMap || {})
+    .map((entry) => {
+      const quantity = Number(entry.quantity || 0);
+      const amount = Number(entry.amount || 0);
+      const unitPrice = quantity > 0 ? amount / quantity : 0;
+
+      return {
+        date: entry.date,
+        quantity: toRoundedNumber(quantity),
+        amount: toRoundedNumber(amount),
+        unit_price: toRoundedNumber(unitPrice),
+        transactions: entry.transactions || 1,
+        description: entry.description || "",
+        category_name: entry.category_name || null,
+      };
+    })
+    .filter((entry) => entry.quantity > 0 && entry.unit_price > 0)
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  if (entries.length === 0) return null;
+
+  const latest = entries[entries.length - 1];
+  const previous = entries.length > 1 ? entries[entries.length - 2] : null;
+
+  let currentStreak = 0;
+  let runningStreak = 0;
+  let maxStreak = 0;
+  let totalIncreases = 0;
+  let totalDecreases = 0;
+  let totalFlat = 0;
+  const moves = [];
+
+  for (let i = 1; i < entries.length; i++) {
+    const prev = entries[i - 1];
+    const curr = entries[i];
+    const diffAmount = curr.unit_price - prev.unit_price;
+    const diffPct = percentChange(curr.unit_price, prev.unit_price);
+    const direction = classifyPriceMove(
+      curr.unit_price,
+      prev.unit_price,
+      minIncreasePct
+    );
+
+    if (direction === "up") {
+      runningStreak += 1;
+      totalIncreases += 1;
+    } else {
+      if (direction === "down") totalDecreases += 1;
+      if (direction === "flat") totalFlat += 1;
+      runningStreak = 0;
+    }
+
+    maxStreak = Math.max(maxStreak, runningStreak);
+
+    moves.push({
+      from_date: prev.date,
+      to_date: curr.date,
+      previous_price: prev.unit_price,
+      current_price: curr.unit_price,
+      diff_amount: toRoundedNumber(diffAmount),
+      diff_pct: diffPct == null ? null : toRoundedNumber(diffPct, 2),
+      direction,
+    });
+  }
+
+  currentStreak = runningStreak;
+
+  const latestDeltaAmount = previous
+    ? latest.unit_price - previous.unit_price
+    : null;
+  const latestDeltaPct = previous
+    ? percentChange(latest.unit_price, previous.unit_price)
+    : null;
+  const previousCostForLatestQty = previous
+    ? previous.unit_price * latest.quantity
+    : null;
+  const extraCostVsPrevious =
+    previousCostForLatestQty == null
+      ? null
+      : latest.amount - previousCostForLatestQty;
+
+  const totalQuantity = entries.reduce((sum, entry) => sum + entry.quantity, 0);
+  const totalAmount = entries.reduce((sum, entry) => sum + entry.amount, 0);
+  const prices = entries.map((entry) => entry.unit_price);
+  const avgUnitPrice = totalQuantity > 0 ? totalAmount / totalQuantity : 0;
+  const highPrice = Math.max(...prices);
+  const lowPrice = Math.min(...prices);
+  const volatilityPct =
+    avgUnitPrice > 0 ? (stdDev(prices) / avgUnitPrice) * 100 : 0;
+  const latestIsHigh = latest.unit_price >= highPrice;
+
+  let riskScore = 0;
+  if (latestDeltaPct != null && latestDeltaPct > 0) {
+    riskScore += Math.min(40, latestDeltaPct * 1.2);
+  }
+  riskScore += currentStreak * 18;
+  riskScore += Math.max(0, maxStreak - 1) * 7;
+  riskScore += Math.min(15, volatilityPct / 2);
+  if (latestIsHigh && entries.length > 1) riskScore += 8;
+  if (avgUnitPrice > 0 && latest.unit_price > avgUnitPrice * 1.15) {
+    riskScore += 10;
+  }
+
+  let signal = "estable";
+  if (currentStreak >= 2) {
+    signal = "racha_alcista";
+  } else if (latestDeltaPct != null && latestDeltaPct >= 10) {
+    signal = "salto_reciente";
+  } else if (latestDeltaPct != null && latestDeltaPct > minIncreasePct) {
+    signal = "subiendo";
+  } else if (latestDeltaPct != null && latestDeltaPct < -minIncreasePct) {
+    signal = "cediendo";
+  } else if (entries.length < 2) {
+    signal = "sin_comparativo";
+  }
+
+  return {
+    item_id: group.item_id,
+    item_name: group.item_name,
+    first_date: entries[0]?.date || null,
+    last_date: latest.date,
+    purchase_days: entries.length,
+    transaction_count: group.transaction_count,
+    latest_quantity: latest.quantity,
+    latest_unit_price: latest.unit_price,
+    latest_cost: latest.amount,
+    previous_date: previous?.date || null,
+    previous_unit_price: previous?.unit_price ?? null,
+    previous_cost_for_latest_qty:
+      previousCostForLatestQty == null
+        ? null
+        : toRoundedNumber(previousCostForLatestQty),
+    extra_cost_vs_previous:
+      extraCostVsPrevious == null ? null : toRoundedNumber(extraCostVsPrevious),
+    latest_delta_amount:
+      latestDeltaAmount == null ? null : toRoundedNumber(latestDeltaAmount),
+    latest_delta_pct:
+      latestDeltaPct == null ? null : toRoundedNumber(latestDeltaPct, 2),
+    consecutive_increase_streak: currentStreak,
+    max_consecutive_increase_streak: maxStreak,
+    total_increases: totalIncreases,
+    total_decreases: totalDecreases,
+    total_flat: totalFlat,
+    avg_unit_price: toRoundedNumber(avgUnitPrice),
+    high_price: toRoundedNumber(highPrice),
+    low_price: toRoundedNumber(lowPrice),
+    volatility_pct: toRoundedNumber(volatilityPct, 2),
+    latest_is_high: latestIsHigh,
+    signal,
+    risk_score: toRoundedNumber(riskScore, 1),
+    last_description: latest.description || "",
+    last_category_name: latest.category_name || null,
+    recent_moves: moves.slice(-6),
+    series: entries.slice(-24),
+  };
+}
+
+router.get("/item-price-command-center", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  try {
+    const months = clampInt(req.query.months, 18, 1, 60);
+    const limit = clampInt(req.query.limit, 500, 20, 1000);
+    const maxRows = clampInt(req.query.max_rows, 20000, 1000, 50000);
+    const minIncreasePct = Math.min(
+      1000,
+      readPositiveNumber(req.query.min_increase_pct, 0)
+    );
+
+    const now = new Date();
+    const defaultFromDate = new Date(
+      now.getFullYear(),
+      now.getMonth() - (months - 1),
+      1
+    );
+    const defaultDateFrom = toISODate(defaultFromDate);
+    const defaultDateTo = toISODate(now);
+    const dateFrom = isDateKey(req.query.date_from)
+      ? String(req.query.date_from)
+      : defaultDateFrom;
+    const dateTo = isDateKey(req.query.date_to)
+      ? String(req.query.date_to)
+      : defaultDateTo;
+
+    const { data, error } = await supabase
+      .from("transaction_items")
+      .select(
+        `
+        item_id,
+        quantity,
+        unit_price_net,
+        unit_price_final,
+        line_total_final,
+        tax_rate_used,
+        is_exempt_used,
+        items!inner (
+          name,
+          user_id
+        ),
+        transactions!inner (
+          id,
+          user_id,
+          type,
+          date,
+          description,
+          categories ( name )
+        )
+      `
+      )
+      .eq("transactions.user_id", user_id)
+      .eq("transactions.type", "expense")
+      .eq("items.user_id", user_id)
+      .gte("transactions.date", dateFrom)
+      .lte("transactions.date", dateTo)
+      .order("date", { foreignTable: "transactions", ascending: true })
+      .range(0, maxRows - 1);
+
+    if (error) {
+      console.error("Error /analytics/item-price-command-center:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    const groups = {};
+
+    for (const row of data || []) {
+      const trx = row.transactions;
+      const item = row.items;
+      if (!trx || !item || !row.item_id) continue;
+
+      const numbers = getTransactionItemFinalNumbers(row);
+      if (!numbers) continue;
+
+      const itemId = row.item_id;
+      const date = trx.date;
+      if (!date) continue;
+
+      if (!groups[itemId]) {
+        groups[itemId] = {
+          item_id: itemId,
+          item_name: item.name || "Sin nombre",
+          transaction_count: 0,
+          dailyMap: {},
+        };
+      }
+
+      const group = groups[itemId];
+      group.transaction_count += 1;
+
+      if (!group.dailyMap[date]) {
+        group.dailyMap[date] = {
+          date,
+          quantity: 0,
+          amount: 0,
+          transactions: 0,
+          description: "",
+          category_name: null,
+        };
+      }
+
+      const daily = group.dailyMap[date];
+      daily.quantity += numbers.quantity;
+      daily.amount += numbers.amount;
+      daily.transactions += 1;
+      daily.description = trx.description || daily.description;
+      daily.category_name = trx.categories?.name || daily.category_name;
+    }
+
+    const allSignals = Object.values(groups)
+      .map((group) => buildItemPriceSignal(group, minIncreasePct))
+      .filter(Boolean)
+      .sort((a, b) => {
+        if (b.risk_score !== a.risk_score) return b.risk_score - a.risk_score;
+        if (b.consecutive_increase_streak !== a.consecutive_increase_streak) {
+          return (
+            b.consecutive_increase_streak - a.consecutive_increase_streak
+          );
+        }
+        return String(a.item_name).localeCompare(String(b.item_name));
+      });
+
+    const comparable = allSignals.filter((row) => row.previous_unit_price != null);
+    const risingItems = comparable.filter((row) => row.latest_delta_amount > 0);
+    const consecutiveRisers = comparable.filter(
+      (row) => row.consecutive_increase_streak >= 2
+    );
+    const extraCostTotal = comparable.reduce(
+      (sum, row) => sum + (Number(row.extra_cost_vs_previous) || 0),
+      0
+    );
+
+    const responseRows = allSignals.slice(0, limit);
+
+    return res.json({
+      success: true,
+      meta: {
+        months,
+        date_from: dateFrom,
+        date_to: dateTo,
+        min_increase_pct: minIncreasePct,
+        fetched_rows: (data || []).length,
+        returned_items: responseRows.length,
+        total_items: allSignals.length,
+        max_rows: maxRows,
+      },
+      summary: {
+        items_analyzed: allSignals.length,
+        comparable_items: comparable.length,
+        rising_items: risingItems.length,
+        consecutive_risers: consecutiveRisers.length,
+        market_heat_pct:
+          comparable.length > 0
+            ? toRoundedNumber((risingItems.length / comparable.length) * 100, 2)
+            : 0,
+        extra_cost_vs_previous_total: toRoundedNumber(extraCostTotal),
+        hottest_item: responseRows[0] || null,
+      },
+      data: responseRows,
+    });
+  } catch (err) {
+    console.error("Error inesperado /analytics/item-price-command-center:", err);
+    return res.status(500).json({
+      error: "Error generando centro de comando de precios por articulo",
+    });
+  }
+});
+
 /* ========= INGRESOS / GASTOS ANUALES POR TIPO DE ESTABILIDAD ========= */
 
 router.get(
