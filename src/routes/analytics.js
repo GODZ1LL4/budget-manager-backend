@@ -1969,7 +1969,7 @@ function percentChange(current, previous) {
   return ((curr - prev) / prev) * 100;
 }
 
-function getTransactionItemFinalNumbers(row) {
+function getTransactionItemPriceNumbers(row) {
   const quantity = Number(row.quantity || 0);
   if (!Number.isFinite(quantity) || quantity <= 0) return null;
 
@@ -1977,29 +1977,43 @@ function getTransactionItemFinalNumbers(row) {
     row.line_total_final != null ? Number(row.line_total_final) : null;
   const unitFinal =
     row.unit_price_final != null ? Number(row.unit_price_final) : null;
+  const unitNet = Number(row.unit_price_net || 0);
+  const rate = row.is_exempt_used ? 0 : Number(row.tax_rate_used || 0);
 
-  let unitPrice = null;
+  if (!Number.isFinite(unitNet) || unitNet <= 0) return null;
+
+  const taxRate = Number.isFinite(rate) ? rate : 0;
+  const baseUnitPrice = unitNet * (1 + taxRate / 100);
+  if (!Number.isFinite(baseUnitPrice) || baseUnitPrice <= 0) return null;
+
+  let paidUnitPrice = null;
 
   if (Number.isFinite(unitFinal) && unitFinal > 0) {
-    unitPrice = unitFinal;
+    paidUnitPrice = unitFinal;
   } else if (Number.isFinite(lineTotal) && lineTotal > 0) {
-    unitPrice = lineTotal / quantity;
+    paidUnitPrice = lineTotal / quantity;
   } else {
-    const unitNet = Number(row.unit_price_net || 0);
-    const rate = row.is_exempt_used ? 0 : Number(row.tax_rate_used || 0);
-    if (!Number.isFinite(unitNet) || unitNet <= 0) return null;
-    unitPrice = unitNet * (1 + (Number.isFinite(rate) ? rate : 0) / 100);
+    paidUnitPrice = baseUnitPrice;
   }
 
-  if (!Number.isFinite(unitPrice) || unitPrice <= 0) return null;
+  if (!Number.isFinite(paidUnitPrice) || paidUnitPrice <= 0) return null;
 
-  const amount =
-    Number.isFinite(lineTotal) && lineTotal > 0 ? lineTotal : unitPrice * quantity;
+  const paidAmount =
+    Number.isFinite(lineTotal) && lineTotal > 0
+      ? lineTotal
+      : paidUnitPrice * quantity;
+  const baseAmount = baseUnitPrice * quantity;
+  const rawDiscountAmount = baseAmount - paidAmount;
+  const discountAmount = rawDiscountAmount > 0.01 ? rawDiscountAmount : 0;
 
   return {
     quantity,
-    unit_price: unitPrice,
-    amount,
+    base_unit_price: baseUnitPrice,
+    paid_unit_price: paidUnitPrice,
+    base_amount: baseAmount,
+    paid_amount: paidAmount,
+    discount_amount: discountAmount,
+    discount_pct: baseAmount > 0 ? (discountAmount / baseAmount) * 100 : 0,
   };
 }
 
@@ -2015,14 +2029,24 @@ function buildItemPriceSignal(group, minIncreasePct) {
   const entries = Object.values(group.dailyMap || {})
     .map((entry) => {
       const quantity = Number(entry.quantity || 0);
-      const amount = Number(entry.amount || 0);
-      const unitPrice = quantity > 0 ? amount / quantity : 0;
+      const baseAmount = Number(entry.base_amount || 0);
+      const paidAmount = Number(entry.paid_amount || 0);
+      const discountAmount = Number(entry.discount_amount || 0);
+      const unitPrice = quantity > 0 ? baseAmount / quantity : 0;
+      const paidUnitPrice = quantity > 0 ? paidAmount / quantity : 0;
 
       return {
         date: entry.date,
         quantity: toRoundedNumber(quantity),
-        amount: toRoundedNumber(amount),
+        amount: toRoundedNumber(baseAmount),
+        paid_amount: toRoundedNumber(paidAmount),
+        discount_amount: toRoundedNumber(discountAmount),
         unit_price: toRoundedNumber(unitPrice),
+        paid_unit_price: toRoundedNumber(paidUnitPrice),
+        discount_pct:
+          baseAmount > 0
+            ? toRoundedNumber((discountAmount / baseAmount) * 100, 2)
+            : 0,
         transactions: entry.transactions || 1,
         description: entry.description || "",
         category_name: entry.category_name || null,
@@ -2092,11 +2116,25 @@ function buildItemPriceSignal(group, minIncreasePct) {
     previousCostForLatestQty == null
       ? null
       : latest.amount - previousCostForLatestQty;
+  const paidExtraCostVsPrevious =
+    previousCostForLatestQty == null
+      ? null
+      : latest.paid_amount - previousCostForLatestQty;
 
   const totalQuantity = entries.reduce((sum, entry) => sum + entry.quantity, 0);
   const totalAmount = entries.reduce((sum, entry) => sum + entry.amount, 0);
+  const totalPaidAmount = entries.reduce(
+    (sum, entry) => sum + entry.paid_amount,
+    0
+  );
+  const totalDiscountAmount = entries.reduce(
+    (sum, entry) => sum + entry.discount_amount,
+    0
+  );
   const prices = entries.map((entry) => entry.unit_price);
   const avgUnitPrice = totalQuantity > 0 ? totalAmount / totalQuantity : 0;
+  const avgPaidUnitPrice =
+    totalQuantity > 0 ? totalPaidAmount / totalQuantity : 0;
   const highPrice = Math.max(...prices);
   const lowPrice = Math.min(...prices);
   const volatilityPct =
@@ -2137,15 +2175,24 @@ function buildItemPriceSignal(group, minIncreasePct) {
     transaction_count: group.transaction_count,
     latest_quantity: latest.quantity,
     latest_unit_price: latest.unit_price,
-    latest_cost: latest.amount,
+    latest_paid_unit_price: latest.paid_unit_price,
+    latest_base_cost: latest.amount,
+    latest_cost: latest.paid_amount,
+    latest_discount_amount: latest.discount_amount,
+    latest_discount_pct: latest.discount_pct,
     previous_date: previous?.date || null,
     previous_unit_price: previous?.unit_price ?? null,
+    previous_paid_unit_price: previous?.paid_unit_price ?? null,
     previous_cost_for_latest_qty:
       previousCostForLatestQty == null
         ? null
         : toRoundedNumber(previousCostForLatestQty),
     extra_cost_vs_previous:
       extraCostVsPrevious == null ? null : toRoundedNumber(extraCostVsPrevious),
+    paid_extra_cost_vs_previous:
+      paidExtraCostVsPrevious == null
+        ? null
+        : toRoundedNumber(paidExtraCostVsPrevious),
     latest_delta_amount:
       latestDeltaAmount == null ? null : toRoundedNumber(latestDeltaAmount),
     latest_delta_pct:
@@ -2156,8 +2203,15 @@ function buildItemPriceSignal(group, minIncreasePct) {
     total_decreases: totalDecreases,
     total_flat: totalFlat,
     avg_unit_price: toRoundedNumber(avgUnitPrice),
+    avg_paid_unit_price: toRoundedNumber(avgPaidUnitPrice),
     high_price: toRoundedNumber(highPrice),
     low_price: toRoundedNumber(lowPrice),
+    total_base_amount: toRoundedNumber(totalAmount),
+    total_paid_amount: toRoundedNumber(totalPaidAmount),
+    total_discount_amount: toRoundedNumber(totalDiscountAmount),
+    total_discount_pct:
+      totalAmount > 0 ? toRoundedNumber((totalDiscountAmount / totalAmount) * 100, 2) : 0,
+    has_discount: totalDiscountAmount > 0,
     volatility_pct: toRoundedNumber(volatilityPct, 2),
     latest_is_high: latestIsHigh,
     signal,
@@ -2241,7 +2295,7 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
       const item = row.items;
       if (!trx || !item || !row.item_id) continue;
 
-      const numbers = getTransactionItemFinalNumbers(row);
+      const numbers = getTransactionItemPriceNumbers(row);
       if (!numbers) continue;
 
       const itemId = row.item_id;
@@ -2264,7 +2318,9 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
         group.dailyMap[date] = {
           date,
           quantity: 0,
-          amount: 0,
+          base_amount: 0,
+          paid_amount: 0,
+          discount_amount: 0,
           transactions: 0,
           description: "",
           category_name: null,
@@ -2273,7 +2329,9 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
 
       const daily = group.dailyMap[date];
       daily.quantity += numbers.quantity;
-      daily.amount += numbers.amount;
+      daily.base_amount += numbers.base_amount;
+      daily.paid_amount += numbers.paid_amount;
+      daily.discount_amount += numbers.discount_amount;
       daily.transactions += 1;
       daily.description = trx.description || daily.description;
       daily.category_name = trx.categories?.name || daily.category_name;
@@ -2301,6 +2359,21 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
       (sum, row) => sum + (Number(row.extra_cost_vs_previous) || 0),
       0
     );
+    const paidExtraCostTotal = comparable.reduce(
+      (sum, row) => sum + (Number(row.paid_extra_cost_vs_previous) || 0),
+      0
+    );
+    const latestDiscountTotal = allSignals.reduce(
+      (sum, row) => sum + (Number(row.latest_discount_amount) || 0),
+      0
+    );
+    const periodDiscountTotal = allSignals.reduce(
+      (sum, row) => sum + (Number(row.total_discount_amount) || 0),
+      0
+    );
+    const discountedItems = allSignals.filter(
+      (row) => Number(row.latest_discount_amount || 0) > 0
+    );
 
     const responseRows = allSignals.slice(0, limit);
 
@@ -2326,6 +2399,10 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
             ? toRoundedNumber((risingItems.length / comparable.length) * 100, 2)
             : 0,
         extra_cost_vs_previous_total: toRoundedNumber(extraCostTotal),
+        paid_extra_cost_vs_previous_total: toRoundedNumber(paidExtraCostTotal),
+        latest_discount_total: toRoundedNumber(latestDiscountTotal),
+        period_discount_total: toRoundedNumber(periodDiscountTotal),
+        discounted_items: discountedItems.length,
         hottest_item: responseRows[0] || null,
       },
       data: responseRows,
