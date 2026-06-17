@@ -2415,6 +2415,444 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
   }
 });
 
+/* ========= CENTRO DE COMANDO DE GASTOS / INGRESOS ========= */
+
+function getMonthKeysBetween(startMonthKey, endMonthKey) {
+  const months = [];
+  let cursor = startMonthKey;
+
+  while (cursor <= endMonthKey) {
+    months.push(cursor);
+    cursor = addMonthsToMonthKey(cursor, 1);
+  }
+
+  return months;
+}
+
+function getTransactionSignal(type, row, minDeltaPct) {
+  const deltaPct = row.delta_pct;
+  const vsTypicalPct = row.vs_typical_pct;
+
+  if (row.previous_month_amount <= 0 && row.current_month_amount > 0) {
+    return "nuevo";
+  }
+
+  if (type === "expense") {
+    if (row.over_budget_amount > 0) return "sobre_presupuesto";
+    if (row.budget_pace_pct != null && row.budget_pace_pct >= 115) {
+      return "ritmo_alto";
+    }
+    if (deltaPct != null && deltaPct >= minDeltaPct) return "subiendo";
+    if (deltaPct != null && deltaPct <= -minDeltaPct) return "bajando";
+    if (vsTypicalPct != null && vsTypicalPct >= 25) return "sobre_tipico";
+    return "estable";
+  }
+
+  if (deltaPct != null && deltaPct <= -Math.max(minDeltaPct, 15)) {
+    return "caida";
+  }
+  if (vsTypicalPct != null && vsTypicalPct <= -20) return "por_debajo";
+  if (deltaPct != null && deltaPct >= minDeltaPct) return "subiendo";
+  if (deltaPct != null && deltaPct <= -minDeltaPct) return "bajando";
+  if (row.active_months >= Math.max(3, Math.floor(row.months_count * 0.65))) {
+    return "recurrente";
+  }
+
+  return "estable";
+}
+
+function getTransactionAttentionScore(type, row) {
+  let score = Math.min(24, Math.max(0, row.share_pct || 0) * 0.7);
+  const deltaPct = Number(row.delta_pct);
+  const vsTypicalPct = Number(row.vs_typical_pct);
+  const volatilityPct = Number(row.volatility_pct);
+
+  if (type === "expense") {
+    if (Number.isFinite(deltaPct) && deltaPct > 0) {
+      score += Math.min(26, deltaPct * 0.9);
+    }
+    if (Number.isFinite(vsTypicalPct) && vsTypicalPct > 0) {
+      score += Math.min(20, vsTypicalPct * 0.45);
+    }
+    if (row.over_budget_amount > 0) score += 34;
+    else if (row.budget_pace_pct != null && row.budget_pace_pct > 100) {
+      score += Math.min(24, (row.budget_pace_pct - 100) * 0.7);
+    }
+  } else {
+    if (Number.isFinite(deltaPct) && deltaPct < 0) {
+      score += Math.min(34, Math.abs(deltaPct) * 0.9);
+    }
+    if (Number.isFinite(vsTypicalPct) && vsTypicalPct < 0) {
+      score += Math.min(26, Math.abs(vsTypicalPct) * 0.55);
+    }
+    if (row.current_month_amount <= 0 && row.previous_month_amount > 0) {
+      score += 28;
+    }
+  }
+
+  if (Number.isFinite(volatilityPct)) {
+    score += Math.min(16, volatilityPct * 0.18);
+  }
+
+  return toRoundedNumber(score, 1);
+}
+
+router.get("/transaction-command-center", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  try {
+    const txType = String(req.query.type || "expense").toLowerCase();
+    if (!["expense", "income"].includes(txType)) {
+      return res.status(400).json({ error: "type debe ser expense o income" });
+    }
+
+    const months = clampInt(req.query.months, 12, 2, 60);
+    const limit = clampInt(req.query.limit, 500, 20, 1000);
+    const maxRows = clampInt(req.query.max_rows, 30000, 1000, 80000);
+    const minDeltaPct = Math.min(
+      1000,
+      readPositiveNumber(req.query.min_delta_pct, 10)
+    );
+
+    const reportRange = getRequestCurrentMonthRange(req);
+    const defaultDateTo = reportRange.today;
+    const dateTo = isDateKey(req.query.date_to)
+      ? String(req.query.date_to)
+      : defaultDateTo;
+    const activeMonthKey = dateTo.slice(0, 7);
+    const activeMonthRange = getMonthRange(activeMonthKey);
+    const activeDay = Math.min(
+      Number(dateTo.slice(8, 10)) || 1,
+      Number(activeMonthRange.end.slice(8, 10)) || 1
+    );
+    const daysInActiveMonth = Number(activeMonthRange.end.slice(8, 10)) || 1;
+    const elapsedRatio = Math.max(
+      0,
+      Math.min(1, activeDay / daysInActiveMonth)
+    );
+
+    const defaultStartMonth = addMonthsToMonthKey(activeMonthKey, -(months - 1));
+    const dateFrom = isDateKey(req.query.date_from)
+      ? String(req.query.date_from)
+      : `${defaultStartMonth}-01`;
+    const startMonthKey = dateFrom.slice(0, 7);
+    const monthKeys = getMonthKeysBetween(startMonthKey, activeMonthKey);
+    const previousMonthKey = addMonthsToMonthKey(activeMonthKey, -1);
+
+    const { data, error } = await supabase
+      .from("transactions")
+      .select(
+        `
+        id,
+        amount,
+        type,
+        date,
+        description,
+        category_id,
+        categories:categories!transactions_category_id_fkey (
+          name,
+          stability_type,
+          type
+        ),
+        account:accounts!transactions_account_id_fkey (
+          name
+        )
+      `
+      )
+      .eq("user_id", user_id)
+      .eq("type", txType)
+      .gte("date", dateFrom)
+      .lte("date", dateTo)
+      .order("date", { ascending: false })
+      .range(0, maxRows - 1);
+
+    if (error) {
+      console.error("Error /analytics/transaction-command-center:", error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    let budgetsByCategory = {};
+    if (txType === "expense") {
+      const { data: budgets, error: budgetError } = await supabase
+        .from("budgets")
+        .select("category_id, limit_amount, month, categories(type)")
+        .eq("user_id", user_id)
+        .eq("month", activeMonthKey);
+
+      if (budgetError) {
+        console.error("Budget error /transaction-command-center:", budgetError);
+        return res.status(500).json({ error: budgetError.message });
+      }
+
+      budgetsByCategory = (budgets || []).reduce((acc, budget) => {
+        if (!budget?.category_id) return acc;
+        if (budget.categories?.type && budget.categories.type !== "expense") {
+          return acc;
+        }
+        acc[budget.category_id] =
+          (acc[budget.category_id] || 0) + (Number(budget.limit_amount) || 0);
+        return acc;
+      }, {});
+    }
+
+    const groups = {};
+    const totalAmount = (data || []).reduce(
+      (sum, tx) => sum + (Number(tx.amount) || 0),
+      0
+    );
+
+    for (const tx of data || []) {
+      const amount = Number(tx.amount) || 0;
+      const date = tx.date;
+      if (amount <= 0 || !date) continue;
+
+      const categoryId = tx.category_id || "__uncategorized__";
+      const month = date.slice(0, 7);
+      if (!groups[categoryId]) {
+        groups[categoryId] = {
+          category_id: tx.category_id || null,
+          category_key: categoryId,
+          category_name: tx.categories?.name || "Sin categoria",
+          stability_type: tx.categories?.stability_type || "variable",
+          total_amount: 0,
+          transaction_count: 0,
+          amounts: [],
+          monthly: {},
+          recent_transactions: [],
+          last_date: date,
+          last_amount: amount,
+          last_description: tx.description || "",
+          last_account_name: tx.account?.name || null,
+        };
+
+        monthKeys.forEach((key) => {
+          groups[categoryId].monthly[key] = 0;
+        });
+      }
+
+      const group = groups[categoryId];
+      group.total_amount += amount;
+      group.transaction_count += 1;
+      group.amounts.push(amount);
+      group.monthly[month] = (group.monthly[month] || 0) + amount;
+
+      if (date >= group.last_date) {
+        group.last_date = date;
+        group.last_amount = amount;
+        group.last_description = tx.description || "";
+        group.last_account_name = tx.account?.name || group.last_account_name;
+      }
+
+      if (group.recent_transactions.length < 8) {
+        group.recent_transactions.push({
+          id: tx.id,
+          date,
+          amount: toRoundedNumber(amount),
+          description: tx.description || "",
+          account_name: tx.account?.name || null,
+        });
+      }
+    }
+
+    const rows = Object.values(groups).map((group) => {
+      const values = monthKeys.map((key) => Number(group.monthly[key] || 0));
+      const historyMonthKeys = monthKeys.filter((key) => key !== activeMonthKey);
+      const historyValues = historyMonthKeys.map(
+        (key) => Number(group.monthly[key] || 0)
+      );
+      const nonZeroHistory = historyValues.filter((value) => value > 0);
+      const typicalValues = nonZeroHistory.length ? nonZeroHistory : historyValues;
+      const averageMonthly = historyValues.length ? mean(historyValues) : 0;
+      const typicalMonthly = typicalValues.length ? median(typicalValues) : 0;
+      const volatilityBase = typicalValues.length > 1 ? typicalValues : values;
+      const volatilityAvg = volatilityBase.length ? mean(volatilityBase) : 0;
+      const volatilityPct =
+        volatilityAvg > 0 ? (stdDev(volatilityBase) / volatilityAvg) * 100 : 0;
+      const currentMonthAmount = Number(group.monthly[activeMonthKey] || 0);
+      const previousMonthAmount = Number(group.monthly[previousMonthKey] || 0);
+      const deltaAmount = currentMonthAmount - previousMonthAmount;
+      const deltaPct = percentChange(currentMonthAmount, previousMonthAmount);
+      const vsTypicalAmount = currentMonthAmount - typicalMonthly;
+      const vsTypicalPct = percentChange(currentMonthAmount, typicalMonthly);
+      const expectedToDate = typicalMonthly * elapsedRatio;
+      const pacePct =
+        expectedToDate > 0 ? (currentMonthAmount / expectedToDate) * 100 : null;
+      const activeMonths = values.filter((value) => value > 0).length;
+      const activeMonthValues = values.filter((value) => value > 0);
+      const budgetLimit =
+        txType === "expense"
+          ? Number(budgetsByCategory[group.category_key] || 0)
+          : null;
+      const budgetUsedPct =
+        budgetLimit > 0 ? (currentMonthAmount / budgetLimit) * 100 : null;
+      const budgetExpectedToDate =
+        budgetLimit != null && budgetLimit > 0 ? budgetLimit * elapsedRatio : null;
+      const budgetPacePct =
+        budgetExpectedToDate && budgetExpectedToDate > 0
+          ? (currentMonthAmount / budgetExpectedToDate) * 100
+          : null;
+      const overBudgetAmount =
+        budgetLimit != null && budgetLimit > 0
+          ? Math.max(0, currentMonthAmount - budgetLimit)
+          : 0;
+      const sharePct =
+        totalAmount > 0 ? (group.total_amount / totalAmount) * 100 : 0;
+      const avgTransaction =
+        group.transaction_count > 0
+          ? group.total_amount / group.transaction_count
+          : 0;
+
+      const row = {
+        type: txType,
+        category_id: group.category_id,
+        category_key: group.category_key,
+        category_name: group.category_name,
+        stability_type: group.stability_type,
+        months_count: monthKeys.length,
+        active_months: activeMonths,
+        total_amount: toRoundedNumber(group.total_amount),
+        current_month_amount: toRoundedNumber(currentMonthAmount),
+        previous_month_amount: toRoundedNumber(previousMonthAmount),
+        delta_amount: toRoundedNumber(deltaAmount),
+        delta_pct: deltaPct == null ? null : toRoundedNumber(deltaPct, 2),
+        average_monthly: toRoundedNumber(averageMonthly),
+        typical_monthly: toRoundedNumber(typicalMonthly),
+        vs_typical_amount: toRoundedNumber(vsTypicalAmount),
+        vs_typical_pct:
+          vsTypicalPct == null ? null : toRoundedNumber(vsTypicalPct, 2),
+        expected_to_date: toRoundedNumber(expectedToDate),
+        pace_pct: pacePct == null ? null : toRoundedNumber(pacePct, 2),
+        high_month_amount: toRoundedNumber(Math.max(...values, 0)),
+        low_active_month_amount: toRoundedNumber(
+          activeMonthValues.length ? Math.min(...activeMonthValues) : 0
+        ),
+        volatility_pct: toRoundedNumber(volatilityPct, 2),
+        transaction_count: group.transaction_count,
+        avg_transaction: toRoundedNumber(avgTransaction),
+        share_pct: toRoundedNumber(sharePct, 2),
+        budget_limit:
+          budgetLimit == null || budgetLimit <= 0
+            ? null
+            : toRoundedNumber(budgetLimit),
+        budget_used_pct:
+          budgetUsedPct == null ? null : toRoundedNumber(budgetUsedPct, 2),
+        budget_pace_pct:
+          budgetPacePct == null ? null : toRoundedNumber(budgetPacePct, 2),
+        budget_remaining:
+          budgetLimit == null || budgetLimit <= 0
+            ? null
+            : toRoundedNumber(budgetLimit - currentMonthAmount),
+        over_budget_amount: toRoundedNumber(overBudgetAmount),
+        last_date: group.last_date,
+        last_amount: toRoundedNumber(group.last_amount),
+        last_description: group.last_description,
+        last_account_name: group.last_account_name,
+        recent_transactions: group.recent_transactions,
+        series: monthKeys.map((month) => ({
+          month,
+          amount: toRoundedNumber(group.monthly[month] || 0),
+        })),
+      };
+
+      row.signal = getTransactionSignal(txType, row, minDeltaPct);
+      row.attention_score = getTransactionAttentionScore(txType, row);
+      return row;
+    });
+
+    rows.sort((a, b) => {
+      if (b.attention_score !== a.attention_score) {
+        return b.attention_score - a.attention_score;
+      }
+      return b.current_month_amount - a.current_month_amount;
+    });
+
+    const responseRows = rows.slice(0, limit);
+    const currentTotal = rows.reduce(
+      (sum, row) => sum + (Number(row.current_month_amount) || 0),
+      0
+    );
+    const previousTotal = rows.reduce(
+      (sum, row) => sum + (Number(row.previous_month_amount) || 0),
+      0
+    );
+    const typicalTotal = rows.reduce(
+      (sum, row) => sum + (Number(row.typical_monthly) || 0),
+      0
+    );
+    const budgetTotal = rows.reduce(
+      (sum, row) => sum + (Number(row.budget_limit) || 0),
+      0
+    );
+    const overBudgetTotal = rows.reduce(
+      (sum, row) => sum + (Number(row.over_budget_amount) || 0),
+      0
+    );
+
+    const deltaTotal = currentTotal - previousTotal;
+    const deltaTotalPct = percentChange(currentTotal, previousTotal);
+    const expectedToDateTotal = typicalTotal * elapsedRatio;
+    const paceTotalPct =
+      expectedToDateTotal > 0
+        ? (currentTotal / expectedToDateTotal) * 100
+        : null;
+
+    return res.json({
+      success: true,
+      meta: {
+        type: txType,
+        months,
+        date_from: dateFrom,
+        date_to: dateTo,
+        active_month: activeMonthKey,
+        previous_month: previousMonthKey,
+        active_day: activeDay,
+        days_in_month: daysInActiveMonth,
+        elapsed_ratio: toRoundedNumber(elapsedRatio, 4),
+        min_delta_pct: minDeltaPct,
+        fetched_rows: (data || []).length,
+        returned_categories: responseRows.length,
+        total_categories: rows.length,
+        max_rows: maxRows,
+      },
+      summary: {
+        categories_analyzed: rows.length,
+        transaction_count: (data || []).length,
+        total_amount: toRoundedNumber(totalAmount),
+        current_month_amount: toRoundedNumber(currentTotal),
+        previous_month_amount: toRoundedNumber(previousTotal),
+        delta_amount: toRoundedNumber(deltaTotal),
+        delta_pct:
+          deltaTotalPct == null ? null : toRoundedNumber(deltaTotalPct, 2),
+        typical_monthly: toRoundedNumber(typicalTotal),
+        expected_to_date: toRoundedNumber(expectedToDateTotal),
+        pace_pct: paceTotalPct == null ? null : toRoundedNumber(paceTotalPct, 2),
+        rising_categories: rows.filter((row) => row.delta_amount > 0).length,
+        falling_categories: rows.filter((row) => row.delta_amount < 0).length,
+        recurring_categories: rows.filter(
+          (row) => row.active_months >= Math.max(3, Math.floor(monthKeys.length * 0.65))
+        ).length,
+        high_attention_categories: rows.filter(
+          (row) => row.attention_score >= 45
+        ).length,
+        budget_total: txType === "expense" ? toRoundedNumber(budgetTotal) : null,
+        over_budget_total:
+          txType === "expense" ? toRoundedNumber(overBudgetTotal) : null,
+        over_budget_categories:
+          txType === "expense"
+            ? rows.filter((row) => row.over_budget_amount > 0).length
+            : null,
+        top_category: responseRows[0] || null,
+      },
+      data: responseRows,
+    });
+  } catch (err) {
+    console.error("Error inesperado /analytics/transaction-command-center:", err);
+    return res.status(500).json({
+      error: "Error generando centro de comando de transacciones",
+    });
+  }
+});
+
 /* ========= INGRESOS / GASTOS ANUALES POR TIPO DE ESTABILIDAD ========= */
 
 router.get(
