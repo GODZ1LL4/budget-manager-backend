@@ -2235,14 +2235,13 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
       readPositiveNumber(req.query.min_increase_pct, 0)
     );
 
-    const now = new Date();
-    const defaultFromDate = new Date(
-      now.getFullYear(),
-      now.getMonth() - (months - 1),
-      1
+    const reportRange = getRequestCurrentMonthRange(req);
+    const defaultStartMonth = addMonthsToMonthKey(
+      reportRange.currentMonthKey,
+      -(months - 1)
     );
-    const defaultDateFrom = toISODate(defaultFromDate);
-    const defaultDateTo = toISODate(now);
+    const defaultDateFrom = `${defaultStartMonth}-01`;
+    const defaultDateTo = reportRange.today;
     const dateFrom = isDateKey(req.query.date_from)
       ? String(req.query.date_from)
       : defaultDateFrom;
