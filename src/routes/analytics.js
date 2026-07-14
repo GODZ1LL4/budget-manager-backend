@@ -4393,7 +4393,6 @@ router.get(
   }
 );
 
-// ========== INTERVALO ENTRE GASTOS POR CATEGORÍA ==========
 // ========== DETECTOR DE INGRESOS REPETITIVOS (NO MARCADOS) ==========
 router.get(
   "/recurring-income-patterns",
