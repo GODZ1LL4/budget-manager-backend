@@ -2852,6 +2852,292 @@ router.get("/transaction-command-center", authenticateUser, async (req, res) => 
   }
 });
 
+/* ========= TRAZABILIDAD ENTRE CUENTAS ========= */
+
+router.get("/account-flow-trace", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+
+  try {
+    const currentRange = getRequestCurrentMonthRange(req);
+    const dateFrom = isDateKey(req.query.date_from)
+      ? String(req.query.date_from)
+      : currentRange.start;
+    const dateTo = isDateKey(req.query.date_to)
+      ? String(req.query.date_to)
+      : currentRange.today;
+    const maxRows = clampInt(req.query.max_rows, 50000, 1000, 100000);
+
+    if (dateFrom > dateTo) {
+      return res.status(400).json({
+        error: "date_from no puede ser mayor que date_to",
+      });
+    }
+
+    const [accountsResult, transactionsResult] = await Promise.all([
+      supabase
+        .from("account_balances_extended")
+        .select("id, name, current_balance, reserved_total, available_balance")
+        .eq("user_id", user_id)
+        .order("name", { ascending: true }),
+      supabase
+        .from("transactions")
+        .select(
+          `
+          id,
+          amount,
+          type,
+          date,
+          description,
+          account_id,
+          account_from_id,
+          account_to_id,
+          account:accounts!transactions_account_id_fkey (id, name),
+          account_from:accounts!transactions_account_from_fkey (id, name),
+          account_to:accounts!transactions_account_to_fkey (id, name),
+          categories:categories!transactions_category_id_fkey (id, name, type)
+        `
+        )
+        .eq("user_id", user_id)
+        .in("type", ["income", "expense", "transfer"])
+        .gte("date", dateFrom)
+        .lte("date", dateTo)
+        .order("date", { ascending: false })
+        .range(0, maxRows - 1),
+    ]);
+
+    const requiredErrors = [
+      accountsResult.error,
+      transactionsResult.error,
+    ].filter(Boolean);
+
+    if (requiredErrors.length > 0) {
+      return res.status(500).json({ error: requiredErrors[0].message });
+    }
+
+    const accountsById = {};
+
+    const ensureAccount = (accountId, fallbackName = "Cuenta sin nombre") => {
+      const key = accountId || "__no_account__";
+      if (!accountsById[key]) {
+        accountsById[key] = {
+          account_id: accountId || null,
+          account_key: key,
+          account_name: fallbackName || "Cuenta sin nombre",
+          current_balance: null,
+          reserved_total: null,
+          available_balance: null,
+          income: 0,
+          expense: 0,
+          transfer_in: 0,
+          transfer_out: 0,
+          income_count: 0,
+          expense_count: 0,
+          transfer_in_count: 0,
+          transfer_out_count: 0,
+          last_activity_date: null,
+        };
+      }
+      return accountsById[key];
+    };
+
+    for (const account of accountsResult.data || []) {
+      const row = ensureAccount(account.id, account.name || "Cuenta");
+      row.current_balance = toRoundedNumber(account.current_balance);
+      row.reserved_total = toRoundedNumber(account.reserved_total);
+      row.available_balance = toRoundedNumber(account.available_balance);
+    }
+
+    const transferLinks = {};
+    const movements = [];
+
+    const touchDate = (row, date) => {
+      if (!date) return;
+      if (!row.last_activity_date || date > row.last_activity_date) {
+        row.last_activity_date = date;
+      }
+    };
+
+    const mapAccountName = (id, joinedAccount, fallback = "Cuenta sin nombre") =>
+      joinedAccount?.name ||
+      accountsById[id || "__no_account__"]?.account_name ||
+      fallback;
+
+    for (const tx of transactionsResult.data || []) {
+      const amount = Number(tx.amount) || 0;
+      if (amount <= 0) continue;
+
+      const type = tx.type;
+      const date = tx.date;
+      const description = tx.description || "";
+
+      if (type === "income") {
+        const accountId = tx.account_id || tx.account?.id || null;
+        const accountName = mapAccountName(accountId, tx.account, "Cuenta");
+        const account = ensureAccount(accountId, accountName);
+
+        account.income += amount;
+        account.income_count += 1;
+        touchDate(account, date);
+
+        movements.push({
+          id: tx.id,
+          type,
+          date,
+          description,
+          amount: toRoundedNumber(amount),
+          from_account_id: null,
+          from_account_name: "Ingreso externo",
+          to_account_id: account.account_id,
+          to_account_name: account.account_name,
+          category_name: tx.categories?.name || null,
+        });
+      } else if (type === "expense") {
+        const accountId = tx.account_id || tx.account?.id || null;
+        const accountName = mapAccountName(accountId, tx.account, "Cuenta");
+        const account = ensureAccount(accountId, accountName);
+
+        account.expense += amount;
+        account.expense_count += 1;
+        touchDate(account, date);
+
+        movements.push({
+          id: tx.id,
+          type,
+          date,
+          description,
+          amount: toRoundedNumber(amount),
+          from_account_id: account.account_id,
+          from_account_name: account.account_name,
+          to_account_id: null,
+          to_account_name: "Gasto externo",
+          category_name: tx.categories?.name || null,
+        });
+      } else if (type === "transfer") {
+        const fromId = tx.account_from_id || tx.account_from?.id || null;
+        const toId = tx.account_to_id || tx.account_to?.id || null;
+        const fromName = mapAccountName(fromId, tx.account_from, "Cuenta origen");
+        const toName = mapAccountName(toId, tx.account_to, "Cuenta destino");
+        const fromAccount = ensureAccount(fromId, fromName);
+        const toAccount = ensureAccount(toId, toName);
+
+        fromAccount.transfer_out += amount;
+        fromAccount.transfer_out_count += 1;
+        toAccount.transfer_in += amount;
+        toAccount.transfer_in_count += 1;
+        touchDate(fromAccount, date);
+        touchDate(toAccount, date);
+
+        const linkKey = `${fromAccount.account_key}__${toAccount.account_key}`;
+        if (!transferLinks[linkKey]) {
+          transferLinks[linkKey] = {
+            from_account_id: fromAccount.account_id,
+            from_account_name: fromAccount.account_name,
+            to_account_id: toAccount.account_id,
+            to_account_name: toAccount.account_name,
+            amount: 0,
+            count: 0,
+            last_date: null,
+          };
+        }
+
+        transferLinks[linkKey].amount += amount;
+        transferLinks[linkKey].count += 1;
+        if (!transferLinks[linkKey].last_date || date > transferLinks[linkKey].last_date) {
+          transferLinks[linkKey].last_date = date;
+        }
+
+        movements.push({
+          id: tx.id,
+          type,
+          date,
+          description,
+          amount: toRoundedNumber(amount),
+          from_account_id: fromAccount.account_id,
+          from_account_name: fromAccount.account_name,
+          to_account_id: toAccount.account_id,
+          to_account_name: toAccount.account_name,
+          category_name: null,
+        });
+      }
+    }
+
+    const accounts = Object.values(accountsById)
+      .map((account) => {
+        const income = Number(account.income) || 0;
+        const expense = Number(account.expense) || 0;
+        const transferIn = Number(account.transfer_in) || 0;
+        const transferOut = Number(account.transfer_out) || 0;
+        const netExternal = income - expense;
+        const netTotal = income + transferIn - expense - transferOut;
+        const totalIn = income + transferIn;
+        const totalOut = expense + transferOut;
+        const activity = totalIn + totalOut;
+
+        return {
+          ...account,
+          income: toRoundedNumber(income),
+          expense: toRoundedNumber(expense),
+          transfer_in: toRoundedNumber(transferIn),
+          transfer_out: toRoundedNumber(transferOut),
+          total_in: toRoundedNumber(totalIn),
+          total_out: toRoundedNumber(totalOut),
+          net_external: toRoundedNumber(netExternal),
+          net_total: toRoundedNumber(netTotal),
+          activity: toRoundedNumber(activity),
+        };
+      })
+      .sort((a, b) => b.activity - a.activity || a.account_name.localeCompare(b.account_name));
+
+    const links = Object.values(transferLinks)
+      .map((link) => ({
+        ...link,
+        amount: toRoundedNumber(link.amount),
+      }))
+      .sort((a, b) => b.amount - a.amount);
+
+    const totalIncome = accounts.reduce((sum, row) => sum + row.income, 0);
+    const totalExpense = accounts.reduce((sum, row) => sum + row.expense, 0);
+    const totalTransferIn = accounts.reduce((sum, row) => sum + row.transfer_in, 0);
+    const totalTransferOut = accounts.reduce((sum, row) => sum + row.transfer_out, 0);
+    const totalTransferVolume = links.reduce((sum, row) => sum + row.amount, 0);
+
+    const byInflow = [...accounts].sort((a, b) => b.total_in - a.total_in)[0] || null;
+    const byOutflow = [...accounts].sort((a, b) => b.total_out - a.total_out)[0] || null;
+
+    return res.json({
+      success: true,
+      meta: {
+        date_from: dateFrom,
+        date_to: dateTo,
+        fetched_rows: (transactionsResult.data || []).length,
+        returned_movements: movements.length,
+        max_rows: maxRows,
+      },
+      summary: {
+        total_income: toRoundedNumber(totalIncome),
+        total_expense: toRoundedNumber(totalExpense),
+        net_external: toRoundedNumber(totalIncome - totalExpense),
+        total_transfer_in: toRoundedNumber(totalTransferIn),
+        total_transfer_out: toRoundedNumber(totalTransferOut),
+        transfer_volume: toRoundedNumber(totalTransferVolume),
+        account_count: accounts.length,
+        transfer_route_count: links.length,
+        movement_count: movements.length,
+        top_inflow_account: byInflow,
+        top_outflow_account: byOutflow,
+      },
+      accounts,
+      links,
+      movements: movements.slice(0, 120),
+    });
+  } catch (err) {
+    console.error("Error inesperado /analytics/account-flow-trace:", err);
+    return res.status(500).json({
+      error: "Error generando trazabilidad entre cuentas",
+    });
+  }
+});
+
 /* ========= INGRESOS / GASTOS ANUALES POR TIPO DE ESTABILIDAD ========= */
 
 router.get(
