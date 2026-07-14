@@ -4075,6 +4075,152 @@ router.get("/category-month-heatmap", authenticateUser, async (req, res) => {
   }
 });
 
+async function buildRecurringTransactionPatterns(userId, txType, monthsBack) {
+  const now = new Date();
+  const fromDateObj = new Date(
+    now.getFullYear(),
+    now.getMonth() - (monthsBack - 1),
+    1
+  );
+  const fromDate = fromDateObj.toISOString().split("T")[0];
+
+  const { data, error } = await supabase
+    .from("transactions")
+    .select(
+      `
+      id,
+      amount,
+      date,
+      category_id,
+      description,
+      categories ( name )
+    `
+    )
+    .eq("user_id", userId)
+    .eq("type", txType)
+    .gte("date", fromDate);
+
+  if (error) {
+    console.error(`Error en recurring-${txType}-patterns:`, error);
+    throw error;
+  }
+
+  const txs = data || [];
+
+  const normDesc = (s) =>
+    (s || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 80);
+
+  const daysBetween = (d1, d2) => {
+    const t1 = new Date(d1).getTime();
+    const t2 = new Date(d2).getTime();
+    return Math.abs((t2 - t1) / (1000 * 60 * 60 * 24));
+  };
+
+  const medianLocal = (arr) => {
+    if (!arr.length) return 0;
+    const sorted = [...arr].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length - 1) / 2;
+    if (sorted.length % 2 === 1) {
+      return sorted[Math.floor(mid)];
+    }
+    const m1 = sorted[Math.floor(mid)];
+    const m2 = sorted[Math.floor(mid) + 1];
+    return (m1 + m2) / 2;
+  };
+
+  const stdDevLocal = (arr, meanValue) => {
+    if (!arr.length) return 0;
+    const avg = meanValue ?? arr.reduce((s, v) => s + v, 0) / arr.length;
+    const variance =
+      arr.reduce((s, v) => s + Math.pow(v - avg, 2), 0) / arr.length;
+    return Math.sqrt(variance);
+  };
+
+  const groups = {};
+  txs.forEach((tx) => {
+    const catId = tx.category_id || "sin_categoria";
+    const catName = tx.categories?.name || "Sin categoria";
+    const descKey = normDesc(tx.description) || "sin_descripcion";
+    const key = `${catId}__${descKey}`;
+
+    if (!groups[key]) {
+      groups[key] = {
+        category_id: catId,
+        category_name: catName,
+        description_key: descKey,
+        transactions: [],
+      };
+    }
+
+    groups[key].transactions.push({
+      date: tx.date,
+      amount: Number(tx.amount) || 0,
+    });
+  });
+
+  const patterns = [];
+
+  Object.values(groups).forEach((g) => {
+    const txList = g.transactions;
+    if (txList.length < 3) return;
+
+    txList.sort((a, b) => a.date.localeCompare(b.date));
+
+    const intervals = [];
+    for (let i = 1; i < txList.length; i++) {
+      intervals.push(daysBetween(txList[i - 1].date, txList[i].date));
+    }
+
+    if (intervals.length < 2) return;
+
+    const medianInterval = medianLocal(intervals);
+    const meanInterval = intervals.reduce((s, v) => s + v, 0) / intervals.length;
+    const sd = stdDevLocal(intervals, meanInterval);
+    const coefVar = meanInterval > 0 ? sd / meanInterval : 1;
+
+    if (medianInterval < 3 || medianInterval > 60) return;
+    if (coefVar > 0.5) return;
+
+    let frequency = "irregular";
+    if (medianInterval >= 3 && medianInterval <= 10) {
+      frequency = "semanal";
+    } else if (medianInterval > 10 && medianInterval <= 20) {
+      frequency = "quincenal";
+    } else if (medianInterval > 20 && medianInterval <= 40) {
+      frequency = "mensual";
+    } else if (medianInterval > 40 && medianInterval <= 60) {
+      frequency = "bimestral";
+    }
+
+    const totalAmount = txList.reduce((s, t) => s + t.amount, 0);
+    const avgAmount = totalAmount / txList.length;
+
+    patterns.push({
+      category_id: g.category_id,
+      category_name: g.category_name,
+      description_key: g.description_key,
+      occurrences: txList.length,
+      median_interval_days: Number(medianInterval.toFixed(2)),
+      mean_interval_days: Number(meanInterval.toFixed(2)),
+      std_dev_interval_days: Number(sd.toFixed(2)),
+      coef_variation: Number(coefVar.toFixed(2)),
+      frequency_label: frequency,
+      avg_amount: Number(avgAmount.toFixed(2)),
+      first_date: txList[0].date,
+      last_date: txList[txList.length - 1].date,
+    });
+  });
+
+  patterns.sort((a, b) => {
+    if (b.occurrences !== a.occurrences) {
+      return b.occurrences - a.occurrences;
+    }
+    return b.last_date.localeCompare(a.last_date);
+  });
+
+  return patterns;
+}
+
 // ========== DETECTOR DE GASTOS REPETITIVOS (NO MARCADOS) ==========
 router.get(
   "/recurring-expense-patterns",
@@ -4248,6 +4394,32 @@ router.get(
 );
 
 // ========== INTERVALO ENTRE GASTOS POR CATEGORÍA ==========
+// ========== DETECTOR DE INGRESOS REPETITIVOS (NO MARCADOS) ==========
+router.get(
+  "/recurring-income-patterns",
+  authenticateUser,
+  async (req, res) => {
+    const user_id = req.user.id;
+
+    try {
+      const monthsBack = parseInt(req.query.months, 10) || 6;
+      const patterns = await buildRecurringTransactionPatterns(
+        user_id,
+        "income",
+        monthsBack
+      );
+
+      return res.json({ success: true, data: patterns });
+    } catch (err) {
+      console.error("Error inesperado en recurring-income-patterns:", err);
+      return res
+        .status(500)
+        .json({ error: "Error interno en recurring-income-patterns" });
+    }
+  }
+);
+
+// ========== INTERVALO ENTRE GASTOS POR CATEGORIA ==========
 router.get(
   "/expense-intervals-by-category",
   authenticateUser,

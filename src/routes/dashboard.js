@@ -52,6 +52,48 @@ function resolveMonthPeriod(req) {
   };
 }
 
+function resolveTransactionReportType(req, fallback = "expense") {
+  const raw = Array.isArray(req.query.type) ? req.query.type[0] : req.query.type;
+  const type = String(raw || fallback).trim().toLowerCase();
+
+  if (!["expense", "income"].includes(type)) {
+    return { error: "Parametro type invalido. Usa expense o income." };
+  }
+
+  return { type };
+}
+
+async function getCategoryTotalsByType(userId, type, period) {
+  const { data, error } = await supabase
+    .from("transactions")
+    .select("amount, category_id, categories(name)")
+    .eq("user_id", userId)
+    .eq("type", type)
+    .gte("date", period.start)
+    .lte("date", period.end);
+
+  if (error) throw error;
+
+  const totalsByCategory = {};
+  const categoryNameMap = {};
+
+  (data || []).forEach((tx) => {
+    const amount = Number(tx.amount) || 0;
+    if (amount <= 0) return;
+
+    const categoryId = tx.category_id || "__uncategorized__";
+    totalsByCategory[categoryId] = (totalsByCategory[categoryId] || 0) + amount;
+
+    if (!categoryNameMap[categoryId]) {
+      categoryNameMap[categoryId] = tx.category_id
+        ? tx.categories?.name || "Sin nombre"
+        : "Sin categoria";
+    }
+  });
+
+  return { totalsByCategory, categoryNameMap };
+}
+
 /* ============================================================
    GET: RESUMEN DASHBOARD
    ============================================================ */
@@ -84,11 +126,17 @@ router.get("/summary", authenticateUser, async (req, res) => {
     let totalIncome = 0;
     let totalExpense = 0;
     const expensesByCategory = {};
+    const incomeByCategory = {};
 
     tx.forEach((t) => {
       const amt = parseFloat(t.amount) || 0;
 
-      if (t.type === "income") totalIncome += amt;
+      if (t.type === "income") {
+        totalIncome += amt;
+
+        const catId = t.category_id || "__uncategorized__";
+        incomeByCategory[catId] = (incomeByCategory[catId] || 0) + amt;
+      }
 
       if (t.type === "expense") {
         totalExpense += amt;
@@ -319,6 +367,7 @@ router.get("/summary", authenticateUser, async (req, res) => {
     const categoryIdsNeeded = Array.from(
       new Set([
         ...Object.keys(expensesByCategory),
+        ...Object.keys(incomeByCategory),
         ...Array.from(allCatsFixedVar),
         topCategoryThisMonth?.category_id,
       ])
@@ -466,6 +515,7 @@ router.get("/summary", authenticateUser, async (req, res) => {
 
         // para el pie chart y "Mayor gasto por categoría"
         expensesByCategory,
+        incomeByCategory,
         topCategoryThisMonth,
         topCategoryName,
       },
@@ -520,38 +570,16 @@ router.get("/expenses-by-category", authenticateUser, async (req, res) => {
   }
 
   try {
-    const { data, error } = await supabase
-      .from("transactions")
-      .select("amount, category_id, categories(name)")
-      .eq("user_id", user_id)
-      .eq("type", "expense")
-      .gte("date", period.start)
-      .lte("date", period.end);
-
-    if (error) throw error;
-
-    const expensesByCategory = {};
-    const categoryNameMap = {};
-
-    (data || []).forEach((tx) => {
-      const amount = Number(tx.amount) || 0;
-      if (amount <= 0) return;
-
-      const categoryId = tx.category_id || "__uncategorized__";
-      expensesByCategory[categoryId] =
-        (expensesByCategory[categoryId] || 0) + amount;
-
-      if (!categoryNameMap[categoryId]) {
-        categoryNameMap[categoryId] = tx.category_id
-          ? tx.categories?.name || "Sin nombre"
-          : "Sin categoria";
-      }
-    });
+    const { totalsByCategory, categoryNameMap } = await getCategoryTotalsByType(
+      user_id,
+      "expense",
+      period
+    );
 
     res.json({
       success: true,
       data: {
-        expensesByCategory,
+        expensesByCategory: totalsByCategory,
         categoryNameMap,
       },
       meta: {
@@ -571,13 +599,55 @@ router.get("/expenses-by-category", authenticateUser, async (req, res) => {
 });
 
 /* ============================================================
+   GET: INGRESOS POR CATEGORIA (ANO/MES)
+   ============================================================ */
+router.get("/income-by-category", authenticateUser, async (req, res) => {
+  const user_id = req.user?.id;
+  const period = resolveMonthPeriod(req);
+
+  if (period.error) {
+    return res.status(400).json({ error: period.error });
+  }
+
+  try {
+    const { totalsByCategory, categoryNameMap } = await getCategoryTotalsByType(
+      user_id,
+      "income",
+      period
+    );
+
+    res.json({
+      success: true,
+      data: {
+        incomeByCategory: totalsByCategory,
+        categoryNameMap,
+      },
+      meta: {
+        year: period.year,
+        month: period.month,
+        month_key: period.monthKey,
+        range: {
+          start: period.start,
+          end: period.end,
+        },
+      },
+    });
+  } catch (err) {
+    console.error("Error en /dashboard/income-by-category:", err);
+    res.status(500).json({ error: "Error al calcular ingresos por categoria." });
+  }
+});
+
+/* ============================================================
    GET: TRANSACCIONES POR CATEGORIA (ANO/MES)
    ============================================================ */
 router.get("/transactions-by-category", authenticateUser, async (req, res) => {
   const user_id = req.user?.id;
   const category_id = req.query.category_id;
+  const txType = resolveTransactionReportType(req, "expense");
 
   if (!category_id) return res.status(400).json({ error: "Falta category_id" });
+  if (txType.error) return res.status(400).json({ error: txType.error });
 
   const period = resolveMonthPeriod(req);
 
@@ -588,9 +658,9 @@ router.get("/transactions-by-category", authenticateUser, async (req, res) => {
   try {
     let query = supabase
       .from("transactions")
-      .select("id, amount, description, date")
+      .select("id, amount, description, date, type")
       .eq("user_id", user_id)
-      .eq("type", "expense")
+      .eq("type", txType.type)
       .gte("date", period.start)
       .lte("date", period.end)
       .order("date", { ascending: true });
