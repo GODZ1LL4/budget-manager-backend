@@ -3103,6 +3103,275 @@ router.get("/account-flow-trace", authenticateUser, async (req, res) => {
 
     const byInflow = [...accounts].sort((a, b) => b.total_in - a.total_in)[0] || null;
     const byOutflow = [...accounts].sort((a, b) => b.total_out - a.total_out)[0] || null;
+    const chronologicalTransactions = [...(transactionsResult.data || [])].sort((a, b) => {
+      const dateCompare = String(a.date || "").localeCompare(String(b.date || ""));
+      if (dateCompare !== 0) return dateCompare;
+      return String(a.id || "").localeCompare(String(b.id || ""));
+    });
+
+    const ledgersByAccount = {};
+    const spendingTraceMap = {};
+    const retainedSourceMap = {};
+
+    const getLedger = (accountId, accountName) => {
+      const key = accountId || "__no_account__";
+      if (!ledgersByAccount[key]) ledgersByAccount[key] = [];
+      ensureAccount(accountId, accountName || "Cuenta");
+      return ledgersByAccount[key];
+    };
+
+    const normalizeLotPath = (path, nextAccountName) => {
+      const safePath = Array.isArray(path) && path.length ? [...path] : [];
+      if (nextAccountName && safePath[safePath.length - 1] !== nextAccountName) {
+        safePath.push(nextAccountName);
+      }
+      return safePath;
+    };
+
+    const consumeLots = (accountId, accountName, amount, date) => {
+      const ledger = getLedger(accountId, accountName);
+      let remaining = Number(amount) || 0;
+      const consumed = [];
+
+      while (remaining > 0 && ledger.length > 0) {
+        const lot = ledger[0];
+        const take = Math.min(remaining, Number(lot.remaining_amount) || 0);
+
+        if (take > 0) {
+          consumed.push({
+            ...lot,
+            amount: take,
+          });
+          lot.remaining_amount -= take;
+          remaining -= take;
+        }
+
+        if ((Number(lot.remaining_amount) || 0) <= 0.005) {
+          ledger.shift();
+        }
+      }
+
+      if (remaining > 0.005) {
+        consumed.push({
+          source_type: "opening_balance",
+          source_id: `opening-${accountId || "none"}`,
+          source_label: "Saldo previo al periodo",
+          source_account_id: accountId || null,
+          source_account_name: accountName || "Cuenta",
+          first_date: date,
+          path: [accountName || "Cuenta"],
+          amount: remaining,
+        });
+      }
+
+      return consumed;
+    };
+
+    const addSpendingTrace = (segment, expenseTx, accountName, amount) => {
+      const categoryName = expenseTx.categories?.name || "Sin categoria";
+      const path = normalizeLotPath(segment.path, accountName);
+      const key = [
+        segment.source_type,
+        segment.source_id,
+        accountName,
+        categoryName,
+        path.join(">"),
+      ].join("__");
+
+      if (!spendingTraceMap[key]) {
+        spendingTraceMap[key] = {
+          source_type: segment.source_type,
+          source_label: segment.source_label,
+          source_account_id: segment.source_account_id || null,
+          source_account_name: segment.source_account_name || "Cuenta",
+          spent_account_id: expenseTx.account_id || expenseTx.account?.id || null,
+          spent_account_name: accountName,
+          category_name: categoryName,
+          path,
+          amount: 0,
+          count: 0,
+          first_date: expenseTx.date,
+          last_date: expenseTx.date,
+        };
+      }
+
+      const trace = spendingTraceMap[key];
+      trace.amount += amount;
+      trace.count += 1;
+      if (expenseTx.date < trace.first_date) trace.first_date = expenseTx.date;
+      if (expenseTx.date > trace.last_date) trace.last_date = expenseTx.date;
+    };
+
+    for (const tx of chronologicalTransactions) {
+      const amount = Number(tx.amount) || 0;
+      if (amount <= 0) continue;
+
+      if (tx.type === "income") {
+        const accountId = tx.account_id || tx.account?.id || null;
+        const accountName = mapAccountName(accountId, tx.account, "Cuenta");
+        const ledger = getLedger(accountId, accountName);
+        const sourceLabel =
+          tx.description ||
+          tx.categories?.name ||
+          `Ingreso en ${accountName}`;
+
+        ledger.push({
+          source_type: "income",
+          source_id: tx.id,
+          source_label: sourceLabel,
+          source_account_id: accountId,
+          source_account_name: accountName,
+          first_date: tx.date,
+          path: [accountName],
+          remaining_amount: amount,
+        });
+      } else if (tx.type === "transfer") {
+        const fromId = tx.account_from_id || tx.account_from?.id || null;
+        const toId = tx.account_to_id || tx.account_to?.id || null;
+        const fromName = mapAccountName(fromId, tx.account_from, "Cuenta origen");
+        const toName = mapAccountName(toId, tx.account_to, "Cuenta destino");
+        const consumed = consumeLots(fromId, fromName, amount, tx.date);
+        const toLedger = getLedger(toId, toName);
+
+        consumed.forEach((segment) => {
+          toLedger.push({
+            source_type: segment.source_type,
+            source_id: segment.source_id,
+            source_label: segment.source_label,
+            source_account_id: segment.source_account_id,
+            source_account_name: segment.source_account_name,
+            first_date: segment.first_date,
+            path: normalizeLotPath(segment.path, toName),
+            remaining_amount: segment.amount,
+          });
+        });
+      } else if (tx.type === "expense") {
+        const accountId = tx.account_id || tx.account?.id || null;
+        const accountName = mapAccountName(accountId, tx.account, "Cuenta");
+        const consumed = consumeLots(accountId, accountName, amount, tx.date);
+        consumed.forEach((segment) => {
+          addSpendingTrace(segment, tx, accountName, segment.amount);
+        });
+      }
+    }
+
+    Object.entries(ledgersByAccount).forEach(([accountKey, lots]) => {
+      const account = accountsById[accountKey];
+      const accountName = account?.account_name || "Cuenta";
+
+      lots.forEach((lot) => {
+        const remaining = Number(lot.remaining_amount) || 0;
+        if (remaining <= 0.005) return;
+
+        const key = [lot.source_type, lot.source_id, accountKey].join("__");
+        if (!retainedSourceMap[key]) {
+          retainedSourceMap[key] = {
+            source_type: lot.source_type,
+            source_label: lot.source_label,
+            source_account_name: lot.source_account_name || accountName,
+            current_account_name: accountName,
+            path: normalizeLotPath(lot.path, accountName),
+            amount: 0,
+          };
+        }
+        retainedSourceMap[key].amount += remaining;
+      });
+    });
+
+    const spendingTraces = Object.values(spendingTraceMap)
+      .map((trace) => ({
+        ...trace,
+        amount: toRoundedNumber(trace.amount),
+      }))
+      .sort((a, b) => b.amount - a.amount)
+      .slice(0, 12);
+
+    const retainedSources = Object.values(retainedSourceMap)
+      .map((row) => ({
+        ...row,
+        amount: toRoundedNumber(row.amount),
+      }))
+      .sort((a, b) => b.amount - a.amount)
+      .slice(0, 8);
+
+    const accountRoles = accounts
+      .map((account) => {
+        const transferVolume =
+          Number(account.transfer_in || 0) + Number(account.transfer_out || 0);
+        const externalVolume = Number(account.income || 0) + Number(account.expense || 0);
+        const bridgeScore = Math.min(
+          Number(account.transfer_in || 0),
+          Number(account.transfer_out || 0)
+        );
+
+        let role = "Cuenta operativa";
+        let reason = "Mezcla entradas, salidas y movimientos internos.";
+        let score = Number(account.activity || 0);
+
+        if (bridgeScore > 0 && transferVolume >= externalVolume * 0.65) {
+          role = "Cuenta puente";
+          reason = "Recibe transferencias y tambien redistribuye dinero a otras cuentas.";
+          score = bridgeScore;
+        } else if (Number(account.income || 0) >= Math.max(Number(account.expense || 0), Number(account.transfer_in || 0))) {
+          role = "Cuenta receptora";
+          reason = "Concentra ingresos externos del periodo.";
+          score = Number(account.income || 0);
+        } else if (Number(account.expense || 0) >= Math.max(Number(account.income || 0), Number(account.transfer_out || 0))) {
+          role = "Cuenta de consumo";
+          reason = "Desde aqui sale la mayor parte del gasto externo.";
+          score = Number(account.expense || 0);
+        } else if (Number(account.transfer_in || 0) > Number(account.transfer_out || 0)) {
+          role = "Cuenta destino";
+          reason = "Recibe mas dinero por transferencias del que envia.";
+          score = Number(account.transfer_in || 0);
+        }
+
+        return {
+          account_id: account.account_id,
+          account_name: account.account_name,
+          role,
+          reason,
+          score: toRoundedNumber(score),
+        };
+      })
+      .filter((row) => row.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 6);
+
+    const insights = [];
+    const topTrace = spendingTraces[0];
+    const topRole = accountRoles[0];
+    const topRetained = retainedSources[0];
+
+    if (topTrace) {
+      insights.push({
+        kind: "spending_trace",
+        title: "Ruta principal hacia gastos",
+        body: `${topTrace.source_label} termino financiando ${topTrace.category_name} desde ${topTrace.spent_account_name}.`,
+        amount: topTrace.amount,
+        path: topTrace.path,
+      });
+    }
+
+    if (topRole) {
+      insights.push({
+        kind: "account_role",
+        title: topRole.role,
+        body: `${topRole.account_name}: ${topRole.reason}`,
+        amount: topRole.score,
+        account_name: topRole.account_name,
+      });
+    }
+
+    if (topRetained) {
+      insights.push({
+        kind: "retained_source",
+        title: "Dinero que sigue dentro del sistema",
+        body: `${topRetained.source_label} queda principalmente en ${topRetained.current_account_name}.`,
+        amount: topRetained.amount,
+        path: topRetained.path,
+      });
+    }
 
     return res.json({
       success: true,
@@ -3129,6 +3398,14 @@ router.get("/account-flow-trace", authenticateUser, async (req, res) => {
       accounts,
       links,
       movements: movements.slice(0, 120),
+      analysis: {
+        method:
+          "Estimacion FIFO por cuenta: los ingresos alimentan saldos, las transferencias mueven esos lotes y los gastos consumen el dinero mas antiguo disponible.",
+        insights,
+        account_roles: accountRoles,
+        spending_traces: spendingTraces,
+        retained_sources: retainedSources,
+      },
     });
   } catch (err) {
     console.error("Error inesperado /analytics/account-flow-trace:", err);
