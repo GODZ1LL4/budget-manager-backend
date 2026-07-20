@@ -4585,6 +4585,12 @@ router.get("/unusual-expenses", authenticateUser, async (req, res) => {
 router.get("/category-month-heatmap", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
   const year = parseInt(req.query.year, 10) || new Date().getFullYear();
+  const txType = String(req.query.type || "expense").toLowerCase();
+
+  if (!["expense", "income"].includes(txType)) {
+    return res.status(400).json({ error: "type debe ser expense o income" });
+  }
+
   const { start, end } = getYearRange(year);
 
   try {
@@ -4592,7 +4598,7 @@ router.get("/category-month-heatmap", authenticateUser, async (req, res) => {
       .from("transactions")
       .select("amount, date, category_id, categories(name)")
       .eq("user_id", user_id)
-      .eq("type", "expense")
+      .eq("type", txType)
       .gte("date", start)
       .lte("date", end);
 
@@ -4629,9 +4635,9 @@ router.get("/category-month-heatmap", authenticateUser, async (req, res) => {
       amount: Number(r.amount.toFixed(2)),
     }));
 
-    return res.json({ success: true, data: rows, meta: { year } });
+    return res.json({ success: true, data: rows, meta: { year, type: txType } });
   } catch (err) {
-    console.error("Error en /analytics/category-month-heatmap:", err);
+    console.error(`Error en /analytics/category-month-heatmap (${txType}):`, err);
     return res
       .status(500)
       .json({ error: "Error interno generando heatmap de categorías" });
