@@ -2313,6 +2313,7 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
             description: trx.description || "Lista de compra",
             amount: trx.amount == null ? null : Number(trx.amount),
             itemIds: new Set(),
+            linesByItemId: {},
             line_count: 0,
             total_quantity: 0,
             total_paid_amount: 0,
@@ -2324,6 +2325,25 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
         shoppingList.line_count += 1;
         shoppingList.total_quantity += numbers.quantity;
         shoppingList.total_paid_amount += numbers.paid_amount;
+
+        if (!shoppingList.linesByItemId[itemId]) {
+          shoppingList.linesByItemId[itemId] = {
+            item_id: itemId,
+            item_name: item.name || "Sin nombre",
+            quantity: 0,
+            base_amount: 0,
+            paid_amount: 0,
+            discount_amount: 0,
+            line_count: 0,
+          };
+        }
+
+        const shoppingListLine = shoppingList.linesByItemId[itemId];
+        shoppingListLine.quantity += numbers.quantity;
+        shoppingListLine.base_amount += numbers.base_amount;
+        shoppingListLine.paid_amount += numbers.paid_amount;
+        shoppingListLine.discount_amount += numbers.discount_amount;
+        shoppingListLine.line_count += 1;
       }
 
       if (!groups[itemId]) {
@@ -2402,6 +2422,31 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
     const responseRows = allSignals.slice(0, limit);
     const shoppingLists = Object.values(shoppingListsById)
       .map((shoppingList) => {
+        const lines = Object.values(shoppingList.linesByItemId || {})
+          .map((line) => {
+            const quantity = Number(line.quantity || 0);
+            const baseAmount = Number(line.base_amount || 0);
+            const paidAmount = Number(line.paid_amount || 0);
+            const discountAmount = Number(line.discount_amount || 0);
+
+            return {
+              item_id: line.item_id,
+              item_name: line.item_name,
+              quantity: toRoundedNumber(quantity, 2),
+              base_amount: toRoundedNumber(baseAmount),
+              paid_amount: toRoundedNumber(paidAmount),
+              discount_amount: toRoundedNumber(discountAmount),
+              unit_price:
+                quantity > 0 ? toRoundedNumber(baseAmount / quantity) : 0,
+              paid_unit_price:
+                quantity > 0 ? toRoundedNumber(paidAmount / quantity) : 0,
+              line_count: line.line_count,
+            };
+          })
+          .filter((line) => Number(line.quantity || 0) > 0)
+          .sort((a, b) =>
+            String(a.item_name || "").localeCompare(String(b.item_name || ""))
+          );
         const totalPaid = toRoundedNumber(shoppingList.total_paid_amount);
         const amount = Number.isFinite(shoppingList.amount) && shoppingList.amount > 0
           ? shoppingList.amount
@@ -2412,11 +2457,12 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
           date: shoppingList.date,
           description: shoppingList.description,
           amount: toRoundedNumber(amount),
-          item_ids: Array.from(shoppingList.itemIds),
-          item_count: shoppingList.itemIds.size,
+          item_ids: lines.map((line) => String(line.item_id)),
+          item_count: lines.length,
           line_count: shoppingList.line_count,
           total_quantity: toRoundedNumber(shoppingList.total_quantity, 2),
           total_paid_amount: totalPaid,
+          lines,
         };
       })
       .filter((shoppingList) => shoppingList.item_count > 0)
