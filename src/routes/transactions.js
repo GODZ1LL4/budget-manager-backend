@@ -15,7 +15,7 @@ router.get("/for-calendar", authenticateUser, async (req, res) => {
   // 1) Obtener todas las transacciones del usuario (reales + plantillas)
   const { data: allTxs, error } = await supabase
     .from("transactions")
-    .select("*")
+    .select("*, categories:categories!transactions_category_id_fkey (id, name, type)")
     .eq("user_id", user_id);
 
   if (error) return res.status(500).json({ error: error.message });

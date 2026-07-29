@@ -2268,8 +2268,10 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
           id,
           user_id,
           type,
+          amount,
           date,
           description,
+          is_shopping_list,
           categories ( name )
         )
       `
@@ -2288,6 +2290,7 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
     }
 
     const groups = {};
+    const shoppingListsById = {};
 
     for (const row of data || []) {
       const trx = row.transactions;
@@ -2300,6 +2303,28 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
       const itemId = row.item_id;
       const date = trx.date;
       if (!date) continue;
+
+      if (trx.is_shopping_list === true && trx.id) {
+        const txId = String(trx.id);
+        if (!shoppingListsById[txId]) {
+          shoppingListsById[txId] = {
+            id: txId,
+            date,
+            description: trx.description || "Lista de compra",
+            amount: trx.amount == null ? null : Number(trx.amount),
+            itemIds: new Set(),
+            line_count: 0,
+            total_quantity: 0,
+            total_paid_amount: 0,
+          };
+        }
+
+        const shoppingList = shoppingListsById[txId];
+        shoppingList.itemIds.add(String(itemId));
+        shoppingList.line_count += 1;
+        shoppingList.total_quantity += numbers.quantity;
+        shoppingList.total_paid_amount += numbers.paid_amount;
+      }
 
       if (!groups[itemId]) {
         groups[itemId] = {
@@ -2375,6 +2400,33 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
     );
 
     const responseRows = allSignals.slice(0, limit);
+    const shoppingLists = Object.values(shoppingListsById)
+      .map((shoppingList) => {
+        const totalPaid = toRoundedNumber(shoppingList.total_paid_amount);
+        const amount = Number.isFinite(shoppingList.amount) && shoppingList.amount > 0
+          ? shoppingList.amount
+          : totalPaid;
+
+        return {
+          id: shoppingList.id,
+          date: shoppingList.date,
+          description: shoppingList.description,
+          amount: toRoundedNumber(amount),
+          item_ids: Array.from(shoppingList.itemIds),
+          item_count: shoppingList.itemIds.size,
+          line_count: shoppingList.line_count,
+          total_quantity: toRoundedNumber(shoppingList.total_quantity, 2),
+          total_paid_amount: totalPaid,
+        };
+      })
+      .filter((shoppingList) => shoppingList.item_count > 0)
+      .sort((a, b) => {
+        const byDate = String(b.date || "").localeCompare(String(a.date || ""));
+        if (byDate !== 0) return byDate;
+        return String(a.description || "").localeCompare(
+          String(b.description || "")
+        );
+      });
 
     return res.json({
       success: true,
@@ -2405,6 +2457,7 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
         hottest_item: responseRows[0] || null,
       },
       data: responseRows,
+      shopping_lists: shoppingLists,
     });
   } catch (err) {
     console.error("Error inesperado /analytics/item-price-command-center:", err);
