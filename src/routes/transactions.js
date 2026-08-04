@@ -11,19 +11,32 @@ const ExcelJS = require("exceljs");
 
 router.get("/for-calendar", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
+  const pageSize = 1000;
+  let from = 0;
+  const allTxs = [];
 
   // 1) Obtener todas las transacciones del usuario (reales + plantillas)
-  const { data: allTxs, error } = await supabase
-    .from("transactions")
-    .select("*, categories:categories!transactions_category_id_fkey (id, name, type)")
-    .eq("user_id", user_id);
+  while (true) {
+    const { data, error } = await supabase
+      .from("transactions")
+      .select("*, categories:categories!transactions_category_id_fkey (id, name, type)")
+      .eq("user_id", user_id)
+      .order("date", { ascending: true })
+      .order("created_at", { ascending: true })
+      .range(from, from + pageSize - 1);
 
-  if (error) return res.status(500).json({ error: error.message });
+    if (error) return res.status(500).json({ error: error.message });
+
+    allTxs.push(...(data || []));
+
+    if (!data || data.length < pageSize) break;
+    from += pageSize;
+  }
 
   // 2) Mapear instancias reales creadas por recurrencia
   //    Clave: `${originId}_${date}`
   const realRecurringTxsSet = new Set();
-  for (const tx of allTxs || []) {
+  for (const tx of allTxs) {
     if (tx.recurrence_origin_id) {
       realRecurringTxsSet.add(`${tx.recurrence_origin_id}_${tx.date}`);
     }
@@ -31,7 +44,7 @@ router.get("/for-calendar", authenticateUser, async (req, res) => {
 
   const result = [];
 
-  for (const tx of allTxs || []) {
+  for (const tx of allTxs) {
     // A) Transacción normal (no recurrente) -> se devuelve tal cual
     if (!tx.recurrence) {
       result.push(tx);
