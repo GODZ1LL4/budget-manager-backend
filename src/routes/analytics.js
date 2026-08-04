@@ -4584,17 +4584,31 @@ router.get("/unusual-expenses", authenticateUser, async (req, res) => {
   const currentStart = `${monthKey}-01`;
 
   try {
-    // 1) Histórico antes del mes actual
-    const { data: history, error: histErr } = await supabase
-      .from("transactions")
-      .select("id, amount, category_id, categories(name)")
-      .eq("user_id", user_id)
-      .eq("type", "expense")
-      .lt("date", currentStart);
+    const pageSize = 1000;
+    const history = [];
+    const current = [];
 
-    if (histErr) {
-      console.error(histErr);
-      return res.status(500).json({ error: histErr.message });
+    // 1) Histórico antes del mes actual
+    let historyFrom = 0;
+    while (true) {
+      const { data, error: histErr } = await supabase
+        .from("transactions")
+        .select("id, amount, category_id, categories(name)")
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .lt("date", currentStart)
+        .order("date", { ascending: true })
+        .range(historyFrom, historyFrom + pageSize - 1);
+
+      if (histErr) {
+        console.error(histErr);
+        return res.status(500).json({ error: histErr.message });
+      }
+
+      history.push(...(data || []));
+
+      if (!data || data.length < pageSize) break;
+      historyFrom += pageSize;
     }
 
     const statsByCat = {};
@@ -4632,31 +4646,48 @@ router.get("/unusual-expenses", authenticateUser, async (req, res) => {
 
     // 2) Transacciones del mes actual
     const today = now.toISOString().split("T")[0];
-    const { data: current, error: currErr } = await supabase
-      .from("transactions")
-      .select("id, amount, date, description, category_id, categories(name)")
-      .eq("user_id", user_id)
-      .eq("type", "expense")
-      .gte("date", currentStart)
-      .lte("date", today);
+    let currentFrom = 0;
+    while (true) {
+      const { data, error: currErr } = await supabase
+        .from("transactions")
+        .select("id, amount, date, description, category_id, categories(name)")
+        .eq("user_id", user_id)
+        .eq("type", "expense")
+        .gte("date", currentStart)
+        .lte("date", today)
+        .order("date", { ascending: true })
+        .range(currentFrom, currentFrom + pageSize - 1);
 
-    if (currErr) {
-      console.error(currErr);
-      return res.status(500).json({ error: currErr.message });
+      if (currErr) {
+        console.error(currErr);
+        return res.status(500).json({ error: currErr.message });
+      }
+
+      current.push(...(data || []));
+
+      if (!data || data.length < pageSize) break;
+      currentFrom += pageSize;
     }
 
     const unusual = [];
     const zThreshold = 2; // >= 2 desviaciones estándar
+    const minAbsoluteDelta = 25;
+    const minRelativeDelta = 0.05;
 
-    (current || []).forEach((tx) => {
+    current.forEach((tx) => {
       const catId = tx.category_id;
       const stats = statsByCat[catId];
       if (!stats) return;
       if (!stats.std_dev || stats.std_dev <= 0 || stats.count < 5) return;
 
       const amt = parseFloat(tx.amount) || 0;
-      const z = (amt - stats.mean) / stats.std_dev;
-      if (z >= zThreshold) {
+      const delta = amt - stats.mean;
+      const minPracticalDelta = Math.max(
+        minAbsoluteDelta,
+        Math.abs(stats.mean) * minRelativeDelta
+      );
+      const z = delta / stats.std_dev;
+      if (z >= zThreshold && delta >= minPracticalDelta) {
         unusual.push({
           id: tx.id,
           date: tx.date,
@@ -4666,13 +4697,26 @@ router.get("/unusual-expenses", authenticateUser, async (req, res) => {
           z_score: Number(z.toFixed(2)),
           mean: Number(stats.mean.toFixed(2)),
           std_dev: Number(stats.std_dev.toFixed(2)),
+          delta: Number(delta.toFixed(2)),
+          delta_pct:
+            stats.mean > 0 ? Number(((delta / stats.mean) * 100).toFixed(2)) : null,
+          min_delta: Number(minPracticalDelta.toFixed(2)),
         });
       }
     });
 
     unusual.sort((a, b) => b.z_score - a.z_score);
 
-    return res.json({ success: true, data: unusual });
+    return res.json({
+      success: true,
+      data: unusual,
+      meta: {
+        month: monthKey,
+        z_threshold: zThreshold,
+        min_absolute_delta: minAbsoluteDelta,
+        min_relative_delta_pct: minRelativeDelta * 100,
+      },
+    });
   } catch (err) {
     console.error("Error en /analytics/unusual-expenses:", err);
     return res
