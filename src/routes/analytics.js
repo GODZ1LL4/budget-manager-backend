@@ -200,14 +200,53 @@ router.get("/top-items-by-category", authenticateUser, async (req, res) => {
   }
 });
 
-/* ========= PRESUPUESTO VS REAL (MES ACTUAL) ========= */
+/* ========= PRESUPUESTO VS REAL (PERIODO SELECCIONADO) ========= */
 
-async function getBudgetVsActualRawByCategory(user_id, now = new Date()) {
-  const currentMonth = getMonthKey(now);
-  const start = `${currentMonth}-01`;
-  const end = new Date(now.getFullYear(), now.getMonth() + 1, 0)
-    .toISOString()
-    .split("T")[0];
+const getBudgetVsActualPeriod = (req) => {
+  const currentRange = getCurrentMonthRange(new Date(), getRequestTimeZone(req));
+  const hasYear =
+    req.query.year != null && String(req.query.year).trim() !== "";
+  const hasMonth =
+    req.query.month != null && String(req.query.month).trim() !== "";
+  const year = hasYear ? Number(req.query.year) : currentRange.year;
+  const month = hasMonth ? Number(req.query.month) : currentRange.month;
+
+  if (
+    !Number.isInteger(year) ||
+    year < 2000 ||
+    year > 2100 ||
+    !Number.isInteger(month) ||
+    month < 1 ||
+    month > 12
+  ) {
+    return {
+      error: "Parametros year/month invalidos. Usa year 2000-2100 y month 1-12.",
+    };
+  }
+
+  const monthKey = `${year}-${String(month).padStart(2, "0")}`;
+  const range = getMonthRange(monthKey);
+
+  return {
+    year,
+    month,
+    monthKey,
+    start: range.start,
+    end: range.end,
+  };
+};
+
+async function getBudgetVsActualRawByCategory(user_id, period = null) {
+  const fallbackNow = new Date();
+  const fallbackMonth = getMonthKey(fallbackNow);
+  const activePeriod =
+    period || {
+      monthKey: fallbackMonth,
+      start: `${fallbackMonth}-01`,
+      end: new Date(fallbackNow.getFullYear(), fallbackNow.getMonth() + 1, 0)
+        .toISOString()
+        .split("T")[0],
+    };
 
   const { data: budgets, error: budgetError } = await supabase
     .from("budgets")
@@ -219,7 +258,7 @@ async function getBudgetVsActualRawByCategory(user_id, now = new Date()) {
     `
     )
     .eq("user_id", user_id)
-    .eq("month", currentMonth);
+    .eq("month", activePeriod.monthKey);
 
   if (budgetError) throw new Error(budgetError.message);
 
@@ -228,8 +267,8 @@ async function getBudgetVsActualRawByCategory(user_id, now = new Date()) {
     .select("category_id, amount")
     .eq("user_id", user_id)
     .eq("type", "expense")
-    .gte("date", start)
-    .lte("date", end);
+    .gte("date", activePeriod.start)
+    .lte("date", activePeriod.end);
 
   if (txError) throw new Error(txError.message);
 
@@ -251,15 +290,30 @@ async function getBudgetVsActualRawByCategory(user_id, now = new Date()) {
 
 router.get("/budget-vs-actual", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
+  const period = getBudgetVsActualPeriod(req);
+
+  if (period.error) {
+    return res.status(400).json({ error: period.error });
+  }
 
   try {
-    const raw = await getBudgetVsActualRawByCategory(user_id);
+    const raw = await getBudgetVsActualRawByCategory(user_id, period);
     const result = raw.map((r) => ({
       category: r.category,
       presupuesto: r.limit,
       gastado: r.spent,
     }));
-    res.json({ success: true, data: result });
+    res.json({
+      success: true,
+      meta: {
+        year: period.year,
+        month: period.month,
+        month_key: period.monthKey,
+        start: period.start,
+        end: period.end,
+      },
+      data: result,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -268,15 +322,30 @@ router.get("/budget-vs-actual", authenticateUser, async (req, res) => {
 // Alias con shape diferente, usado por otros componentes
 router.get("/spending-vs-budget", authenticateUser, async (req, res) => {
   const user_id = req.user.id;
+  const period = getBudgetVsActualPeriod(req);
+
+  if (period.error) {
+    return res.status(400).json({ error: period.error });
+  }
 
   try {
-    const raw = await getBudgetVsActualRawByCategory(user_id);
+    const raw = await getBudgetVsActualRawByCategory(user_id, period);
     const result = raw.map((r) => ({
       category: r.category,
       spent: r.spent,
       limit: r.limit,
     }));
-    res.json({ success: true, data: result });
+    res.json({
+      success: true,
+      meta: {
+        year: period.year,
+        month: period.month,
+        month_key: period.monthKey,
+        start: period.start,
+        end: period.end,
+      },
+      data: result,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
