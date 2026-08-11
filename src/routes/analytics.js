@@ -6259,7 +6259,7 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
 
     const limit = Math.max(
       1,
-      Math.min(50, parseInt(req.query.limit ?? "15", 10) || 15)
+      Math.min(200, parseInt(req.query.limit ?? "50", 10) || 50)
     );
 
     const includeNoise = String(req.query.include_noise ?? "true") === "true";
@@ -6284,6 +6284,9 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
     );
 
     const includeStale = String(req.query.include_stale ?? "false") === "true";
+    const statusFilter = String(req.query.status_filter || "all")
+      .trim()
+      .toLowerCase();
 
     // =========================
     // Fechas (igual patrón que /expense-forecast)
@@ -6724,7 +6727,22 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
       scheduled: 3,
     };
 
-    const combined = [...recurring, ...noise]
+    const statusSets = {
+      all: null,
+      overdue: new Set(["overdue"]),
+      due_now: new Set(["overdue", "today"]),
+      due_soon: new Set(["today", "due_soon"]),
+      scheduled: new Set(["scheduled"]),
+      not_overdue: new Set(["today", "due_soon", "scheduled"]),
+    };
+
+    const requestedStatuses = statusSets[statusFilter] ?? statusSets.all;
+    const allCandidates = [...recurring, ...noise];
+    const filteredCandidates = requestedStatuses
+      ? allCandidates.filter((row) => requestedStatuses.has(row.shopping_status))
+      : allCandidates;
+
+    const combined = filteredCandidates
       .sort((a, b) => {
         const rankA = shoppingStatusRank[a.shopping_status] ?? 99;
         const rankB = shoppingStatusRank[b.shopping_status] ?? 99;
@@ -6763,13 +6781,17 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
         min_occurrences: minOccurrences,
         include_noise: includeNoise,
         include_stale: includeStale,
+        status_filter: statusSets[statusFilter] ? statusFilter : "all",
         due_soon_days: dueSoonDays,
         min_interval_days: minIntervalDays,
         max_interval_days: maxIntervalDays,
         max_coef_variation: maxCoefVariation,
         forecast_logic: "shopping-plan",
         total_items_analyzed: Object.keys(eventsByItem).length,
-        total_candidates: recurring.length + noise.length,
+        total_candidates: allCandidates.length,
+        filtered_candidates: filteredCandidates.length,
+        returned_items: combined.length,
+        limit,
         expiry_rule: {
           hard_drop_days: `min(${HARD_DROP_DAYS}, 2*expiry_days)`,
           expiry_days: "max(4*median_interval_days, 180)",
