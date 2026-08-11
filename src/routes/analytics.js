@@ -6271,12 +6271,19 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
 
     const maxIntervalDays = Math.max(
       minIntervalDays,
-      parseInt(req.query.max_interval_days ?? "70", 10) || 70
+      parseInt(req.query.max_interval_days ?? "180", 10) || 180
     );
 
     const maxCoefVariation = Number.isFinite(Number(req.query.max_coef_variation))
       ? Number(req.query.max_coef_variation)
-      : 0.6;
+      : 1;
+
+    const dueSoonDays = Math.max(
+      0,
+      Math.min(60, parseInt(req.query.due_soon_days ?? "7", 10) || 7)
+    );
+
+    const includeStale = String(req.query.include_stale ?? "false") === "true";
 
     // =========================
     // Fechas (igual patrón que /expense-forecast)
@@ -6330,7 +6337,7 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
     const history_from = toISODate(historyFromObj);
     const history_to = toISODate(historyToObj);
 
-    const historyDays = Math.max(1, diffInDays(history_from, history_to) || 1);
+    const historyDays = Math.max(1, diffInDays(history_from, history_to) + 1);
     const targetDays = Math.max(1, diffInDays(date_from, date_to) + 1);
 
     // =========================
@@ -6345,6 +6352,7 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
         line_total_final,
         items!inner (
           name,
+          category,
           user_id,
           taxes ( rate, is_exempt )
         ),
@@ -6370,6 +6378,7 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
     // =========================
     const eventsByItem = {}; // itemId -> date -> { qty, amount }
     const itemNameMap = {};
+    const itemCategoryMap = {};
 
     (data || []).forEach((row) => {
       const trx = row.transactions;
@@ -6383,6 +6392,7 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
       if (!itemId || !day || qty <= 0) return;
 
       itemNameMap[itemId] = itemRel.name || "Sin nombre";
+      itemCategoryMap[itemId] = itemRel.category || null;
 
       // monto final con fallback
       let lineAmount = 0;
@@ -6413,19 +6423,19 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
     const nearInt = (x) => Math.abs(x - Math.round(x)) <= qtyEps;
 
     // =========================
-    // Recency hybrid thresholds
+    // Recency thresholds for long-tail purchase reminders
     // =========================
-    const HARD_DROP_DAYS = 90; // >90 => excluir completamente (muerto)
-    // expiry dinámico:
-    // quincenal(14) -> max(3*14=42,45)=45
-    // mensual(30) -> max(90,45)=90
+    const HARD_DROP_DAYS = 3650; // safety cap; stale behavior is now dynamic below
+    // expiry dinamico:
+    // quincenal(14) -> max(4*14=56,180)=180
+    // mensual(30) -> max(120,180)=180
     const expiryDaysFor = (medianIntervalDays) => {
       const mi = Math.max(1, Math.round(Number(medianIntervalDays) || 1));
-      return Math.max(3 * mi, 45);
+      return Math.max(4 * mi, 180);
     };
 
     // =========================
-    // Construir patrones
+    // Build suggested shopping plan
     // =========================
     const recurring = [];
     const noise = [];
@@ -6433,7 +6443,7 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
     for (const itemId of Object.keys(eventsByItem)) {
       const byDate = eventsByItem[itemId];
       const dates = Object.keys(byDate).sort();
-      if (dates.length < 2) continue;
+      if (dates.length < minOccurrences) continue;
 
       const entries = dates.map((d) => ({
         date: d,
@@ -6453,6 +6463,13 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
       const meanInterval = mean(intervals);
       const stdInterval = stdDev(intervals);
       const cv = meanInterval > 0 ? stdInterval / meanInterval : 999;
+
+      if (
+        medianInterval < minIntervalDays ||
+        medianInterval > maxIntervalDays
+      ) {
+        continue;
+      }
 
       const amounts = entries.map((e) => Number(e.amount) || 0).filter((x) => x > 0);
       const qtys = entries.map((e) => Number(e.quantity) || 0).filter((x) => x > 0);
@@ -6476,12 +6493,55 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
       const daysSinceLast = diffInDays(lastDate, date_from); // lastDate antes del rango => positivo
       const expiryDays = expiryDaysFor(medianInterval);
 
-      const isHardExpired = daysSinceLast > HARD_DROP_DAYS;
+      const isHardExpired =
+        !includeStale && daysSinceLast > Math.min(HARD_DROP_DAYS, expiryDays * 2);
       const isSoftExpired = daysSinceLast > expiryDays && !isHardExpired;
+
+      const intervalForPlan = Math.max(1, Math.round(medianInterval));
+      const firstDueDate = addDays(lastDate, intervalForPlan);
+      let nextDueDate = firstDueDate;
+      let missedOccurrences = 0;
+
+      while (String(nextDueDate) < date_from && missedOccurrences < 500) {
+        missedOccurrences += 1;
+        nextDueDate = addDays(nextDueDate, intervalForPlan);
+      }
+
+      const isOverdue = String(firstDueDate) < date_from;
+      const dueDate = isOverdue ? firstDueDate : nextDueDate;
+      const suggestedPurchaseDate = isOverdue ? date_from : nextDueDate;
+      const daysUntilDue = isOverdue
+        ? -diffInDays(firstDueDate, date_from)
+        : diffInDays(date_from, nextDueDate);
+      const overdueDays = isOverdue ? Math.abs(daysUntilDue) : 0;
+
+      let shoppingStatus = "scheduled";
+      if (isOverdue) shoppingStatus = "overdue";
+      else if (daysUntilDue === 0) shoppingStatus = "today";
+      else if (daysUntilDue <= dueSoonDays) shoppingStatus = "due_soon";
+
+      const occurrenceScore = Math.min(
+        1,
+        entries.length / Math.max(minOccurrences, 6)
+      );
+      const intervalScore = Math.max(0, 1 - Math.min(cv, 2) / 2);
+      const recencyScore =
+        daysSinceLast <= intervalForPlan * 2
+          ? 1
+          : Math.max(
+              0.35,
+              1 -
+                (daysSinceLast - intervalForPlan * 2) /
+                  Math.max(1, expiryDays - intervalForPlan * 2)
+            );
+      const confidenceBase =
+        (occurrenceScore * 0.42 + intervalScore * 0.38 + recencyScore * 0.2) *
+        100;
 
       const baseRow = {
         item_id: itemId,
         item_name: itemNameMap[itemId] || "Sin nombre",
+        category_name: itemCategoryMap[itemId],
         occurrences: entries.length,
 
         median_interval_days: Number(medianInterval.toFixed(1)),
@@ -6502,6 +6562,13 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
         days_since_last: Number.isFinite(daysSinceLast) ? daysSinceLast : null,
         expiry_days: expiryDays,
         recency_status: isHardExpired ? "hard_expired" : isSoftExpired ? "soft_expired" : "fresh",
+        shopping_status: shoppingStatus,
+        due_date: dueDate,
+        suggested_purchase_date: suggestedPurchaseDate,
+        next_purchase_date: suggestedPurchaseDate,
+        days_until_due: Number.isFinite(daysUntilDue) ? daysUntilDue : null,
+        overdue_days: overdueDays,
+        missed_occurrences: missedOccurrences,
       };
 
       // Si está MUY viejo: excluir del reporte por completo
@@ -6516,38 +6583,69 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
         medianInterval <= maxIntervalDays &&
         cv <= maxCoefVariation;
 
-      // si está soft-expired, NO puede ser recurrente
-      const finalIsRecurring = isRecurringCandidate && !isSoftExpired;
+      // Un item vencido puede seguir siendo recurrente; la confianza captura el deterioro.
+      const finalIsRecurring = isRecurringCandidate;
 
       if (finalIsRecurring) {
         // recurrente real
-        const interval = Math.max(1, Math.round(medianInterval));
+        const interval = intervalForPlan;
         const amountPerEvent = Number(medAmount) || 0;
         if (amountPerEvent <= 0) continue;
-
-        const gap = diffInDays(lastDate, date_from);
-        const n = gap > 0 ? Math.ceil(gap / interval) : 1;
-        let next = addDays(lastDate, n * interval);
 
         let expectedCount = 0;
         let projection = 0;
 
-        while (new Date(next) <= new Date(date_to)) {
-          expectedCount += 1;
-          projection += amountPerEvent;
-          next = addDays(next, interval);
+        if (isOverdue) {
+          expectedCount = 1;
+          projection = amountPerEvent;
+        } else {
+          let next = nextDueDate;
+          while (String(next) <= date_to) {
+            expectedCount += 1;
+            projection += amountPerEvent;
+            next = addDays(next, interval);
+          }
         }
 
         if (projection > 0) {
           const expectedQuantity = expectedCount * (Number(typicalQty) || 0);
+          const estimatedUnitPrice =
+            Number(typicalQty) > 0 ? amountPerEvent / Number(typicalQty) : 0;
+          const confidenceScore = Number(confidenceBase.toFixed(1));
+          const urgencyBase =
+            shoppingStatus === "overdue"
+              ? 120 + Math.min(overdueDays, 45)
+              : shoppingStatus === "today"
+              ? 115
+              : shoppingStatus === "due_soon"
+              ? 95 - Math.min(daysUntilDue, dueSoonDays)
+              : 70 - Math.min(daysUntilDue, 90) * 0.4;
+          const priorityScore = Number(
+            (
+              urgencyBase +
+              confidenceScore * 0.35 +
+              Math.log10(amountPerEvent + 1) * 4
+            ).toFixed(1)
+          );
 
           recurring.push({
             ...baseRow,
             type: "recurring",
+            forecast_logic: "shopping-plan",
+            confidence_score: confidenceScore,
+            priority_score: priorityScore,
             expected_count: expectedCount,
             expected_quantity: isDiscrete
               ? Number(expectedQuantity.toFixed(0))
               : Number(expectedQuantity.toFixed(2)),
+            recommended_quantity: isDiscrete
+              ? Number(expectedQuantity.toFixed(0))
+              : Number(expectedQuantity.toFixed(2)),
+            quantity_per_purchase: isDiscrete
+              ? Number(typicalQty.toFixed(0))
+              : Number(typicalQty.toFixed(2)),
+            estimated_unit_price: Number(estimatedUnitPrice.toFixed(2)),
+            estimated_purchase_total: Number(amountPerEvent.toFixed(2)),
             projection: Number(projection.toFixed(2)),
           });
         }
@@ -6558,40 +6656,94 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
         // para noise pedimos un mínimo de señal
         if (entries.length < 3) continue;
 
-        const total = amounts.reduce((s, v) => s + v, 0);
-        const meanPerDay = total / historyDays;
-        const projectedA = meanPerDay * targetDays;
+        if (!isOverdue && String(nextDueDate) > date_to) continue;
 
         const expectedCountRaw = (entries.length / historyDays) * targetDays;
-        const expectedCount = expectedCountRaw >= 0.75 ? Math.round(expectedCountRaw) : 0;
+        const expectedCount = Math.max(
+          isOverdue || String(nextDueDate) <= date_to ? 1 : 0,
+          expectedCountRaw >= 0.75 ? Math.round(expectedCountRaw) : 0
+        );
 
-        const projectedB = expectedCount > 0 ? expectedCount * (Number(medAmount) || 0) : 0;
-
-        const projection = Math.min(projectedA, projectedB);
+        const projection = expectedCount * (Number(medAmount) || 0);
 
         // si es soft-expired, limitamos agresivo para que no domine el top
         // (alguien que no compra desde hace 2 meses no debería "prometer" mucho)
-        const softExpiryPenalty = isSoftExpired ? 0.35 : 1.0;
+        const softExpiryPenalty = isSoftExpired ? 0.75 : 1.0;
         const finalProjection = projection * softExpiryPenalty;
 
         if (Number.isFinite(finalProjection) && finalProjection > 0) {
           const expectedQuantity = expectedCount * (Number(typicalQty) || 0);
+          const amountPerEvent = Number(medAmount) || 0;
+          const estimatedUnitPrice =
+            Number(typicalQty) > 0 ? amountPerEvent / Number(typicalQty) : 0;
+          const confidenceScore = Number((confidenceBase * 0.75).toFixed(1));
+          const urgencyBase =
+            shoppingStatus === "overdue"
+              ? 120 + Math.min(overdueDays, 45)
+              : shoppingStatus === "today"
+              ? 115
+              : shoppingStatus === "due_soon"
+              ? 95 - Math.min(daysUntilDue, dueSoonDays)
+              : 70 - Math.min(daysUntilDue, 90) * 0.4;
+          const priorityScore = Number(
+            (
+              urgencyBase +
+              confidenceScore * 0.35 +
+              Math.log10(amountPerEvent + 1) * 4
+            ).toFixed(1)
+          );
 
           noise.push({
             ...baseRow,
             type: "event",
+            forecast_logic: "shopping-plan",
+            confidence_score: confidenceScore,
+            priority_score: priorityScore,
             expected_count: expectedCount,
             expected_quantity: isDiscrete
               ? Number(expectedQuantity.toFixed(0))
               : Number(expectedQuantity.toFixed(2)),
+            recommended_quantity: isDiscrete
+              ? Number(expectedQuantity.toFixed(0))
+              : Number(expectedQuantity.toFixed(2)),
+            quantity_per_purchase: isDiscrete
+              ? Number(typicalQty.toFixed(0))
+              : Number(typicalQty.toFixed(2)),
+            estimated_unit_price: Number(estimatedUnitPrice.toFixed(2)),
+            estimated_purchase_total: Number(amountPerEvent.toFixed(2)),
             projection: Number(finalProjection.toFixed(2)),
           });
         }
       }
     }
 
+    const shoppingStatusRank = {
+      overdue: 0,
+      today: 1,
+      due_soon: 2,
+      scheduled: 3,
+    };
+
     const combined = [...recurring, ...noise]
-      .sort((a, b) => (b.projection || 0) - (a.projection || 0))
+      .sort((a, b) => {
+        const rankA = shoppingStatusRank[a.shopping_status] ?? 99;
+        const rankB = shoppingStatusRank[b.shopping_status] ?? 99;
+        if (rankA !== rankB) return rankA - rankB;
+
+        const daysA = a.days_until_due ?? 9999;
+        const daysB = b.days_until_due ?? 9999;
+        if (daysA !== daysB) return daysA - daysB;
+
+        if ((b.confidence_score || 0) !== (a.confidence_score || 0)) {
+          return (b.confidence_score || 0) - (a.confidence_score || 0);
+        }
+
+        if ((b.projection || 0) !== (a.projection || 0)) {
+          return (b.projection || 0) - (a.projection || 0);
+        }
+
+        return String(a.item_name || "").localeCompare(String(b.item_name || ""));
+      })
       .slice(0, limit);
 
     const total_projected = combined.reduce((s, r) => s + (r.projection || 0), 0);
@@ -6610,20 +6762,31 @@ router.get("/item-expense-forecast", authenticateUser, async (req, res) => {
         months,
         min_occurrences: minOccurrences,
         include_noise: includeNoise,
+        include_stale: includeStale,
+        due_soon_days: dueSoonDays,
         min_interval_days: minIntervalDays,
         max_interval_days: maxIntervalDays,
         max_coef_variation: maxCoefVariation,
+        forecast_logic: "shopping-plan",
+        total_items_analyzed: Object.keys(eventsByItem).length,
+        total_candidates: recurring.length + noise.length,
         expiry_rule: {
-          hard_drop_days: HARD_DROP_DAYS,
-          expiry_days: "max(3*median_interval_days, 45)",
-          soft_expired_behavior: "degrade_to_event (penalized)",
-          hard_expired_behavior: "excluded",
+          hard_drop_days: `min(${HARD_DROP_DAYS}, 2*expiry_days)`,
+          expiry_days: "max(4*median_interval_days, 180)",
+          soft_expired_behavior: "kept_due_but_lower_confidence",
+          hard_expired_behavior: "excluded unless include_stale=true",
         },
       },
       summary: {
         total_projected: Number(total_projected.toFixed(2)),
         total_expense: Number(total_projected.toFixed(2)),
         quantity_expected: Number(quantity_expected.toFixed(2)),
+        items_suggested: combined.length,
+        due_now: combined.filter((r) =>
+          ["overdue", "today"].includes(r.shopping_status)
+        ).length,
+        due_soon: combined.filter((r) => r.shopping_status === "due_soon").length,
+        recurring_items: combined.filter((r) => r.type === "recurring").length,
       },
       data: combined,
     });
