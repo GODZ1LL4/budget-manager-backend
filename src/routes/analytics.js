@@ -4856,11 +4856,39 @@ router.get("/category-month-heatmap", authenticateUser, async (req, res) => {
   }
 });
 
-async function buildRecurringTransactionPatterns(userId, txType, monthsBack) {
+async function buildRecurringTransactionPatterns(
+  userId,
+  txType,
+  monthsBack,
+  options = {}
+) {
+  const months = Math.max(
+    1,
+    Math.min(36, parseInt(monthsBack ?? "6", 10) || 6)
+  );
+  const minOccurrences = Math.max(
+    2,
+    parseInt(options.minOccurrences ?? "3", 10) || 3
+  );
+  const minIntervalDays = Math.max(
+    1,
+    parseInt(options.minIntervalDays ?? "3", 10) || 3
+  );
+  const maxIntervalDays = Math.max(
+    minIntervalDays,
+    parseInt(options.maxIntervalDays ?? "70", 10) || 70
+  );
+  const maxCoefVariation = Number.isFinite(Number(options.maxCoefVariation))
+    ? Number(options.maxCoefVariation)
+    : 0.6;
+  const similarityThreshold = Number.isFinite(Number(options.similarityThreshold))
+    ? Number(options.similarityThreshold)
+    : 0.45;
+
   const now = new Date();
   const fromDateObj = new Date(
     now.getFullYear(),
-    now.getMonth() - (monthsBack - 1),
+    now.getMonth() - (months - 1),
     1
   );
   const fromDate = fromDateObj.toISOString().split("T")[0];
@@ -4886,92 +4914,105 @@ async function buildRecurringTransactionPatterns(userId, txType, monthsBack) {
     throw error;
   }
 
-  const txs = data || [];
-
-  const normDesc = (s) =>
-    (s || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 80);
-
-  const daysBetween = (d1, d2) => {
-    const t1 = new Date(d1).getTime();
-    const t2 = new Date(d2).getTime();
-    return Math.abs((t2 - t1) / (1000 * 60 * 60 * 24));
-  };
-
-  const medianLocal = (arr) => {
-    if (!arr.length) return 0;
-    const sorted = [...arr].sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length - 1) / 2;
-    if (sorted.length % 2 === 1) {
-      return sorted[Math.floor(mid)];
-    }
-    const m1 = sorted[Math.floor(mid)];
-    const m2 = sorted[Math.floor(mid) + 1];
-    return (m1 + m2) / 2;
-  };
-
-  const stdDevLocal = (arr, meanValue) => {
-    if (!arr.length) return 0;
-    const avg = meanValue ?? arr.reduce((s, v) => s + v, 0) / arr.length;
-    const variance =
-      arr.reduce((s, v) => s + Math.pow(v - avg, 2), 0) / arr.length;
-    return Math.sqrt(variance);
-  };
-
-  const groups = {};
-  txs.forEach((tx) => {
-    const catId = tx.category_id || "sin_categoria";
-    const catName = tx.categories?.name || "Sin categoria";
-    const descKey = normDesc(tx.description) || "sin_descripcion";
-    const key = `${catId}__${descKey}`;
-
-    if (!groups[key]) {
-      groups[key] = {
-        category_id: catId,
-        category_name: catName,
-        description_key: descKey,
-        transactions: [],
-      };
-    }
-
-    groups[key].transactions.push({
+  const txs = (data || [])
+    .map((tx) => ({
+      id: tx.id,
       date: tx.date,
       amount: Number(tx.amount) || 0,
-    });
-  });
+      category_id: tx.category_id || "sin_categoria",
+      category_name: tx.categories?.name || "Sin categoria",
+      description: tx.description || "",
+      norm: normalizeText(tx.description) || "sin descripcion",
+    }))
+    .filter((tx) => tx.amount > 0 && !!tx.date);
+
+  const byCategory = {};
+  for (const tx of txs) {
+    const catKey = String(tx.category_id || "sin_categoria");
+    if (!byCategory[catKey]) byCategory[catKey] = [];
+    byCategory[catKey].push(tx);
+  }
+
+  const clusters = [];
+
+  for (const catKey of Object.keys(byCategory)) {
+    const catClusters = [];
+
+    for (const tx of byCategory[catKey]) {
+      const grams = trigrams(tx.norm);
+      let bestIdx = -1;
+      let bestScore = 0;
+
+      for (let i = 0; i < catClusters.length; i++) {
+        const score = jaccard(grams, catClusters[i].rep_grams);
+        if (score > bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+      }
+
+      if (bestIdx >= 0 && bestScore >= similarityThreshold) {
+        catClusters[bestIdx].transactions.push(tx);
+        if (tx.norm.length > catClusters[bestIdx].description_key.length) {
+          catClusters[bestIdx].description_key = tx.norm;
+          catClusters[bestIdx].rep_grams = grams;
+        }
+      } else {
+        catClusters.push({
+          category_id: tx.category_id,
+          category_name: tx.category_name,
+          description_key: tx.norm,
+          rep_grams: grams,
+          transactions: [tx],
+        });
+      }
+    }
+
+    clusters.push(...catClusters);
+  }
 
   const patterns = [];
 
-  Object.values(groups).forEach((g) => {
-    const txList = g.transactions;
-    if (txList.length < 3) return;
+  const frequencyLabel = (medianInterval) => {
+    if (medianInterval >= 3 && medianInterval <= 10) return "semanal";
+    if (medianInterval > 10 && medianInterval <= 20) return "quincenal";
+    if (medianInterval > 20 && medianInterval <= 40) return "mensual";
+    if (medianInterval > 40 && medianInterval <= 70) return "bimestral";
+    return "irregular";
+  };
 
-    txList.sort((a, b) => a.date.localeCompare(b.date));
+  clusters.forEach((g) => {
+    if (g.transactions.length < minOccurrences) return;
+
+    const byDate = new Map();
+    for (const tx of g.transactions) {
+      const current = byDate.get(tx.date) || { date: tx.date, amount: 0 };
+      current.amount += tx.amount;
+      byDate.set(tx.date, current);
+    }
+
+    const txList = Array.from(byDate.values()).sort((a, b) =>
+      a.date.localeCompare(b.date)
+    );
+    if (txList.length < minOccurrences) return;
 
     const intervals = [];
     for (let i = 1; i < txList.length; i++) {
-      intervals.push(daysBetween(txList[i - 1].date, txList[i].date));
+      const days = diffInDays(txList[i - 1].date, txList[i].date);
+      if (days > 0) intervals.push(days);
     }
 
-    if (intervals.length < 2) return;
+    if (intervals.length < minOccurrences - 1) return;
 
-    const medianInterval = medianLocal(intervals);
-    const meanInterval = intervals.reduce((s, v) => s + v, 0) / intervals.length;
-    const sd = stdDevLocal(intervals, meanInterval);
+    const medianInterval = median(intervals);
+    const meanInterval = mean(intervals);
+    const sd = stdDev(intervals);
     const coefVar = meanInterval > 0 ? sd / meanInterval : 1;
 
-    if (medianInterval < 3 || medianInterval > 60) return;
-    if (coefVar > 0.5) return;
-
-    let frequency = "irregular";
-    if (medianInterval >= 3 && medianInterval <= 10) {
-      frequency = "semanal";
-    } else if (medianInterval > 10 && medianInterval <= 20) {
-      frequency = "quincenal";
-    } else if (medianInterval > 20 && medianInterval <= 40) {
-      frequency = "mensual";
-    } else if (medianInterval > 40 && medianInterval <= 60) {
-      frequency = "bimestral";
+    if (medianInterval < minIntervalDays || medianInterval > maxIntervalDays) {
+      return;
     }
+    if (coefVar > maxCoefVariation) return;
 
     const totalAmount = txList.reduce((s, t) => s + t.amount, 0);
     const avgAmount = totalAmount / txList.length;
@@ -4985,7 +5026,7 @@ async function buildRecurringTransactionPatterns(userId, txType, monthsBack) {
       mean_interval_days: Number(meanInterval.toFixed(2)),
       std_dev_interval_days: Number(sd.toFixed(2)),
       coef_variation: Number(coefVar.toFixed(2)),
-      frequency_label: frequency,
+      frequency_label: frequencyLabel(medianInterval),
       avg_amount: Number(avgAmount.toFixed(2)),
       first_date: txList[0].date,
       last_date: txList[txList.length - 1].date,
@@ -5011,160 +5052,20 @@ router.get(
 
     try {
       const monthsBack = parseInt(req.query.months, 10) || 6;
-      const now = new Date();
-      const fromDateObj = new Date(
-        now.getFullYear(),
-        now.getMonth() - (monthsBack - 1),
-        1
+      const detectedPatterns = await buildRecurringTransactionPatterns(
+        user_id,
+        "expense",
+        monthsBack,
+        {
+          minOccurrences: req.query.min_occurrences,
+          minIntervalDays: req.query.min_interval_days,
+          maxIntervalDays: req.query.max_interval_days,
+          maxCoefVariation: req.query.max_coef_variation,
+          similarityThreshold: req.query.similarity_threshold,
+        }
       );
-      const fromDate = fromDateObj.toISOString().split("T")[0];
 
-      const { data, error } = await supabase
-        .from("transactions")
-        .select(
-          `
-          id,
-          amount,
-          date,
-          category_id,
-          description,
-          categories ( name )
-        `
-        )
-        .eq("user_id", user_id)
-        .eq("type", "expense")
-        .gte("date", fromDate);
-
-      if (error) {
-        console.error("🔥 Error en recurring-expense-patterns:", error);
-        return res.status(500).json({ error: error.message });
-      }
-
-      const txs = data || [];
-
-      // Helpers
-      const normDesc = (s) =>
-        (s || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 80); // limitar un poco
-
-      const daysBetween = (d1, d2) => {
-        const t1 = new Date(d1).getTime();
-        const t2 = new Date(d2).getTime();
-        return Math.abs((t2 - t1) / (1000 * 60 * 60 * 24));
-      };
-
-      const median = (arr) => {
-        if (!arr.length) return 0;
-        const sorted = [...arr].sort((a, b) => a - b);
-        const mid = Math.floor(sorted.length - 1) / 2;
-        if (sorted.length % 2 === 1) {
-          return sorted[Math.floor(mid)];
-        } else {
-          const m1 = sorted[Math.floor(mid)];
-          const m2 = sorted[Math.floor(mid) + 1];
-          return (m1 + m2) / 2;
-        }
-      };
-
-      const stdDev = (arr, mean) => {
-        if (!arr.length) return 0;
-        const m = mean ?? arr.reduce((s, v) => s + v, 0) / arr.length;
-        const variance =
-          arr.reduce((s, v) => s + Math.pow(v - m, 2), 0) / arr.length;
-        return Math.sqrt(variance);
-      };
-
-      // 1) Agrupamos por categoría + descripción normalizada
-      const groups = {};
-      txs.forEach((tx) => {
-        const catId = tx.category_id || "sin_categoria";
-        const catName = tx.categories?.name || "Sin categoría";
-        const descKey = normDesc(tx.description) || "sin_descripcion";
-
-        const key = `${catId}__${descKey}`;
-
-        if (!groups[key]) {
-          groups[key] = {
-            category_id: catId,
-            category_name: catName,
-            description_key: descKey,
-            transactions: [],
-          };
-        }
-        groups[key].transactions.push({
-          date: tx.date,
-          amount: Number(tx.amount) || 0,
-        });
-      });
-
-      const patterns = [];
-
-      Object.values(groups).forEach((g) => {
-        const txList = g.transactions;
-        if (txList.length < 3) return; // mínimo 3 ocurrencias
-
-        // Orden por fecha ascendente
-        txList.sort((a, b) => a.date.localeCompare(b.date));
-
-        const intervals = [];
-        for (let i = 1; i < txList.length; i++) {
-          const d = daysBetween(txList[i - 1].date, txList[i].date);
-          intervals.push(d);
-        }
-
-        if (intervals.length < 2) return;
-
-        const medianInterval = median(intervals);
-        const meanInterval =
-          intervals.reduce((s, v) => s + v, 0) / intervals.length;
-        const sd = stdDev(intervals, meanInterval);
-        const coefVar = meanInterval > 0 ? sd / meanInterval : 1;
-
-        // Regla simple para "recurrente"
-        // - intervalo mediano entre 3 y 60 días
-        // - coeficiente de variación relativamente bajo
-        if (medianInterval < 3 || medianInterval > 60) return;
-        if (coefVar > 0.5) return;
-
-        // Etiqueta de frecuencia aproximada
-        let frequency = "irregular";
-        if (medianInterval >= 3 && medianInterval <= 10) {
-          frequency = "semanal";
-        } else if (medianInterval > 10 && medianInterval <= 20) {
-          frequency = "quincenal";
-        } else if (medianInterval > 20 && medianInterval <= 40) {
-          frequency = "mensual";
-        } else if (medianInterval > 40 && medianInterval <= 60) {
-          frequency = "bimestral";
-        }
-
-        const totalAmount = txList.reduce((s, t) => s + t.amount, 0);
-        const avgAmount = totalAmount / txList.length;
-
-        patterns.push({
-          category_id: g.category_id,
-          category_name: g.category_name,
-          description_key: g.description_key,
-          occurrences: txList.length,
-          median_interval_days: Number(medianInterval.toFixed(2)),
-          mean_interval_days: Number(meanInterval.toFixed(2)),
-          std_dev_interval_days: Number(sd.toFixed(2)),
-          coef_variation: Number(coefVar.toFixed(2)),
-          frequency_label: frequency,
-          avg_amount: Number(avgAmount.toFixed(2)),
-          first_date: txList[0].date,
-          last_date: txList[txList.length - 1].date,
-        });
-      });
-
-      // Ordenar: más frecuentes y más recientes primero
-      patterns.sort((a, b) => {
-        if (b.occurrences !== a.occurrences) {
-          return b.occurrences - a.occurrences;
-        }
-        return b.last_date.localeCompare(a.last_date);
-      });
-
-      return res.json({ success: true, data: patterns });
+      return res.json({ success: true, data: detectedPatterns });
     } catch (err) {
       console.error("🔥 Error inesperado en recurring-expense-patterns:", err);
       return res
@@ -5186,7 +5087,14 @@ router.get(
       const patterns = await buildRecurringTransactionPatterns(
         user_id,
         "income",
-        monthsBack
+        monthsBack,
+        {
+          minOccurrences: req.query.min_occurrences,
+          minIntervalDays: req.query.min_interval_days,
+          maxIntervalDays: req.query.max_interval_days,
+          maxCoefVariation: req.query.max_coef_variation,
+          similarityThreshold: req.query.similarity_threshold,
+        }
       );
 
       return res.json({ success: true, data: patterns });
