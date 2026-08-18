@@ -54,6 +54,165 @@ const sumNumeric = (rows, pickValue) =>
 const getRequestCurrentMonthRange = (req) =>
   getCurrentMonthRange(new Date(), getRequestTimeZone(req));
 
+const UNUSUAL_EXPENSE_RULES = Object.freeze({
+  zThreshold: 2,
+  minAbsoluteDelta: 25,
+  minRelativeDelta: 0.05,
+  minHistoryCount: 5,
+});
+
+const getTransactionCategoryName = (tx, fallback = "Sin categoria") => {
+  const category = tx?.categories;
+  const name = Array.isArray(category) ? category[0]?.name : category?.name;
+  return name || fallback;
+};
+
+const getUnusualExpenseDetectionMeta = (rules = UNUSUAL_EXPENSE_RULES) => ({
+  z_threshold: rules.zThreshold,
+  min_absolute_delta: rules.minAbsoluteDelta,
+  min_relative_delta_pct: rules.minRelativeDelta * 100,
+  min_history_count: rules.minHistoryCount,
+});
+
+function detectUnusualExpenses(historyRows, currentRows, options = {}) {
+  const rules = {
+    ...UNUSUAL_EXPENSE_RULES,
+    ...(options.rules || {}),
+  };
+  const statsByCat = {};
+
+  (historyRows || []).forEach((tx) => {
+    const catId = tx.category_id;
+    if (!catId) return;
+
+    const amount = Number(tx.amount) || 0;
+    if (amount <= 0) return;
+
+    if (!statsByCat[catId]) {
+      statsByCat[catId] = {
+        category_id: catId,
+        category_name: getTransactionCategoryName(tx, `Categoria ${catId}`),
+        count: 0,
+        sum: 0,
+        sumSq: 0,
+      };
+    }
+
+    const stats = statsByCat[catId];
+    stats.count += 1;
+    stats.sum += amount;
+    stats.sumSq += amount * amount;
+  });
+
+  Object.values(statsByCat).forEach((stats) => {
+    stats.mean = stats.count > 0 ? stats.sum / stats.count : 0;
+    const variance =
+      stats.count > 0 ? stats.sumSq / stats.count - stats.mean * stats.mean : 0;
+    stats.std_dev = Math.sqrt(Math.max(variance, 0));
+  });
+
+  const unusual = [];
+  const emptyDescription = options.emptyDescription ?? "";
+
+  (currentRows || []).forEach((tx) => {
+    const catId = tx.category_id;
+    const stats = statsByCat[catId];
+    if (!stats) return;
+    if (
+      !stats.std_dev ||
+      stats.std_dev <= 0 ||
+      stats.count < rules.minHistoryCount
+    ) {
+      return;
+    }
+
+    const amount = Number(tx.amount) || 0;
+    const delta = amount - stats.mean;
+    const minPracticalDelta = Math.max(
+      rules.minAbsoluteDelta,
+      Math.abs(stats.mean) * rules.minRelativeDelta
+    );
+    const z = delta / stats.std_dev;
+
+    if (z < rules.zThreshold || delta < minPracticalDelta) return;
+
+    const categoryName = getTransactionCategoryName(tx, stats.category_name);
+    const deltaPct =
+      stats.mean > 0 ? Number(((delta / stats.mean) * 100).toFixed(2)) : null;
+
+    unusual.push({
+      id: tx.id,
+      date: tx.date,
+      amount: toRoundedNumber(amount),
+      category: categoryName,
+      category_id: catId,
+      category_name: categoryName,
+      description: tx.description || emptyDescription,
+      z_score: Number(z.toFixed(2)),
+      mean: toRoundedNumber(stats.mean),
+      std_dev: toRoundedNumber(stats.std_dev),
+      delta: toRoundedNumber(delta),
+      delta_pct: deltaPct,
+      min_delta: toRoundedNumber(minPracticalDelta),
+      baseline: toRoundedNumber(stats.mean),
+      above_baseline: toRoundedNumber(delta),
+      above_baseline_pct: deltaPct,
+    });
+  });
+
+  const sortBy = options.sortBy || "z_score";
+  unusual.sort((a, b) => {
+    if (sortBy === "delta") {
+      return b.delta - a.delta || b.z_score - a.z_score;
+    }
+    return b.z_score - a.z_score || b.delta - a.delta;
+  });
+
+  const limit = Number(options.limit);
+  return Number.isFinite(limit) && limit > 0 ? unusual.slice(0, limit) : unusual;
+}
+
+async function fetchExpenseTransactionsForUnusual(userId, filters = {}) {
+  const pageSize = 1000;
+  const rows = [];
+  let from = 0;
+
+  while (true) {
+    let query = supabase
+      .from("transactions")
+      .select(
+        `
+        id,
+        amount,
+        date,
+        description,
+        category_id,
+        categories:categories!transactions_category_id_fkey (
+          name
+        )
+      `
+      )
+      .eq("user_id", userId)
+      .eq("type", "expense");
+
+    if (filters.beforeDate) query = query.lt("date", filters.beforeDate);
+    if (filters.fromDate) query = query.gte("date", filters.fromDate);
+    if (filters.toDate) query = query.lte("date", filters.toDate);
+
+    const { data, error } = await query
+      .order("date", { ascending: true })
+      .range(from, from + pageSize - 1);
+
+    if (error) return { data: rows, error };
+
+    rows.push(...(data || []));
+    if (!data || data.length < pageSize) break;
+    from += pageSize;
+  }
+
+  return { data: rows, error: null };
+}
+
 /* ========= ITEM PRICES ========= */
 
 router.get("/item-prices-trend", authenticateUser, async (req, res) => {
@@ -4653,137 +4812,37 @@ router.get("/unusual-expenses", authenticateUser, async (req, res) => {
   const currentStart = `${monthKey}-01`;
 
   try {
-    const pageSize = 1000;
-    const history = [];
-    const current = [];
+    const historyResult = await fetchExpenseTransactionsForUnusual(user_id, {
+      beforeDate: currentStart,
+    });
 
-    // 1) Histórico antes del mes actual
-    let historyFrom = 0;
-    while (true) {
-      const { data, error: histErr } = await supabase
-        .from("transactions")
-        .select("id, amount, category_id, categories(name)")
-        .eq("user_id", user_id)
-        .eq("type", "expense")
-        .lt("date", currentStart)
-        .order("date", { ascending: true })
-        .range(historyFrom, historyFrom + pageSize - 1);
-
-      if (histErr) {
-        console.error(histErr);
-        return res.status(500).json({ error: histErr.message });
-      }
-
-      history.push(...(data || []));
-
-      if (!data || data.length < pageSize) break;
-      historyFrom += pageSize;
+    if (historyResult.error) {
+      console.error(historyResult.error);
+      return res.status(500).json({ error: historyResult.error.message });
     }
 
-    const statsByCat = {};
-    (history || []).forEach((tx) => {
-      const catId = tx.category_id;
-      if (!catId) return;
-      const amt = parseFloat(tx.amount) || 0;
-
-      if (!statsByCat[catId]) {
-        statsByCat[catId] = {
-          category_id: catId,
-          category_name: tx.categories?.name || `Categoría ${catId}`,
-          count: 0,
-          sum: 0,
-          sumSq: 0,
-        };
-      }
-
-      const s = statsByCat[catId];
-      s.count += 1;
-      s.sum += amt;
-      s.sumSq += amt * amt;
-    });
-
-    Object.values(statsByCat).forEach((s) => {
-      if (s.count > 0) {
-        s.mean = s.sum / s.count;
-        const variance = s.sumSq / s.count - s.mean * s.mean;
-        s.std_dev = Math.sqrt(Math.max(variance, 0));
-      } else {
-        s.mean = 0;
-        s.std_dev = 0;
-      }
-    });
-
-    // 2) Transacciones del mes actual
     const today = now.toISOString().split("T")[0];
-    let currentFrom = 0;
-    while (true) {
-      const { data, error: currErr } = await supabase
-        .from("transactions")
-        .select("id, amount, date, description, category_id, categories(name)")
-        .eq("user_id", user_id)
-        .eq("type", "expense")
-        .gte("date", currentStart)
-        .lte("date", today)
-        .order("date", { ascending: true })
-        .range(currentFrom, currentFrom + pageSize - 1);
-
-      if (currErr) {
-        console.error(currErr);
-        return res.status(500).json({ error: currErr.message });
-      }
-
-      current.push(...(data || []));
-
-      if (!data || data.length < pageSize) break;
-      currentFrom += pageSize;
-    }
-
-    const unusual = [];
-    const zThreshold = 2; // >= 2 desviaciones estándar
-    const minAbsoluteDelta = 25;
-    const minRelativeDelta = 0.05;
-
-    current.forEach((tx) => {
-      const catId = tx.category_id;
-      const stats = statsByCat[catId];
-      if (!stats) return;
-      if (!stats.std_dev || stats.std_dev <= 0 || stats.count < 5) return;
-
-      const amt = parseFloat(tx.amount) || 0;
-      const delta = amt - stats.mean;
-      const minPracticalDelta = Math.max(
-        minAbsoluteDelta,
-        Math.abs(stats.mean) * minRelativeDelta
-      );
-      const z = delta / stats.std_dev;
-      if (z >= zThreshold && delta >= minPracticalDelta) {
-        unusual.push({
-          id: tx.id,
-          date: tx.date,
-          amount: amt,
-          category: tx.categories?.name || stats.category_name,
-          description: tx.description || "",
-          z_score: Number(z.toFixed(2)),
-          mean: Number(stats.mean.toFixed(2)),
-          std_dev: Number(stats.std_dev.toFixed(2)),
-          delta: Number(delta.toFixed(2)),
-          delta_pct:
-            stats.mean > 0 ? Number(((delta / stats.mean) * 100).toFixed(2)) : null,
-          min_delta: Number(minPracticalDelta.toFixed(2)),
-        });
-      }
+    const currentResult = await fetchExpenseTransactionsForUnusual(user_id, {
+      fromDate: currentStart,
+      toDate: today,
     });
 
-    unusual.sort((a, b) => b.z_score - a.z_score);
+    if (currentResult.error) {
+      console.error(currentResult.error);
+      return res.status(500).json({ error: currentResult.error.message });
+    }
+
+    const unusual = detectUnusualExpenses(
+      historyResult.data || [],
+      currentResult.data || []
+    );
 
     return res.json({
       success: true,
       data: unusual,
       meta: {
         month: monthKey,
-        z_threshold: zThreshold,
-        min_absolute_delta: minAbsoluteDelta,
-        min_relative_delta_pct: minRelativeDelta * 100,
+        ...getUnusualExpenseDetectionMeta(),
       },
     });
   } catch (err) {
@@ -7801,7 +7860,7 @@ router.get("/mobile-monthly-report", authenticateUser, async (req, res) => {
       previousComparableDay
     ).padStart(2, "0")}`;
 
-    const historyStart = `${addMonthsToMonthKey(monthKey, -6)}-01`;
+    const historyStart = null;
     const historyEnd = previousMonthRange.end;
 
     const [
@@ -7840,26 +7899,9 @@ router.get("/mobile-monthly-report", authenticateUser, async (req, res) => {
         .eq("type", "expense")
         .gte("date", previousMonthStart)
         .lte("date", previousComparableEnd),
-      supabase
-        .from("transactions")
-        .select(
-          `
-          id,
-          amount,
-          type,
-          date,
-          description,
-          category_id,
-          categories:categories!transactions_category_id_fkey (
-            name,
-            stability_type
-          )
-        `
-        )
-        .eq("user_id", user_id)
-        .eq("type", "expense")
-        .gte("date", historyStart)
-        .lte("date", historyEnd),
+      fetchExpenseTransactionsForUnusual(user_id, {
+        beforeDate: monthStart,
+      }),
       supabase
         .from("budgets")
         .select("id, month, category_id, limit_amount, categories(name, type)")
@@ -8027,50 +8069,15 @@ router.get("/mobile-monthly-report", authenticateUser, async (req, res) => {
     const remainingDailyAllowance =
       Math.max(remainingAgainstBudget, 0) / Math.max(remainingDays, 1);
 
-    const historyByCategory = {};
-    (historyTxResult.data || []).forEach((tx) => {
-      const key = tx.category_id || "sin_categoria";
-      const amount = Number(tx.amount) || 0;
-      if (amount <= 0) return;
-      if (!historyByCategory[key]) historyByCategory[key] = [];
-      historyByCategory[key].push(amount);
-    });
-
-    const unusualExpenses = currentExpenses
-      .map((tx) => {
-        const key = tx.category_id || "sin_categoria";
-        const values = historyByCategory[key] || [];
-        if (values.length < 4) return null;
-
-        const baselineMedian = median(values);
-        const baselineMean = mean(values);
-        const baselineStd = stdDev(values);
-        const threshold = Math.max(
-          baselineMedian * 1.8,
-          baselineMean + baselineStd * 1.35
-        );
-        const amount = Number(tx.amount) || 0;
-
-        if (!Number.isFinite(threshold) || threshold <= 0) return null;
-        if (amount <= threshold) return null;
-
-        return {
-          id: tx.id,
-          date: tx.date,
-          description: tx.description || "Sin descripcion",
-          category_id: tx.category_id || null,
-          category_name: tx.categories?.name || "Sin categoria",
-          amount: toRoundedNumber(amount),
-          baseline: toRoundedNumber(threshold),
-          above_baseline: toRoundedNumber(amount - threshold),
-          above_baseline_pct: toRoundedNumber(
-            ((amount - threshold) / threshold) * 100
-          ),
-        };
-      })
-      .filter(Boolean)
-      .sort((a, b) => b.above_baseline - a.above_baseline)
-      .slice(0, 6);
+    const unusualExpenses = detectUnusualExpenses(
+      historyTxResult.data || [],
+      currentExpenses,
+      {
+        emptyDescription: "Sin descripcion",
+        limit: 6,
+        sortBy: "delta",
+      }
+    );
 
     const dailyMap = {};
     for (let day = 1; day <= daysInMonth; day++) {
@@ -8257,6 +8264,7 @@ router.get("/mobile-monthly-report", authenticateUser, async (req, res) => {
             start: historyStart,
             end: historyEnd,
           },
+          unusual_expense_detection: getUnusualExpenseDetectionMeta(),
         },
       },
     });

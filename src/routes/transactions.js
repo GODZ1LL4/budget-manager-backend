@@ -1301,45 +1301,7 @@ router.post("/shopping-list", authenticateUser, async (req, res) => {
 
     const totalAfterDiscount = round2(totalBeforeDiscount * discountFactor);
 
-    // 1) Insertar precios nuevos (si aplica)
-    if (pricesToInsert.length > 0) {
-      const { error: insertErr } = await supabase
-        .from("item_prices")
-        .insert(
-          pricesToInsert.map((p) => ({
-            item_id: p.item_id,
-            price: round2(p.price),
-            date: p.date,
-          }))
-        );
-
-      if (insertErr) {
-        console.error("❌ Error insertando item_prices:", insertErr);
-        return res.status(500).json({
-          error: "ITEM_PRICES_INSERT_FAILED",
-          message: "No se pudieron insertar nuevos precios del día",
-        });
-      }
-    }
-
-    // 2) Actualizar precios existentes (si aplica)
-    if (pricesToUpdate.length > 0) {
-      const updateResults = await Promise.all(
-        pricesToUpdate.map((p) =>
-          supabase.from("item_prices").update({ price: round2(p.price) }).eq("id", p.id)
-        )
-      );
-      const someError = updateResults.find((r) => r.error);
-      if (someError) {
-        console.error("❌ Error actualizando item_prices:", someError.error);
-        return res.status(500).json({
-          error: "ITEM_PRICES_UPDATE_FAILED",
-          message: "No se pudieron actualizar algunos precios del día",
-        });
-      }
-    }
-
-    // 3) Crear transacción
+    // 1) Crear transaccion
     const { data: tx, error: txErr } = await supabase
       .from("transactions")
       .insert([
@@ -1359,11 +1321,64 @@ router.post("/shopping-list", authenticateUser, async (req, res) => {
       .single();
 
     if (txErr || !tx) {
-      console.error("❌ Error creando transacción:", txErr);
+      console.error("Error creando transaccion:", txErr);
       return res.status(500).json({
         error: "TRANSACTION_CREATE_FAILED",
-        message: "No se pudo crear la transacción de lista de compras",
+        message: "No se pudo crear la transaccion de lista de compras",
       });
+    }
+
+    const transactionDate = tx.date || date;
+    const rollbackCreatedShoppingTransaction = async () => {
+      const { error: rollbackErr } = await supabase
+        .from("transactions")
+        .delete()
+        .eq("id", tx.id)
+        .eq("user_id", user_id);
+
+      if (rollbackErr) {
+        console.error("Error limpiando transaccion de lista:", rollbackErr);
+      }
+    };
+
+    // 2) Insertar precios nuevos (si aplica)
+    if (pricesToInsert.length > 0) {
+      const { error: insertErr } = await supabase
+        .from("item_prices")
+        .insert(
+          pricesToInsert.map((p) => ({
+            item_id: p.item_id,
+            price: round2(p.price),
+            date: transactionDate,
+          }))
+        );
+
+      if (insertErr) {
+        console.error("❌ Error insertando item_prices:", insertErr);
+        await rollbackCreatedShoppingTransaction();
+        return res.status(500).json({
+          error: "ITEM_PRICES_INSERT_FAILED",
+          message: "No se pudieron insertar nuevos precios del día",
+        });
+      }
+    }
+
+    // 3) Actualizar precios existentes (si aplica)
+    if (pricesToUpdate.length > 0) {
+      const updateResults = await Promise.all(
+        pricesToUpdate.map((p) =>
+          supabase.from("item_prices").update({ price: round2(p.price) }).eq("id", p.id)
+        )
+      );
+      const someError = updateResults.find((r) => r.error);
+      if (someError) {
+        console.error("❌ Error actualizando item_prices:", someError.error);
+        await rollbackCreatedShoppingTransaction();
+        return res.status(500).json({
+          error: "ITEM_PRICES_UPDATE_FAILED",
+          message: "No se pudieron actualizar algunos precios del día",
+        });
+      }
     }
 
     // 4) Insertar transaction_items
@@ -1384,6 +1399,7 @@ router.post("/shopping-list", authenticateUser, async (req, res) => {
 
     if (txItemsErr) {
       console.error("❌ Error insertando transaction_items:", txItemsErr);
+      await rollbackCreatedShoppingTransaction();
       return res.status(500).json({
         error: "TRANSACTION_ITEMS_FAILED",
         message: "La transacción se creó, pero falló el detalle de artículos",
