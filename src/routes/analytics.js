@@ -51,6 +51,41 @@ const toRoundedNumber = (value, decimals = 2) => {
 const sumNumeric = (rows, pickValue) =>
   (rows || []).reduce((sum, row) => sum + (Number(pickValue(row)) || 0), 0);
 
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+const normalizeDateKey = (value) => {
+  if (!value) return null;
+  const match = String(value).match(/^(\d{4}-\d{2}-\d{2})/);
+  return match ? match[1] : null;
+};
+
+const dateKeyToUtcDate = (dateKey) => {
+  const normalized = normalizeDateKey(dateKey);
+  if (!normalized) return null;
+
+  const [year, month, day] = normalized.split("-").map(Number);
+  if (!year || !month || !day) return null;
+
+  return new Date(Date.UTC(year, month - 1, day));
+};
+
+const daysBetweenDateKeys = (fromDateKey, toDateKey) => {
+  const from = dateKeyToUtcDate(fromDateKey);
+  const to = dateKeyToUtcDate(toDateKey);
+
+  if (!from || !to) return null;
+
+  return Math.floor((to.getTime() - from.getTime()) / MS_PER_DAY);
+};
+
+const addDaysToDateKey = (dateKey, days) => {
+  const date = dateKeyToUtcDate(dateKey);
+  if (!date) return null;
+
+  date.setUTCDate(date.getUTCDate() + Number(days || 0));
+  return date.toISOString().slice(0, 10);
+};
+
 const getRequestCurrentMonthRange = (req) =>
   getCurrentMonthRange(new Date(), getRequestTimeZone(req));
 
@@ -1229,6 +1264,348 @@ router.get("/goals-progress", authenticateUser, async (req, res) => {
 });
 
 /* ========= PROYECCIONES POR CATEGORÍA (INGRESO / GASTO) ========= */
+
+router.get("/goals-savings-projection", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
+  const today = getCurrentMonthRange(
+    new Date(),
+    getRequestTimeZone(req)
+  ).today;
+
+  const rawRecentDays = Number(req.query.recent_days);
+  const recentWindowDays =
+    Number.isFinite(rawRecentDays) &&
+    rawRecentDays >= 14 &&
+    rawRecentDays <= 365
+      ? Math.round(rawRecentDays)
+      : 90;
+
+  try {
+    const { data: goals, error: goalsErr } = await supabase
+      .from("goals")
+      .select(
+        "id, name, target_amount, due_date, created_at, account_id, status, is_priority"
+      )
+      .eq("user_id", user_id)
+      .in("status", ["active", "paused"]);
+
+    if (goalsErr) return res.status(500).json({ error: goalsErr.message });
+
+    const goalIds = (goals || []).map((goal) => goal.id).filter(Boolean);
+
+    if (!goalIds.length) {
+      return res.json({
+        success: true,
+        data: {
+          summary: {
+            goals_count: 0,
+            target_total: 0,
+            reserved_total: 0,
+            remaining_total: 0,
+            progress_pct: 0,
+            projected_daily_rate_total: 0,
+            projected_monthly_rate_total: 0,
+            goals_with_deadline: 0,
+            on_track_deadline: 0,
+            at_risk_deadline: 0,
+            no_pace_count: 0,
+            nearest_deadline: null,
+            soonest_completion: null,
+          },
+          goals: [],
+          meta: {
+            today,
+            recent_window_days: recentWindowDays,
+          },
+        },
+      });
+    }
+
+    const { data: movements, error: movementsErr } = await supabase
+      .from("goal_movements")
+      .select("goal_id, type, amount, movement_date, created_at")
+      .eq("user_id", user_id)
+      .in("goal_id", goalIds);
+
+    if (movementsErr) {
+      return res.status(500).json({ error: movementsErr.message });
+    }
+
+    const movementsByGoal = {};
+    (movements || []).forEach((movement) => {
+      const goalId = movement.goal_id;
+      if (!goalId) return;
+      if (!movementsByGoal[goalId]) movementsByGoal[goalId] = [];
+
+      movementsByGoal[goalId].push({
+        ...movement,
+        date_key:
+          normalizeDateKey(movement.movement_date) ||
+          normalizeDateKey(movement.created_at),
+      });
+    });
+
+    const goalsProjection = (goals || []).map((goal) => {
+      const goalMovements = movementsByGoal[goal.id] || [];
+      const target = Number(goal.target_amount) || 0;
+      const dueDate = normalizeDateKey(goal.due_date);
+      const createdDate = normalizeDateKey(goal.created_at) || today;
+
+      let reserved = 0;
+      let depositsTotal = 0;
+      let withdrawalsTotal = 0;
+      let recentNet = 0;
+      let firstMovementDate = null;
+      let lastMovementDate = null;
+
+      goalMovements.forEach((movement) => {
+        const amount = Math.abs(Number(movement.amount) || 0);
+        const type = String(movement.type || "");
+        const sign =
+          type === "deposit" || type === "adjust"
+            ? 1
+            : type === "withdraw" || type === "auto_withdraw"
+            ? -1
+            : 0;
+
+        if (sign > 0) depositsTotal += amount;
+        if (sign < 0) withdrawalsTotal += amount;
+
+        reserved += sign * amount;
+
+        const movementDate = movement.date_key;
+        if (movementDate) {
+          if (!firstMovementDate || movementDate < firstMovementDate) {
+            firstMovementDate = movementDate;
+          }
+          if (!lastMovementDate || movementDate > lastMovementDate) {
+            lastMovementDate = movementDate;
+          }
+
+          const daysFromMovement = daysBetweenDateKeys(movementDate, today);
+          if (
+            daysFromMovement != null &&
+            daysFromMovement >= 0 &&
+            daysFromMovement < recentWindowDays
+          ) {
+            recentNet += sign * amount;
+          }
+        }
+      });
+
+      reserved = Math.max(0, reserved);
+
+      const remaining = Math.max(target - reserved, 0);
+      const progressPct = target > 0 ? (reserved / target) * 100 : 0;
+      const paceStartDate = firstMovementDate || createdDate;
+      const activeDays = Math.max(
+        daysBetweenDateKeys(paceStartDate, today) ?? 0,
+        1
+      );
+      const recentObservedDays = Math.max(
+        1,
+        Math.min(recentWindowDays, activeDays)
+      );
+      const lifetimeDailyRate = reserved > 0 ? reserved / activeDays : 0;
+      const recentDailyRate = recentNet > 0 ? recentNet / recentObservedDays : 0;
+      const projectedDailyRate =
+        recentDailyRate > 0 ? recentDailyRate : lifetimeDailyRate;
+      const projectedMonthlyRate = projectedDailyRate * 30.4375;
+      const velocitySource =
+        recentDailyRate > 0
+          ? "recent"
+          : lifetimeDailyRate > 0
+          ? "lifetime"
+          : "none";
+
+      const projectedCompletionDays =
+        remaining <= 0
+          ? 0
+          : projectedDailyRate > 0
+          ? Math.ceil(remaining / projectedDailyRate)
+          : null;
+      const projectedCompletionDate =
+        projectedCompletionDays == null
+          ? null
+          : addDaysToDateKey(today, projectedCompletionDays);
+
+      const daysUntilDue = dueDate ? daysBetweenDateKeys(today, dueDate) : null;
+      const requiredDailyRate =
+        dueDate && daysUntilDue != null && daysUntilDue >= 0 && remaining > 0
+          ? remaining / Math.max(daysUntilDue, 1)
+          : remaining <= 0
+          ? 0
+          : null;
+      const requiredMonthlyRate =
+        requiredDailyRate == null ? null : requiredDailyRate * 30.4375;
+      const projectedAtDue =
+        dueDate && daysUntilDue != null
+          ? reserved + projectedDailyRate * Math.max(daysUntilDue, 0)
+          : null;
+      const deadlineGapAmount =
+        projectedAtDue == null ? null : projectedAtDue - target;
+      const deadlineGapDays =
+        dueDate && projectedCompletionDays != null && daysUntilDue != null
+          ? daysUntilDue - projectedCompletionDays
+          : null;
+
+      let canMeetDeadline = null;
+      if (dueDate) {
+        if (remaining <= 0) canMeetDeadline = true;
+        else if (daysUntilDue == null || daysUntilDue < 0) canMeetDeadline = false;
+        else if (projectedCompletionDays == null) canMeetDeadline = false;
+        else canMeetDeadline = projectedCompletionDays <= daysUntilDue;
+      }
+
+      let projectionStatus = "no_deadline";
+      if (remaining <= 0) projectionStatus = "achieved";
+      else if (dueDate && daysUntilDue < 0) projectionStatus = "overdue";
+      else if (projectedDailyRate <= 0) projectionStatus = "no_pace";
+      else if (dueDate && canMeetDeadline) projectionStatus = "on_track";
+      else if (dueDate && canMeetDeadline === false) projectionStatus = "behind";
+      else projectionStatus = "projected";
+
+      const movementCount = goalMovements.length;
+      const confidence =
+        projectedDailyRate <= 0
+          ? "none"
+          : movementCount >= 4 && activeDays >= 30
+          ? "high"
+          : movementCount >= 2 && activeDays >= 14
+          ? "medium"
+          : "low";
+
+      return {
+        id: goal.id,
+        name: goal.name || "Meta",
+        status: goal.status || "active",
+        is_priority: goal.is_priority === true,
+        target_amount: toRoundedNumber(target),
+        reserved_amount: toRoundedNumber(reserved),
+        remaining_amount: toRoundedNumber(remaining),
+        progress_pct: toRoundedNumber(progressPct),
+        due_date: dueDate,
+        days_until_due: daysUntilDue,
+        can_meet_deadline: canMeetDeadline,
+        projection_status: projectionStatus,
+        projected_completion_days: projectedCompletionDays,
+        projected_completion_date: projectedCompletionDate,
+        projected_amount_at_due:
+          projectedAtDue == null ? null : toRoundedNumber(projectedAtDue),
+        deadline_gap_amount:
+          deadlineGapAmount == null ? null : toRoundedNumber(deadlineGapAmount),
+        deadline_gap_days: deadlineGapDays,
+        required_daily_rate:
+          requiredDailyRate == null ? null : toRoundedNumber(requiredDailyRate),
+        required_monthly_rate:
+          requiredMonthlyRate == null
+            ? null
+            : toRoundedNumber(requiredMonthlyRate),
+        projected_daily_rate: toRoundedNumber(projectedDailyRate),
+        projected_monthly_rate: toRoundedNumber(projectedMonthlyRate),
+        recent_daily_rate: toRoundedNumber(recentDailyRate),
+        lifetime_daily_rate: toRoundedNumber(lifetimeDailyRate),
+        velocity_source: velocitySource,
+        active_days: activeDays,
+        movement_count: movementCount,
+        deposits_total: toRoundedNumber(depositsTotal),
+        withdrawals_total: toRoundedNumber(withdrawalsTotal),
+        first_movement_date: firstMovementDate,
+        last_movement_date: lastMovementDate,
+        confidence,
+      };
+    });
+
+    const statusOrder = {
+      overdue: 0,
+      behind: 1,
+      no_pace: 2,
+      on_track: 3,
+      projected: 4,
+      no_deadline: 5,
+      achieved: 6,
+    };
+
+    goalsProjection.sort((a, b) => {
+      if (a.projection_status !== b.projection_status) {
+        return (
+          (statusOrder[a.projection_status] ?? 99) -
+          (statusOrder[b.projection_status] ?? 99)
+        );
+      }
+      if (a.is_priority !== b.is_priority) return a.is_priority ? -1 : 1;
+      if (a.due_date && b.due_date) return a.due_date.localeCompare(b.due_date);
+      if (a.due_date) return -1;
+      if (b.due_date) return 1;
+      return b.remaining_amount - a.remaining_amount;
+    });
+
+    const goalsWithDeadline = goalsProjection.filter((goal) => goal.due_date);
+    const nearestDeadline =
+      goalsWithDeadline
+        .filter((goal) => goal.days_until_due == null || goal.days_until_due >= 0)
+        .sort((a, b) => String(a.due_date).localeCompare(String(b.due_date)))[0]
+        ?.due_date || null;
+    const soonestCompletion =
+      goalsProjection
+        .filter((goal) => goal.projected_completion_date)
+        .sort((a, b) =>
+          String(a.projected_completion_date).localeCompare(
+            String(b.projected_completion_date)
+          )
+        )[0]?.projected_completion_date || null;
+
+    const targetTotal = sumNumeric(goalsProjection, (goal) => goal.target_amount);
+    const reservedTotal = sumNumeric(
+      goalsProjection,
+      (goal) => goal.reserved_amount
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        summary: {
+          goals_count: goalsProjection.length,
+          target_total: toRoundedNumber(targetTotal),
+          reserved_total: toRoundedNumber(reservedTotal),
+          remaining_total: toRoundedNumber(
+            sumNumeric(goalsProjection, (goal) => goal.remaining_amount)
+          ),
+          progress_pct:
+            targetTotal > 0
+              ? toRoundedNumber((reservedTotal / targetTotal) * 100)
+              : 0,
+          projected_daily_rate_total: toRoundedNumber(
+            sumNumeric(goalsProjection, (goal) => goal.projected_daily_rate)
+          ),
+          projected_monthly_rate_total: toRoundedNumber(
+            sumNumeric(goalsProjection, (goal) => goal.projected_monthly_rate)
+          ),
+          goals_with_deadline: goalsWithDeadline.length,
+          on_track_deadline: goalsWithDeadline.filter(
+            (goal) => goal.can_meet_deadline === true
+          ).length,
+          at_risk_deadline: goalsWithDeadline.filter(
+            (goal) => goal.can_meet_deadline === false
+          ).length,
+          no_pace_count: goalsProjection.filter(
+            (goal) => goal.projection_status === "no_pace"
+          ).length,
+          nearest_deadline: nearestDeadline,
+          soonest_completion: soonestCompletion,
+        },
+        goals: goalsProjection,
+        meta: {
+          today,
+          recent_window_days: recentWindowDays,
+        },
+      },
+    });
+  } catch (err) {
+    console.error("Error goals-savings-projection:", err);
+    return res.status(500).json({ error: "Error interno del servidor" });
+  }
+});
 
 router.get(
   "/projected-expense-by-category",
