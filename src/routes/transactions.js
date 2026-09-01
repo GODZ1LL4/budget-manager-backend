@@ -172,14 +172,25 @@ router.get("/", authenticateUser, async (req, res) => {
     // Orden por fecha descendente
     query = query.order("date", { ascending: false });
 
-    const { data, error } = await query;
+    const pageSize = 1000;
+    let from = 0;
+    const allData = [];
 
-    if (error) {
-      console.error("🔥 Error al obtener transacciones:", error);
-      return res.status(500).json({ error: error.message });
+    while (true) {
+      const { data, error } = await query.range(from, from + pageSize - 1);
+
+      if (error) {
+        console.error("🔥 Error al obtener transacciones:", error);
+        return res.status(500).json({ error: error.message });
+      }
+
+      allData.push(...(data || []));
+
+      if (!data || data.length < pageSize) break;
+      from += pageSize;
     }
 
-    res.json({ success: true, data });
+    res.json({ success: true, data: allData });
   } catch (err) {
     console.error("🔥 Error inesperado al obtener transacciones:", err);
     return res.status(500).json({ error: "Error interno del servidor" });
