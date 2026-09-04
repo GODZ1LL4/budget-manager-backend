@@ -2073,7 +2073,20 @@ router.get("/item-trend/:item_id", authenticateUser, async (req, res) => {
 
   const { data, error } = await supabase
     .from("transaction_items")
-    .select("unit_price_net, line_total_final, quantity, transactions(date)")
+    .select(
+      `
+      unit_price_net,
+      line_total_final,
+      quantity,
+      transactions(date),
+      items (
+        taxes (
+          rate,
+          is_exempt
+        )
+      )
+    `
+    )
     .eq("transactions.user_id", user_id)
     .eq("item_id", item_id)
     .gte("transactions.date", start)
@@ -2093,8 +2106,15 @@ router.get("/item-trend/:item_id", authenticateUser, async (req, res) => {
     if (item.line_total_final != null) {
       total = Number(item.line_total_final) || 0;
     } else {
-      // Fallback: tendencia neta sin ITBIS
-      total = Number(item.unit_price_net || 0) * qty;
+      const itemTaxes = Array.isArray(item.items?.taxes)
+        ? item.items.taxes[0]
+        : item.items?.taxes;
+      const isExempt = itemTaxes?.is_exempt === true;
+      const taxRate = isExempt ? 0 : Number(itemTaxes?.rate || 0);
+      const safeTaxRate = Number.isFinite(taxRate) ? taxRate : 0;
+      const priceWithTax =
+        Number(item.unit_price_net || 0) * (1 + safeTaxRate / 100);
+      total = priceWithTax * qty;
     }
 
     if (!monthly[key]) {
@@ -4320,41 +4340,55 @@ router.get(
         });
       }
 
-      // 2) Gastos diarios reales del mes hasta hoy
-      const { data: expenses, error: expenseError } = await supabase
+      // 2) Movimientos reales del mes hasta hoy para calcular gasto e ingreso acumulado.
+      const { data: currentTransactions, error: transactionError } = await supabase
         .from("transactions")
-        .select("amount, date")
+        .select("amount, date, type")
         .eq("user_id", user_id)
-        .eq("type", "expense")
+        .in("type", ["income", "expense"])
         .gte("date", start)
         .lte("date", today);
 
-      if (expenseError) {
-        console.error(expenseError);
-        return res.status(500).json({ error: expenseError.message });
+      if (transactionError) {
+        console.error(transactionError);
+        return res.status(500).json({ error: transactionError.message });
       }
 
-      const dailyMap = {};
+      const dailyExpenseMap = {};
+      const dailyIncomeMap = {};
 
-      (expenses || []).forEach((tx) => {
+      (currentTransactions || []).forEach((tx) => {
         const d = tx.date; // "YYYY-MM-DD"
         const amt = parseFloat(tx.amount) || 0;
-        if (!dailyMap[d]) dailyMap[d] = 0;
-        dailyMap[d] += amt;
+        if (amt <= 0 || !d) return;
+
+        if (tx.type === "income") {
+          if (!dailyIncomeMap[d]) dailyIncomeMap[d] = 0;
+          dailyIncomeMap[d] += amt;
+          return;
+        }
+
+        if (tx.type === "expense") {
+          if (!dailyExpenseMap[d]) dailyExpenseMap[d] = 0;
+          dailyExpenseMap[d] += amt;
+        }
       });
 
       const idealDaily = budgetTotal / daysInMonth;
 
       let cumulativeIdeal = 0;
       let cumulativeActual = 0;
+      let cumulativeIncome = 0;
 
       const series = [];
 
       for (let day = 1; day <= daysInMonth; day++) {
         const dateStr = `${monthKey}-${String(day).padStart(2, "0")}`;
-        const dailyExpense = dailyMap[dateStr] || 0;
+        const dailyExpense = dailyExpenseMap[dateStr] || 0;
+        const dailyIncome = dailyIncomeMap[dateStr] || 0;
 
         cumulativeActual += dailyExpense;
+        cumulativeIncome += dailyIncome;
         cumulativeIdeal += idealDaily;
 
         // Para días futuros (después de hoy), no sumamos más gasto real
@@ -4367,9 +4401,17 @@ router.get(
           day,
           date: dateStr,
           daily_expense: Number(dailyExpense.toFixed(2)),
+          daily_income: Number(dailyIncome.toFixed(2)),
+          income_cumulative: Number(cumulativeIncome.toFixed(2)),
           ideal_cumulative: Number(cumulativeIdeal.toFixed(2)),
           actual_cumulative: Number(
             (day <= dayOfMonth ? cumulativeActual : cumulativeActual).toFixed(2)
+          ),
+          ideal_net_cumulative: Number(
+            (cumulativeIncome - cumulativeIdeal).toFixed(2)
+          ),
+          actual_net_cumulative: Number(
+            (cumulativeIncome - cumulativeActual).toFixed(2)
           ),
         });
       }
@@ -4384,6 +4426,9 @@ router.get(
 
       const varianceToIdeal = actualToDate - idealToDate;
       const varianceToBudgetEnd = projectedEndOfMonth - budgetTotal;
+      const incomeToDate = series[dayOfMonth - 1]?.income_cumulative || 0;
+      const idealNetToDate = incomeToDate - idealToDate;
+      const actualNetToDate = incomeToDate - actualToDate;
 
       return res.json({
         success: true,
@@ -4393,8 +4438,11 @@ router.get(
           days_in_month: daysInMonth,
           day_of_month: dayOfMonth,
           budget_total: Number(budgetTotal.toFixed(2)),
+          income_to_date: Number(incomeToDate.toFixed(2)),
           ideal_to_date: Number(idealToDate.toFixed(2)),
           actual_to_date: Number(actualToDate.toFixed(2)),
+          ideal_net_to_date: Number(idealNetToDate.toFixed(2)),
+          actual_net_to_date: Number(actualNetToDate.toFixed(2)),
           projected_end_of_month: Number(projectedEndOfMonth.toFixed(2)),
           variance_to_ideal: Number(varianceToIdeal.toFixed(2)),
           variance_to_budget_end: Number(varianceToBudgetEnd.toFixed(2)),
@@ -7557,6 +7605,7 @@ router.get(
           `
           amount,
           date,
+          type,
           category_id,
           categories:categories!transactions_category_id_fkey (
             name
@@ -7564,7 +7613,7 @@ router.get(
         `
         )
         .eq("user_id", user_id)
-        .eq("type", "expense")
+        .in("type", ["income", "expense"])
         .gte("date", date_from)
         .lte("date", today);
 
@@ -7574,12 +7623,21 @@ router.get(
       }
 
       const actualDailyMap = {};
+      const actualIncomeDailyMap = {};
 
       (expenses || []).forEach((tx) => {
         const d = tx.date;
         const amt = Number(tx.amount) || 0;
         const category = tx.categories?.name || "Sin categoría";
         if (amt <= 0 || !d) return;
+
+        if (tx.type === "income") {
+          if (!actualIncomeDailyMap[d]) actualIncomeDailyMap[d] = 0;
+          actualIncomeDailyMap[d] += amt;
+          return;
+        }
+
+        if (tx.type !== "expense") return;
 
         if (!actualDailyMap[d]) actualDailyMap[d] = 0;
         actualDailyMap[d] += amt;
@@ -7590,6 +7648,7 @@ router.get(
 
       let cumulativeExpected = 0;
       let cumulativeActual = 0;
+      let cumulativeIncome = 0;
       const series = [];
 
       for (let day = 1; day <= days_in_month; day++) {
@@ -7598,14 +7657,24 @@ router.get(
         cumulativeExpected += exp;
 
         const act = actualDailyMap[dateStr] || 0;
+        const income = actualIncomeDailyMap[dateStr] || 0;
+        if (day <= day_of_month) cumulativeIncome += income;
         if (day <= day_of_month) cumulativeActual += act;
 
         series.push({
           day,
           date: dateStr,
           expected_daily: Number(exp.toFixed(2)),
+          daily_income: Number(income.toFixed(2)),
+          income_cumulative: Number(cumulativeIncome.toFixed(2)),
           expected_cumulative: Number(cumulativeExpected.toFixed(2)),
           actual_cumulative: Number(cumulativeActual.toFixed(2)),
+          expected_net_cumulative: Number(
+            (cumulativeIncome - cumulativeExpected).toFixed(2)
+          ),
+          actual_net_cumulative: Number(
+            (cumulativeIncome - cumulativeActual).toFixed(2)
+          ),
         });
       }
 
@@ -7685,11 +7754,17 @@ router.get(
         totals.actual_to_date - totals.expected_to_date;
       const totals_variance_to_end =
         totals.forecast_end_of_month - totals.expected_end_of_month;
+      const incomeToDate = series[day_of_month - 1]?.income_cumulative || 0;
+      const expectedNetToDate = incomeToDate - totals.expected_to_date;
+      const actualNetToDate = incomeToDate - totals.actual_to_date;
 
       const summary = {
         expected_total: Number(totals.expected_end_of_month.toFixed(2)),
         expected_to_date: Number(totals.expected_to_date.toFixed(2)),
         actual_to_date: Number(totals.actual_to_date.toFixed(2)),
+        income_to_date: Number(incomeToDate.toFixed(2)),
+        expected_net_to_date: Number(expectedNetToDate.toFixed(2)),
+        actual_net_to_date: Number(actualNetToDate.toFixed(2)),
         forecast_remaining: Number(totals.forecast_remaining.toFixed(2)),
         forecast_end_of_month: Number(totals.forecast_end_of_month.toFixed(2)),
         variance_to_expected: Number(totals_variance_to_date.toFixed(2)),
@@ -7707,6 +7782,9 @@ router.get(
           expected_total: summary.expected_total,
           expected_to_date: summary.expected_to_date,
           actual_to_date: summary.actual_to_date,
+          income_to_date: summary.income_to_date,
+          expected_net_to_date: summary.expected_net_to_date,
+          actual_net_to_date: summary.actual_net_to_date,
           projected_end_of_month: summary.forecast_end_of_month,
           variance_to_expected: summary.variance_to_expected,
           variance_to_expected_end: summary.variance_to_expected_end,
