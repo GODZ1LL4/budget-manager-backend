@@ -251,6 +251,7 @@ async function fetchExpenseTransactionsForUnusual(userId, filters = {}) {
 /* ========= ITEM PRICES ========= */
 
 router.get("/item-prices-trend", authenticateUser, async (req, res) => {
+  const user_id = req.user.id;
   let item_ids = req.query["item_ids[]"] || req.query.item_ids;
 
   if (!item_ids) {
@@ -268,20 +269,44 @@ router.get("/item-prices-trend", authenticateUser, async (req, res) => {
       item_id,
       price,
       date,
-      items ( name )
+      items!inner (
+        name,
+        user_id,
+        taxes (
+          rate,
+          is_exempt
+        )
+      )
     `
     )
+    .eq("items.user_id", user_id)
     .in("item_id", item_ids)
     .order("date", { ascending: true });
 
   if (error) return res.status(500).json({ error: error.message });
 
-  const result = (data || []).map((entry) => ({
-    item_id: entry.item_id,
-    item_name: entry.items?.name || "Sin nombre",
-    price: entry.price,
-    date: entry.date,
-  }));
+  const result = (data || []).map((entry) => {
+    const price = Number(entry.price || 0);
+    const itemTaxes = Array.isArray(entry.items?.taxes)
+      ? entry.items.taxes[0]
+      : entry.items?.taxes;
+    const isExempt = itemTaxes?.is_exempt === true;
+    const taxRate = isExempt
+      ? 0
+      : Number(itemTaxes?.rate || 0);
+    const safeTaxRate = Number.isFinite(taxRate) ? taxRate : 0;
+    const priceWithTax = price * (1 + safeTaxRate / 100);
+
+    return {
+      item_id: entry.item_id,
+      item_name: entry.items?.name || "Sin nombre",
+      price: toRoundedNumber(price),
+      price_with_tax: toRoundedNumber(priceWithTax),
+      tax_rate: safeTaxRate,
+      is_exempt: isExempt,
+      date: entry.date,
+    };
+  });
 
   res.json({ success: true, data: result });
 });
@@ -2583,7 +2608,26 @@ function getTransactionItemPriceNumbers(row) {
   const unitFinal =
     row.unit_price_final != null ? Number(row.unit_price_final) : null;
   const unitNet = Number(row.unit_price_net || 0);
-  const rate = row.is_exempt_used ? 0 : Number(row.tax_rate_used || 0);
+  const itemTaxes = Array.isArray(row.items?.taxes)
+    ? row.items.taxes[0]
+    : row.items?.taxes;
+  const hasStoredExempt = row.is_exempt_used === true || row.is_exempt_used === false;
+  const isExempt = hasStoredExempt
+    ? row.is_exempt_used === true
+    : itemTaxes?.is_exempt === true;
+  const storedRate =
+    row.tax_rate_used == null || row.tax_rate_used === ""
+      ? null
+      : Number(row.tax_rate_used);
+  const fallbackRate =
+    itemTaxes?.rate == null || itemTaxes?.rate === ""
+      ? 0
+      : Number(itemTaxes.rate);
+  const rate = isExempt
+    ? 0
+    : Number.isFinite(storedRate)
+    ? storedRate
+    : fallbackRate;
 
   if (!Number.isFinite(unitNet) || unitNet <= 0) return null;
 
@@ -2867,7 +2911,11 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
         is_exempt_used,
         items!inner (
           name,
-          user_id
+          user_id,
+          taxes (
+            rate,
+            is_exempt
+          )
         ),
         transactions!inner (
           id,
@@ -3053,9 +3101,9 @@ router.get("/item-price-command-center", authenticateUser, async (req, res) => {
             String(a.item_name || "").localeCompare(String(b.item_name || ""))
           );
         const totalPaid = toRoundedNumber(shoppingList.total_paid_amount);
-        const amount = Number.isFinite(shoppingList.amount) && shoppingList.amount > 0
-          ? shoppingList.amount
-          : totalPaid;
+        const amount = totalPaid > 0
+          ? totalPaid
+          : shoppingList.amount;
 
         return {
           id: shoppingList.id,
