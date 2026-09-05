@@ -82,7 +82,12 @@ const addDaysToDateKey = (dateKey, days) => {
   const date = dateKeyToUtcDate(dateKey);
   if (!date) return null;
 
-  date.setUTCDate(date.getUTCDate() + Number(days || 0));
+  const safeDays = Number(days);
+  if (!Number.isFinite(safeDays)) return null;
+
+  date.setUTCDate(date.getUTCDate() + safeDays);
+  if (!Number.isFinite(date.getTime())) return null;
+
   return date.toISOString().slice(0, 10);
 };
 
