@@ -86,6 +86,64 @@ const addDaysToDateKey = (dateKey, days) => {
   return date.toISOString().slice(0, 10);
 };
 
+const isMissingColumnSelectError = (error) => {
+  if (!error) return false;
+
+  const text = [
+    error.code,
+    error.message,
+    error.details,
+    error.hint,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  return (
+    error.code === "42703" ||
+    error.code === "PGRST204" ||
+    (text.includes("column") && text.includes("does not exist")) ||
+    (text.includes("could not find") && text.includes("column")) ||
+    (text.includes("schema cache") && text.includes("column"))
+  );
+};
+
+const selectWithOptionalColumnFallbacks = async ({
+  table,
+  selects,
+  applyFilters,
+  label,
+}) => {
+  let lastError = null;
+
+  for (const select of selects) {
+    const baseQuery = supabase.from(table).select(select);
+    const query = applyFilters ? applyFilters(baseQuery) : baseQuery;
+    const result = await query;
+
+    if (!result.error) {
+      return { data: result.data || [], error: null };
+    }
+
+    lastError = result.error;
+
+    if (!isMissingColumnSelectError(result.error)) {
+      return { data: result.data, error: result.error };
+    }
+
+    console.warn(
+      `Columna opcional no disponible para ${label}; reintentando con una consulta compatible.`,
+      {
+        select,
+        code: result.error.code,
+        message: result.error.message,
+      }
+    );
+  }
+
+  return { data: null, error: lastError };
+};
+
 const getRequestCurrentMonthRange = (req) =>
   getCurrentMonthRange(new Date(), getRequestTimeZone(req));
 
@@ -1306,15 +1364,29 @@ router.get("/goals-savings-projection", authenticateUser, async (req, res) => {
       : 90;
 
   try {
-    const { data: goals, error: goalsErr } = await supabase
-      .from("goals")
-      .select(
-        "id, name, target_amount, due_date, created_at, account_id, status, is_priority"
-      )
-      .eq("user_id", user_id)
-      .in("status", ["active", "paused"]);
+    const { data: rawGoals, error: goalsErr } =
+      await selectWithOptionalColumnFallbacks({
+        table: "goals",
+        label: "goals-savings-projection goals",
+        selects: [
+          "id, name, target_amount, due_date, created_at, status, is_priority",
+          "id, name, target_amount, due_date, created_at, status",
+          "id, name, target_amount, due_date, status",
+          "id, name, target_amount, created_at, status",
+          "id, name, target_amount, status",
+          "id, name, target_amount, due_date, created_at",
+          "id, name, target_amount, due_date",
+          "id, name, target_amount",
+        ],
+        applyFilters: (query) => query.eq("user_id", user_id),
+      });
 
     if (goalsErr) return res.status(500).json({ error: goalsErr.message });
+
+    const goals = (rawGoals || []).filter((goal) => {
+      const status = goal.status || "active";
+      return status === "active" || status === "paused";
+    });
 
     const goalIds = (goals || []).map((goal) => goal.id).filter(Boolean);
 
@@ -1346,11 +1418,19 @@ router.get("/goals-savings-projection", authenticateUser, async (req, res) => {
       });
     }
 
-    const { data: movements, error: movementsErr } = await supabase
-      .from("goal_movements")
-      .select("goal_id, type, amount, movement_date, created_at")
-      .eq("user_id", user_id)
-      .in("goal_id", goalIds);
+    const { data: movements, error: movementsErr } =
+      await selectWithOptionalColumnFallbacks({
+        table: "goal_movements",
+        label: "goals-savings-projection movements",
+        selects: [
+          "goal_id, type, amount, movement_date, created_at",
+          "goal_id, type, amount, created_at",
+          "goal_id, type, amount, movement_date",
+          "goal_id, type, amount",
+        ],
+        applyFilters: (query) =>
+          query.eq("user_id", user_id).in("goal_id", goalIds),
+      });
 
     if (movementsErr) {
       return res.status(500).json({ error: movementsErr.message });
