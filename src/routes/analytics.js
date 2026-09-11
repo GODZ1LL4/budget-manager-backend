@@ -52,6 +52,7 @@ const sumNumeric = (rows, pickValue) =>
   (rows || []).reduce((sum, row) => sum + (Number(pickValue(row)) || 0), 0);
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const MAX_USEFUL_PROJECTION_DAYS = Math.ceil(365.25 * 100);
 
 const normalizeDateKey = (value) => {
   if (!value) return null;
@@ -1528,12 +1529,18 @@ router.get("/goals-savings-projection", authenticateUser, async (req, res) => {
           ? "lifetime"
           : "none";
 
-      const projectedCompletionDays =
+      const rawProjectedCompletionDays =
         remaining <= 0
           ? 0
           : projectedDailyRate > 0
           ? Math.ceil(remaining / projectedDailyRate)
           : null;
+      const hasUsefulProjection =
+        rawProjectedCompletionDays != null &&
+        rawProjectedCompletionDays <= MAX_USEFUL_PROJECTION_DAYS;
+      const projectedCompletionDays = hasUsefulProjection
+        ? rawProjectedCompletionDays
+        : null;
       const projectedCompletionDate =
         projectedCompletionDays == null
           ? null
@@ -1563,14 +1570,16 @@ router.get("/goals-savings-projection", authenticateUser, async (req, res) => {
       if (dueDate) {
         if (remaining <= 0) canMeetDeadline = true;
         else if (daysUntilDue == null || daysUntilDue < 0) canMeetDeadline = false;
-        else if (projectedCompletionDays == null) canMeetDeadline = false;
+        else if (!hasUsefulProjection) canMeetDeadline = false;
         else canMeetDeadline = projectedCompletionDays <= daysUntilDue;
       }
 
       let projectionStatus = "no_deadline";
       if (remaining <= 0) projectionStatus = "achieved";
       else if (dueDate && daysUntilDue < 0) projectionStatus = "overdue";
-      else if (projectedDailyRate <= 0) projectionStatus = "no_pace";
+      else if (projectedDailyRate <= 0 || !hasUsefulProjection) {
+        projectionStatus = "no_pace";
+      }
       else if (dueDate && canMeetDeadline) projectionStatus = "on_track";
       else if (dueDate && canMeetDeadline === false) projectionStatus = "behind";
       else projectionStatus = "projected";
