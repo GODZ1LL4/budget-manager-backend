@@ -202,10 +202,14 @@ function normalizeMilestonePayload(body, { partial = false } = {}) {
 
 async function loadProjectChildren(userId, projectIds) {
   if (!projectIds.length) {
-    return { tasksByProject: {}, milestonesByProject: {} };
+    return {
+      tasksByProject: {},
+      milestonesByProject: {},
+      transactionsByProject: {},
+    };
   }
 
-  const [tasksResult, milestonesResult] = await Promise.all([
+  const [tasksResult, milestonesResult, linksResult] = await Promise.all([
     supabase
       .from("project_tasks")
       .select(
@@ -224,6 +228,12 @@ async function loadProjectChildren(userId, projectIds) {
       .in("project_id", projectIds)
       .order("target_date", { ascending: true, nullsFirst: false })
       .order("created_at", { ascending: true }),
+    supabase
+      .from("project_transaction_links")
+      .select("project_id, transaction_id, created_at")
+      .eq("user_id", userId)
+      .in("project_id", projectIds)
+      .order("created_at", { ascending: false }),
   ]);
 
   if (tasksResult.error) {
@@ -234,6 +244,12 @@ async function loadProjectChildren(userId, projectIds) {
 
   if (milestonesResult.error) {
     const err = new Error(milestonesResult.error.message);
+    err.status = 500;
+    throw err;
+  }
+
+  if (linksResult.error) {
+    const err = new Error(linksResult.error.message);
     err.status = 500;
     throw err;
   }
@@ -250,7 +266,55 @@ async function loadProjectChildren(userId, projectIds) {
     milestonesByProject[milestone.project_id].push(milestone);
   }
 
-  return { tasksByProject, milestonesByProject };
+  const transactionIds = Array.from(
+    new Set((linksResult.data || []).map((link) => link.transaction_id))
+  );
+  const transactionMap = new Map();
+
+  if (transactionIds.length) {
+    const { data: transactions, error: transactionsError } = await supabase
+      .from("transactions")
+      .select(
+        `
+        id,
+        user_id,
+        amount,
+        type,
+        description,
+        date,
+        account_id,
+        category_id,
+        account:accounts!transactions_account_id_fkey (id, name),
+        categories (id, name, type)
+      `
+      )
+      .eq("user_id", userId)
+      .in("id", transactionIds);
+
+    if (transactionsError) {
+      const err = new Error(transactionsError.message);
+      err.status = 500;
+      throw err;
+    }
+
+    for (const transaction of transactions || []) {
+      transactionMap.set(transaction.id, transaction);
+    }
+  }
+
+  const transactionsByProject = {};
+  for (const link of linksResult.data || []) {
+    const transaction = transactionMap.get(link.transaction_id);
+    if (!transaction) continue;
+
+    transactionsByProject[link.project_id] ??= [];
+    transactionsByProject[link.project_id].push({
+      ...transaction,
+      linked_at: link.created_at,
+    });
+  }
+
+  return { tasksByProject, milestonesByProject, transactionsByProject };
 }
 
 router.get("/", authenticateUser, async (req, res) => {
@@ -270,15 +334,14 @@ router.get("/", authenticateUser, async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
 
     const projectIds = (projects || []).map((project) => project.id);
-    const { tasksByProject, milestonesByProject } = await loadProjectChildren(
-      userId,
-      projectIds
-    );
+    const { tasksByProject, milestonesByProject, transactionsByProject } =
+      await loadProjectChildren(userId, projectIds);
 
     const enriched = (projects || []).map((project) => ({
       ...project,
       tasks: tasksByProject[project.id] || [],
       milestones: milestonesByProject[project.id] || [],
+      linked_transactions: transactionsByProject[project.id] || [],
     }));
 
     return res.json({ success: true, data: enriched });
@@ -316,7 +379,7 @@ router.post("/", authenticateUser, async (req, res) => {
 
     return res.status(201).json({
       success: true,
-      data: { ...data, tasks: [], milestones: [] },
+      data: { ...data, tasks: [], milestones: [], linked_transactions: [] },
     });
   } catch (error) {
     return res.status(error.status || 500).json({ error: error.message });
@@ -363,10 +426,8 @@ router.put("/:id", authenticateUser, async (req, res) => {
 
     if (error) return res.status(500).json({ error: error.message });
 
-    const { tasksByProject, milestonesByProject } = await loadProjectChildren(
-      userId,
-      [id]
-    );
+    const { tasksByProject, milestonesByProject, transactionsByProject } =
+      await loadProjectChildren(userId, [id]);
 
     return res.json({
       success: true,
@@ -374,6 +435,7 @@ router.put("/:id", authenticateUser, async (req, res) => {
         ...data,
         tasks: tasksByProject[id] || [],
         milestones: milestonesByProject[id] || [],
+        linked_transactions: transactionsByProject[id] || [],
       },
     });
   } catch (error) {
@@ -398,10 +460,8 @@ router.post("/:id/complete", authenticateUser, async (req, res) => {
 
     if (error) return res.status(500).json({ error: error.message });
 
-    const { tasksByProject, milestonesByProject } = await loadProjectChildren(
-      userId,
-      [id]
-    );
+    const { tasksByProject, milestonesByProject, transactionsByProject } =
+      await loadProjectChildren(userId, [id]);
 
     return res.json({
       success: true,
@@ -409,6 +469,7 @@ router.post("/:id/complete", authenticateUser, async (req, res) => {
         ...data,
         tasks: tasksByProject[id] || [],
         milestones: milestonesByProject[id] || [],
+        linked_transactions: transactionsByProject[id] || [],
       },
     });
   } catch (error) {
@@ -440,6 +501,16 @@ router.delete("/:id", authenticateUser, async (req, res) => {
     return res.status(500).json({ error: tasksDelete.error.message });
   }
 
+  const linksDelete = await supabase
+    .from("project_transaction_links")
+    .delete()
+    .eq("project_id", id)
+    .eq("user_id", userId);
+
+  if (linksDelete.error) {
+    return res.status(500).json({ error: linksDelete.error.message });
+  }
+
   const { error } = await supabase
     .from("projects")
     .delete()
@@ -449,6 +520,109 @@ router.delete("/:id", authenticateUser, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message });
 
   return res.json({ success: true, message: "Proyecto eliminado" });
+});
+
+router.get("/:id/transactions", authenticateUser, async (req, res) => {
+  const userId = req.user.id;
+  const { id } = req.params;
+
+  try {
+    await assertProjectOwned(id, userId);
+    const { transactionsByProject } = await loadProjectChildren(userId, [id]);
+
+    return res.json({
+      success: true,
+      data: transactionsByProject[id] || [],
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+router.post("/:id/transactions", authenticateUser, async (req, res) => {
+  const userId = req.user.id;
+  const { id } = req.params;
+  const { transaction_id } = req.body || {};
+
+  if (!transaction_id) {
+    return res.status(400).json({ error: "transaction_id es obligatorio" });
+  }
+
+  try {
+    await assertProjectOwned(id, userId);
+
+    const { data: transaction, error: transactionError } = await supabase
+      .from("transactions")
+      .select(
+        `
+        id,
+        user_id,
+        amount,
+        type,
+        description,
+        date,
+        account_id,
+        category_id,
+        account:accounts!transactions_account_id_fkey (id, name),
+        categories (id, name, type)
+      `
+      )
+      .eq("id", transaction_id)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (transactionError) {
+      return res.status(500).json({ error: transactionError.message });
+    }
+
+    if (!transaction) {
+      return res.status(404).json({ error: "Transaccion no encontrada" });
+    }
+
+    const { error } = await supabase
+      .from("project_transaction_links")
+      .upsert(
+        [
+          {
+            project_id: id,
+            transaction_id,
+            user_id: userId,
+          },
+        ],
+        { onConflict: "project_id,transaction_id" }
+      );
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    return res.status(201).json({
+      success: true,
+      data: transaction,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({ error: error.message });
+  }
+});
+
+router.delete("/:id/transactions/:transactionId", authenticateUser, async (req, res) => {
+  const userId = req.user.id;
+  const { id, transactionId } = req.params;
+
+  try {
+    await assertProjectOwned(id, userId);
+
+    const { error } = await supabase
+      .from("project_transaction_links")
+      .delete()
+      .eq("project_id", id)
+      .eq("transaction_id", transactionId)
+      .eq("user_id", userId);
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    return res.json({ success: true, message: "Transaccion desvinculada" });
+  } catch (error) {
+    return res.status(error.status || 500).json({ error: error.message });
+  }
 });
 
 router.get("/:id/tasks", authenticateUser, async (req, res) => {
