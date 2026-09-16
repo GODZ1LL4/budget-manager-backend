@@ -59,6 +59,9 @@ app.use("/api/items-with-price", itemsWithPriceRoutes);
 const scenariosRoutes = require("./routes/scenarios");
 app.use("/api/scenarios", scenariosRoutes);
 
+const projectsRoutes = require("./routes/projects");
+app.use("/api/projects", projectsRoutes);
+
 // Nuevas rutas premium
 
 const billingRoutes = require("./routes/billing");
